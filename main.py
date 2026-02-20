@@ -19,7 +19,7 @@ from slowapi.errors import RateLimitExceeded
 
 from config import get_config
 from middleware.rate_limiter import limiter
-from routers import bets, rounds, admin
+from routers import bets, rounds, admin, stream
 from websocket.ws_public import router as ws_public_router
 from websocket.ws_account import router as ws_account_router
 from websocket.ws_manager import manager
@@ -147,6 +147,7 @@ app.add_middleware(
 app.include_router(bets.router)
 app.include_router(rounds.router)
 app.include_router(admin.router)
+app.include_router(stream.router)
 app.include_router(ws_public_router)
 app.include_router(ws_account_router)
 
