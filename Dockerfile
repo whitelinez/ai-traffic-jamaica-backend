@@ -11,9 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python deps first (layer cache)
+# Install CPU-only PyTorch first to avoid pulling 2.5GB GPU build
+RUN pip install --no-cache-dir \
+    torch==2.2.2+cpu \
+    torchvision==0.17.2+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Clean pip cache to reduce image size
+RUN pip cache purge
 
 COPY . .
 
