@@ -49,14 +49,26 @@ async def ai_loop(cfg, hls_stream: HLSStream) -> None:
 
     Checks for URL updates from the refresh loop on every reconnect.
     """
+    try:
+        await _ai_loop_inner(cfg, hls_stream)
+    except Exception as exc:
+        logger.error("AI loop crashed: %s", exc, exc_info=True)
+        raise
+
+
+async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
+    logger.info("AI loop inner: initialising detector")
     detector = VehicleDetector(model_path=cfg.YOLO_MODEL, conf_threshold=cfg.YOLO_CONF)
+    logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
 
+    logger.info("AI loop inner: querying camera_id")
     sb = await get_supabase()
     cam_resp = await sb.table("cameras").select("id").eq("ipcam_alias", cfg.CAMERA_ALIAS).limit(1).execute()
     camera_id = cam_resp.data[0]["id"] if cam_resp.data else "default"
     logger.info("AI loop using camera_id: %s", camera_id)
 
+    logger.info("AI loop inner: opening HLS stream")
     frame_buf = None
     counter: LineCounter | None = None
 
