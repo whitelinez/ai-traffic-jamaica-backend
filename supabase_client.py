@@ -5,7 +5,7 @@ Used for all server-side DB operations (bypasses RLS when needed).
 import logging
 from functools import lru_cache
 
-from supabase import AsyncClient, acreate_client
+from supabase._async.client import AsyncClient, acreate_client
 from config import get_config
 
 logger = logging.getLogger(__name__)
