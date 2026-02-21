@@ -60,9 +60,19 @@ class VehicleDetector:
         padded = Image.new("RGB", (_INFER_SIZE, _INFER_SIZE), (114, 114, 114))
         padded.paste(pil, (pad_left, pad_top))
 
-        # NCHW float32 tensor, normalised [0, 1]
-        arr = np.array(padded, dtype=np.float32) / 255.0
-        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+        # PIL → tensor via raw bytes — avoids torch.from_numpy() which requires
+        # identical numpy ABIs between torch's C extension and the system numpy.
+        # tobytes() returns a plain Python bytes object; frombuffer() on a
+        # bytearray uses Python's buffer protocol (no numpy involved at all).
+        raw = padded.tobytes()  # RGB, length = _INFER_SIZE * _INFER_SIZE * 3
+        tensor = (
+            torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+            .reshape(_INFER_SIZE, _INFER_SIZE, 3)
+            .to(dtype=torch.float32)
+            .div(255.0)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+        )
 
         # Tensor source → ultralytics uses LoadTensor, skips LetterBox/cv2 entirely
         results = self.model.predict(
