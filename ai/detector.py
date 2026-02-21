@@ -4,8 +4,10 @@ COCO classes used: 2=car, 3=motorcycle, 5=bus, 7=truck
 """
 import logging
 
+import cv2
 import numpy as np
 import supervision as sv
+from PIL import Image
 from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
@@ -24,20 +26,20 @@ class VehicleDetector:
     def detect(self, frame: np.ndarray) -> sv.Detections:
         """
         Run inference on a BGR frame.
-        Returns a supervision Detections object filtered to vehicle classes.
+        Converts to PIL Image (RGB) before passing to ultralytics — PIL is an
+        explicitly supported type in ultralytics 8.3.x and avoids internal
+        LetterBox preprocessing issues with raw cv2 numpy arrays.
         """
-        # Ensure C-contiguous uint8 array — required by ultralytics 8.3.x
-        frame = np.ascontiguousarray(frame, dtype=np.uint8)
+        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
         results = self.model.predict(
-            source=frame,
+            source=pil_image,
             conf=self.conf,
             classes=VEHICLE_CLASSES,
             verbose=False,
         )[0]
 
-        detections = sv.Detections.from_ultralytics(results)
-        return detections
+        return sv.Detections.from_ultralytics(results)
 
     @staticmethod
     def class_name(class_id: int) -> str:
