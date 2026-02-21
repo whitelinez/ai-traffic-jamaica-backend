@@ -1,5 +1,5 @@
 """
-ai/tracker.py — Supervision ByteTracker wrapper.
+ai/tracker.py — Supervision ByteTrack wrapper.
 Assigns persistent track IDs to detections across frames.
 """
 import supervision as sv
@@ -7,7 +7,7 @@ import supervision as sv
 
 class VehicleTracker:
     def __init__(self):
-        self.tracker = sv.ByteTracker(
+        self.tracker = sv.ByteTrack(
             track_activation_threshold=0.25,
             lost_track_buffer=30,
             minimum_matching_threshold=0.8,
