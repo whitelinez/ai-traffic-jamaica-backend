@@ -21,8 +21,8 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ultralytics pulls in opencv-python (full); force headless to override it
-RUN pip install --no-cache-dir --force-reinstall opencv-python-headless
+# Re-pin numpy to 1.x — torch 2.2.2 is compiled against numpy 1.x and breaks on numpy 2.x
+RUN pip install --no-cache-dir "numpy==1.26.4"
 
 # Pre-download YOLO weights so they're baked in — avoids 6MB download on every cold start
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
