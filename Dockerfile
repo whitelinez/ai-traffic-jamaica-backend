@@ -11,13 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install CPU-only PyTorch — 2.3.1 supports numpy 2.x (avoids ABI mismatch with opencv 4.11)
+# 1. Pin numpy FIRST — a single version that every subsequent package resolves
+#    against. Eliminates the dual-numpy ABI issue (cv2 / torch / supervision
+#    each importing a different numpy module instance).
+#    numpy 1.26.4 satisfies: ultralytics>=1.23, supervision>=1.21, scipy>=1.23.5
+RUN pip install --no-cache-dir numpy==1.26.4
+
+# 2. CPU-only PyTorch (picks up the pinned numpy above)
 RUN pip install --no-cache-dir \
     torch==2.3.1+cpu \
     torchvision==0.18.1+cpu \
     --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining deps
+# 3. Remaining deps — all see numpy 1.26.4 already in site-packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
