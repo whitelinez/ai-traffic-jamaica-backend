@@ -21,6 +21,12 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# ultralytics pulls in opencv-python (full); force headless to override it
+RUN pip install --no-cache-dir --force-reinstall opencv-python-headless
+
+# Pre-download YOLO weights so they're baked in — avoids 6MB download on every cold start
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
 # Clean pip cache to reduce image size
 RUN pip cache purge
 
