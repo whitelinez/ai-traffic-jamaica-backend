@@ -26,8 +26,11 @@ class VehicleDetector:
         Run inference on a BGR frame.
         Returns a supervision Detections object filtered to vehicle classes.
         """
-        results = self.model(
-            frame,
+        # Ensure C-contiguous uint8 array — required by ultralytics 8.3.x
+        frame = np.ascontiguousarray(frame, dtype=np.uint8)
+
+        results = self.model.predict(
+            source=frame,
             conf=self.conf,
             classes=VEHICLE_CLASSES,
             verbose=False,
