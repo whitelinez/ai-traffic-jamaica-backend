@@ -1,6 +1,7 @@
 """
 ai/counter.py — LineZone crossing counter + Supabase snapshot writer.
 Polls the cameras table for the admin-defined count line every 30s.
+Also loads detect_zone (separate bounding-box zone) every 30s.
 Writes count_snapshots to Supabase every frame.
 """
 import asyncio
@@ -24,7 +25,8 @@ LINE_REFRESH_INTERVAL = 30  # seconds
 class LineCounter:
     """
     Manages a sv.LineZone that counts vehicles crossing a user-defined line.
-    Hot-reloads the line from Supabase every LINE_REFRESH_INTERVAL seconds.
+    Also manages a separate detect_zone (bounding-box filter for detections).
+    Hot-reloads both zones from Supabase every LINE_REFRESH_INTERVAL seconds.
     """
 
     def __init__(self, camera_id: str, frame_width: int, frame_height: int):
@@ -33,20 +35,26 @@ class LineCounter:
         self.frame_height = frame_height
         self._zone = None
         self._zone_type = "line"  # "line" | "polygon"
+        self._detect_zone = None   # sv.PolygonZone for bounding-box filtering
+        self._detect_zone_data = None  # raw dict from DB
         self._last_refresh = 0.0
         self._counts: dict[str, dict] = {}  # {class_name: {in, out}}
+        # Cumulative per-class total for exact-count bet resolution
+        self._per_class_total: dict[str, int] = {}
 
     async def _refresh_line(self) -> None:
-        """Fetch count_line from Supabase cameras table and build zone/line."""
+        """Fetch count_line and detect_zone from Supabase cameras table."""
         cfg = get_config()
         sb = await get_supabase()
-        resp = await sb.table("cameras").select("count_line").eq("id", self.camera_id).single().execute()
-        line_data = resp.data.get("count_line") if resp.data else None
+        resp = await sb.table("cameras").select("count_line, detect_zone").eq("id", self.camera_id).single().execute()
+        data = resp.data or {}
+        line_data = data.get("count_line")
+        detect_data = data.get("detect_zone")
 
         w, h = self.frame_width, self.frame_height
 
+        # Build count zone
         if line_data and "x3" in line_data:
-            # 4-point polygon zone
             polygon = np.array([
                 [int(line_data["x1"] * w), int(line_data["y1"] * h)],
                 [int(line_data["x2"] * w), int(line_data["y2"] * h)],
@@ -57,19 +65,42 @@ class LineCounter:
             self._zone_type = "polygon"
             logger.debug("PolygonZone set with 4 points")
         elif line_data:
-            # Legacy 2-point line
             x1, y1 = int(line_data["x1"] * w), int(line_data["y1"] * h)
             x2, y2 = int(line_data["x2"] * w), int(line_data["y2"] * h)
             self._zone = sv.LineZone(start=sv.Point(x1, y1), end=sv.Point(x2, y2))
             self._zone_type = "line"
             logger.debug("LineZone set: (%d,%d)→(%d,%d)", x1, y1, x2, y2)
         else:
-            # Fallback: horizontal line at COUNT_LINE_RATIO
             ratio = cfg.COUNT_LINE_RATIO
             y = int(ratio * h)
             self._zone = sv.LineZone(start=sv.Point(0, y), end=sv.Point(w, y))
             self._zone_type = "line"
             logger.debug("No DB zone — using fallback line at ratio %.2f", ratio)
+
+        # Build detect zone (separate from count zone)
+        self._detect_zone_data = detect_data
+        if detect_data and "x3" in detect_data:
+            dz_polygon = np.array([
+                [int(detect_data["x1"] * w), int(detect_data["y1"] * h)],
+                [int(detect_data["x2"] * w), int(detect_data["y2"] * h)],
+                [int(detect_data["x3"] * w), int(detect_data["y3"] * h)],
+                [int(detect_data["x4"] * w), int(detect_data["y4"] * h)],
+            ], dtype=np.int32)
+            self._detect_zone = sv.PolygonZone(polygon=dz_polygon)
+            logger.debug("DetectZone polygon set")
+        elif detect_data and "x1" in detect_data:
+            # Simple 2-point bounding box stored as (x1,y1,x2,y2) rect
+            dz_polygon = np.array([
+                [int(detect_data["x1"] * w), int(detect_data["y1"] * h)],
+                [int(detect_data["x2"] * w), int(detect_data["y1"] * h)],
+                [int(detect_data["x2"] * w), int(detect_data["y2"] * h)],
+                [int(detect_data["x1"] * w), int(detect_data["y2"] * h)],
+            ], dtype=np.int32)
+            self._detect_zone = sv.PolygonZone(polygon=dz_polygon)
+            logger.debug("DetectZone rect set from 2-point data")
+        else:
+            self._detect_zone = None
+            logger.debug("No detect zone configured")
 
         self._last_refresh = time.monotonic()
 
@@ -87,7 +118,6 @@ class LineCounter:
         new_crossings = 0
 
         if self._zone_type == "polygon":
-            # PolygonZone: count vehicles currently inside the zone
             inside_mask = self._zone.trigger(detections=detections)
             total_in = int(inside_mask.sum())
             total_out = 0
@@ -97,13 +127,14 @@ class LineCounter:
                 if is_inside and i < len(detections.class_id):
                     cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
                     breakdown[cls_name] = breakdown.get(cls_name, 0) + 1
-            # "crossing" for polygon = change in occupancy vs previous frame
             prev_total = getattr(self, "_prev_total", 0)
             if total > prev_total:
                 new_crossings = total - prev_total
             self._prev_total = total
+            # Update per-class totals
+            for cls, cnt in breakdown.items():
+                self._per_class_total[cls] = cnt
         else:
-            # LineZone: cumulative crossing count
             crossed_in, crossed_out = self._zone.trigger(detections=detections)
             for i, (in_flag, out_flag) in enumerate(zip(crossed_in, crossed_out)):
                 if i >= len(detections.class_id):
@@ -113,26 +144,37 @@ class LineCounter:
                 if in_flag:
                     bucket["in"] += 1
                     new_crossings += 1
+                    self._per_class_total[cls_name] = self._per_class_total.get(cls_name, 0) + 1
                 if out_flag:
                     bucket["out"] += 1
                     new_crossings += 1
+                    self._per_class_total[cls_name] = self._per_class_total.get(cls_name, 0) + 1
             total_in = self._zone.in_count
             total_out = self._zone.out_count
             total = total_in + total_out
             breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
 
-        # Build relative-coord bounding boxes for frontend visualization.
-        # Only include detections with a known vehicle class — skips ghost predictions.
+        # Build bounding boxes — filter to detect_zone if configured, else count_zone
         valid_cls_ids = set(CLASS_NAMES.keys())
         boxes = []
         if len(detections) > 0 and detections.xyxy is not None:
+            # Determine which detections to show boxes for
+            if self._detect_zone is not None:
+                # Show boxes only for vehicles inside detect_zone
+                detect_mask = self._detect_zone.trigger(detections=detections)
+            else:
+                # No separate detect zone — show all valid detections
+                detect_mask = None
+
             for i in range(min(len(detections.xyxy), 60)):
                 x1, y1, x2, y2 = detections.xyxy[i]
                 cls_id = int(detections.class_id[i]) if (
                     detections.class_id is not None and i < len(detections.class_id)
                 ) else -1
                 if cls_id not in valid_cls_ids:
-                    continue  # skip unknown/ghost predictions
+                    continue
+                if detect_mask is not None and i < len(detect_mask) and not detect_mask[i]:
+                    continue  # outside detect zone
                 boxes.append({
                     "x1": round(float(x1) / self.frame_width,  4),
                     "y1": round(float(y1) / self.frame_height, 4),
@@ -150,23 +192,45 @@ class LineCounter:
             "vehicle_breakdown": breakdown,
             "detections": boxes,
             "new_crossings": new_crossings,
+            "per_class_total": dict(self._per_class_total),
         }
         return snapshot
 
     def zone_filter(self, detections: sv.Detections) -> sv.Detections:
         """
-        Filter detections to only those inside the polygon zone before tracking.
-        For line zones returns all detections unchanged (LineZone handles crossing).
-        Returns all detections if zone not yet initialized.
+        Filter detections before tracking:
+        - If detect_zone is set, filter to detect_zone
+        - Else if count_zone is polygon, filter to count_zone
+        - Else (line zone) return all detections unchanged
         """
-        if self._zone is None or self._zone_type != "polygon" or len(detections) == 0:
+        if len(detections) == 0:
             return detections
-        mask = self._zone.trigger(detections=detections)
-        return detections[mask]
+
+        # Prefer detect_zone for pre-tracking filter
+        if self._detect_zone is not None:
+            mask = self._detect_zone.trigger(detections=detections)
+            return detections[mask]
+
+        # Fall back to polygon count_zone filter
+        if self._zone is not None and self._zone_type == "polygon":
+            mask = self._zone.trigger(detections=detections)
+            return detections[mask]
+
+        return detections
+
+    def get_class_total(self, vehicle_class: str | None) -> int:
+        """
+        Return cumulative total for a vehicle class (or all classes).
+        Used by bet resolver to compute actual count delta.
+        """
+        if vehicle_class is None:
+            return sum(self._per_class_total.values())
+        return self._per_class_total.get(vehicle_class, 0)
 
     def reset(self) -> None:
         """Reset counters (called at round start)."""
         self._counts.clear()
+        self._per_class_total.clear()
         if self._zone and self._zone_type == "line":
             self._zone.in_count = 0
             self._zone.out_count = 0

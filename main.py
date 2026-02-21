@@ -3,6 +3,7 @@ main.py — FastAPI application entry point.
 - Validates env at startup (fail-fast)
 - Starts URL refresher first, waits for first live stream URL
 - Starts AI background task with live URL
+- Starts bet resolver loop (every 2s, resolves expired exact-count bets)
 - Mounts all routers and WebSocket endpoints
 """
 import asyncio
@@ -16,7 +17,7 @@ from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import get_config
 from middleware.rate_limiter import limiter
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 _refresh_task: asyncio.Task | None = None
 _ai_task: asyncio.Task | None = None
 _round_task: asyncio.Task | None = None
+_resolver_task: asyncio.Task | None = None
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
@@ -115,12 +117,121 @@ async def round_monitor_loop() -> None:
         await asyncio.sleep(5)
 
 
+async def bet_resolver_loop() -> None:
+    """
+    Resolve expired exact-count micro-bets every 2 seconds.
+    - Queries pending exact_count bets whose window has expired
+    - For each: fetches end snapshot total, computes actual = end_total - baseline
+    - Credits winner, updates status, broadcasts via ws_account
+    """
+    global _counter_ref
+
+    while True:
+        try:
+            sb = await get_supabase()
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            # Find expired pending exact_count bets
+            # window_start + window_duration_sec seconds <= now
+            resp = await sb.table("bets") \
+                .select("id, user_id, round_id, amount, potential_payout, exact_count, baseline_count, vehicle_class, window_start, window_duration_sec") \
+                .eq("bet_type", "exact_count") \
+                .eq("status", "pending") \
+                .lte("window_start", now_iso) \
+                .execute()
+
+            for bet in (resp.data or []):
+                try:
+                    # Check if window has actually expired
+                    ws_str = bet.get("window_start", "")
+                    if not ws_str:
+                        continue
+                    window_start = datetime.fromisoformat(ws_str.replace("Z", "+00:00"))
+                    window_dur = bet.get("window_duration_sec", 0) or 0
+                    window_end = window_start + timedelta(seconds=window_dur)
+                    now = datetime.now(timezone.utc)
+                    if now < window_end:
+                        continue  # not expired yet
+
+                    bet_id = bet["id"]
+                    user_id = bet["user_id"]
+                    exact_count = bet.get("exact_count", 0)
+                    baseline = bet.get("baseline_count", 0) or 0
+                    vehicle_class = bet.get("vehicle_class")
+
+                    # Get current count from in-memory counter if available
+                    end_count = 0
+                    if _counter_ref is not None:
+                        end_count = _counter_ref.get_class_total(vehicle_class)
+                    else:
+                        # Fall back to latest DB snapshot
+                        rnd_resp = await sb.table("bet_rounds") \
+                            .select("camera_id") \
+                            .eq("id", bet["round_id"]) \
+                            .single() \
+                            .execute()
+                        camera_id = rnd_resp.data.get("camera_id") if rnd_resp.data else None
+                        if camera_id:
+                            snap_resp = await sb.table("count_snapshots") \
+                                .select("total, vehicle_breakdown") \
+                                .eq("camera_id", camera_id) \
+                                .order("captured_at", desc=True) \
+                                .limit(1) \
+                                .execute()
+                            if snap_resp.data:
+                                snap = snap_resp.data[0]
+                                if vehicle_class is None:
+                                    end_count = snap.get("total", 0) or 0
+                                else:
+                                    bd = snap.get("vehicle_breakdown") or {}
+                                    end_count = bd.get(vehicle_class, 0)
+
+                    actual = max(0, end_count - baseline)
+                    won = (actual == exact_count)
+
+                    update_data = {
+                        "status": "won" if won else "lost",
+                        "actual_count": actual,
+                        "resolved_at": now.isoformat(),
+                    }
+                    await sb.table("bets").update(update_data).eq("id", bet_id).execute()
+
+                    # Credit winner
+                    if won:
+                        balance_resp = await sb.rpc("get_user_balance", {"p_user_id": user_id}).execute()
+                        cur_balance = int(balance_resp.data) if balance_resp.data is not None else 0
+                        new_balance = cur_balance + bet["potential_payout"]
+                        await sb.rpc("set_user_balance", {"p_user_id": user_id, "p_balance": new_balance}).execute()
+
+                    # Broadcast resolution to user
+                    await manager.send_to_user(user_id, {
+                        "type": "bet_resolved",
+                        "bet_id": str(bet_id),
+                        "won": won,
+                        "payout": bet["potential_payout"] if won else 0,
+                        "actual": actual,
+                        "exact": exact_count,
+                        "vehicle_class": vehicle_class,
+                    })
+
+                    logger.info(
+                        "Resolved bet %s: actual=%d exact=%d → %s",
+                        bet_id, actual, exact_count, "WON" if won else "LOST"
+                    )
+
+                except Exception as bet_exc:
+                    logger.warning("Error resolving bet %s: %s", bet.get("id"), bet_exc)
+
+        except Exception as exc:
+            logger.warning("Bet resolver loop error: %s", exc)
+
+        await asyncio.sleep(2)
+
+
 async def ai_loop(cfg, hls_stream: HLSStream) -> None:
     """
     Continuous AI pipeline:
     HLS frames → YOLO detect → ByteTrack → LineZone → Supabase snapshot + WS broadcast
-
-    Checks for URL updates from the refresh loop on every reconnect.
     """
     try:
         await _ai_loop_inner(cfg, hls_stream)
@@ -162,13 +273,12 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             logger.info("AI loop started: frame size %dx%d", w, h)
 
         detections = await asyncio.to_thread(detector.detect, frame)
-        # Filter to zone before tracking so only relevant vehicles are tracked
         detections = counter.zone_filter(detections)
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
 
-        # Write snapshot to DB — exclude detection boxes (WS-only, not persisted)
-        db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings")}
+        # Write snapshot to DB — exclude detection boxes and per_class_total (WS-only)
+        db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total")}
         asyncio.create_task(write_snapshot(db_snapshot))
 
         if manager.public_count > 0:
@@ -182,14 +292,14 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task
+    global _refresh_task, _ai_task, _round_task, _resolver_task
 
     cfg = get_config()
     logger.info("Config validated — starting WHITELINEZ backend")
 
     await get_supabase()
 
-    # 1. Start URL refresher — fetches immediately, then every interval
+    # 1. Start URL refresher
     _refresh_task = asyncio.create_task(
         url_refresh_loop(cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL),
         name="url_refresh_loop",
@@ -205,7 +315,7 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(1)
 
     if not stream_url:
-        logger.error("No stream URL after 30s — AI loop will not start. Check CAMERA_ALIAS and ipcamlive connectivity.")
+        logger.error("No stream URL after 30s — AI loop will not start.")
     else:
         hls_stream = HLSStream(stream_url)
         _ai_task = asyncio.create_task(ai_loop(cfg, hls_stream), name="ai_loop")
@@ -214,10 +324,13 @@ async def lifespan(app: FastAPI):
     _round_task = asyncio.create_task(round_monitor_loop(), name="round_monitor")
     logger.info("Round monitor started")
 
+    _resolver_task = asyncio.create_task(bet_resolver_loop(), name="bet_resolver")
+    logger.info("Bet resolver started")
+
     yield
 
     # Shutdown
-    for task in (_ai_task, _refresh_task, _round_task):
+    for task in (_ai_task, _refresh_task, _round_task, _resolver_task):
         if task and not task.done():
             task.cancel()
             try:
@@ -276,6 +389,7 @@ async def health():
         "ai_task_running": _ai_task is not None and not _ai_task.done(),
         "refresh_task_running": _refresh_task is not None and not _refresh_task.done(),
         "round_task_running": _round_task is not None and not _round_task.done(),
+        "resolver_task_running": _resolver_task is not None and not _resolver_task.done(),
         "active_round_id": _active_round["id"] if _active_round else None,
     }
 

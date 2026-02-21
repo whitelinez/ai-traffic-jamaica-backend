@@ -1,14 +1,13 @@
 """
-routers/bets.py — POST /bets/place, GET /bets/history
+routers/bets.py — POST /bets/place, POST /bets/place-live, GET /bets/history
 All endpoints require a valid Supabase JWT.
 """
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from slowapi.errors import RateLimitExceeded
 from typing import Annotated
 
-from models.bet import PlaceBetRequest, PlaceBetResponse, BetHistoryItem
+from models.bet import PlaceBetRequest, PlaceBetResponse, BetHistoryItem, PlaceLiveBetRequest, PlaceLiveBetResponse
 from services.auth_service import validate_supabase_jwt, get_user_id
-from services.bet_service import place_bet, get_user_balance
+from services.bet_service import place_bet, place_live_bet, get_user_balance
 from middleware.rate_limiter import limiter
 from supabase_client import get_supabase
 
@@ -31,6 +30,17 @@ async def place_bet_endpoint(
 ):
     user_id = get_user_id(user)
     return await place_bet(user_id, body)
+
+
+@router.post("/place-live", response_model=PlaceLiveBetResponse)
+@limiter.limit("10/minute")
+async def place_live_bet_endpoint(
+    request: Request,
+    body: PlaceLiveBetRequest,
+    user: Annotated[dict, Depends(_get_current_user)],
+):
+    user_id = get_user_id(user)
+    return await place_live_bet(user_id, body)
 
 
 @router.get("/history", response_model=list[BetHistoryItem])
