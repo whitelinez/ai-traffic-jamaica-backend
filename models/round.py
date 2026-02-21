@@ -43,7 +43,7 @@ THRESHOLD_MAX_PER_MIN = 25.0  # ceiling: threshold <= duration_min * 25
 
 class CreateRoundRequest(BaseModel):
     camera_id: UUID
-    market_type: str = Field(..., pattern="^(over_under|vehicle_type|custom)$")
+    market_type: str = Field(..., pattern="^(over_under|vehicle_count|vehicle_type|custom)$")
     params: dict[str, Any]
     opens_at: datetime
     closes_at: datetime
@@ -89,24 +89,39 @@ class CreateRoundRequest(BaseModel):
                     f"minimum is {MIN_ODDS}x to ensure competitive payout."
                 )
 
-        # Threshold sanity for over_under
-        if self.market_type == "over_under":
-            threshold = int(self.params.get("threshold", 0))
+        # Threshold sanity for over_under and vehicle_count
+        if self.market_type in ("over_under", "vehicle_count"):
+            threshold    = int(self.params.get("threshold", 0))
             duration_min = duration_sec / 60
-            min_threshold = int(duration_min * THRESHOLD_MIN_PER_MIN)
-            max_threshold = int(duration_min * THRESHOLD_MAX_PER_MIN)
+
+            # vehicle_count uses a per-class rate multiplier (individual type is
+            # a fraction of total traffic)
+            CLASS_MULTIPLIERS = {
+                "car": 0.50, "motorcycle": 0.20, "truck": 0.15, "bus": 0.10,
+            }
+            multiplier = 1.0
+            if self.market_type == "vehicle_count":
+                vehicle_class = self.params.get("vehicle_class", "")
+                if vehicle_class not in CLASS_MULTIPLIERS:
+                    raise ValueError(
+                        "vehicle_class must be one of: car, truck, bus, motorcycle"
+                    )
+                multiplier = CLASS_MULTIPLIERS[vehicle_class]
+
+            min_threshold = max(1, int(duration_min * THRESHOLD_MIN_PER_MIN * multiplier))
+            max_threshold = max(5, int(duration_min * THRESHOLD_MAX_PER_MIN * multiplier))
 
             if threshold < 1:
                 raise ValueError("Threshold must be at least 1.")
             if threshold < min_threshold:
                 raise ValueError(
-                    f"Threshold {threshold} is too low for a {int(duration_min)}-minute round "
-                    f"(minimum {min_threshold}). This bet would be a guaranteed 'over' win."
+                    f"Threshold {threshold} is too low for this round "
+                    f"(minimum {min_threshold}). Near-guaranteed win."
                 )
             if threshold > max_threshold:
                 raise ValueError(
-                    f"Threshold {threshold} is too high for a {int(duration_min)}-minute round "
-                    f"(maximum {max_threshold}). This bet would be nearly impossible to win."
+                    f"Threshold {threshold} is too high for this round "
+                    f"(maximum {max_threshold}). Nearly impossible."
                 )
 
         return self

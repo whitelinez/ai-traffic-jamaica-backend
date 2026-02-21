@@ -96,7 +96,8 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
 
 def _compute_winners(market_type: str, params: dict, result: dict) -> list[str]:
     """Determine which outcome_keys win based on result."""
-    total = result.get("total", 0)
+    total     = result.get("total", 0)
+    breakdown = result.get("vehicle_breakdown", result.get("by_class", {}))
 
     if market_type == "over_under":
         threshold = params.get("threshold", 0)
@@ -107,9 +108,19 @@ def _compute_winners(market_type: str, params: dict, result: dict) -> list[str]:
         else:
             return ["exact"]
 
+    if market_type == "vehicle_count":
+        vehicle_class = params.get("vehicle_class", "")
+        threshold     = params.get("threshold", 0)
+        count         = breakdown.get(vehicle_class, 0)
+        if count > threshold:
+            return ["over"]
+        elif count < threshold:
+            return ["under"]
+        else:
+            return ["exact"]
+
     if market_type == "vehicle_type":
-        # winner is the vehicle class with the highest count
-        breakdown = result.get("by_class", {})
+        # Winner is the class with the highest count
         if not breakdown:
             return []
         winner = max(breakdown, key=lambda k: breakdown[k])

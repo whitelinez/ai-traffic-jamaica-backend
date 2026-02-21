@@ -168,7 +168,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         snapshot = await counter.process(frame, tracked)
 
         # Write snapshot to DB — exclude detection boxes (WS-only, not persisted)
-        db_snapshot = {k: v for k, v in snapshot.items() if k != "detections"}
+        db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings")}
         asyncio.create_task(write_snapshot(db_snapshot))
 
         if manager.public_count > 0:
