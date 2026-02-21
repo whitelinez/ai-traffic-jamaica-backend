@@ -43,7 +43,7 @@ async def validate_supabase_jwt(token: str) -> dict[str, Any]:
         payload = jwt.decode(
             token,
             jwks,
-            algorithms=["RS256", "HS256"],
+            algorithms=["RS256", "HS256", "ES256"],
             options={"verify_aud": False},
         )
         return payload
