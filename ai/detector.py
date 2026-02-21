@@ -82,7 +82,24 @@ class VehicleDetector:
             verbose=False,
         )[0]
 
-        detections = sv.Detections.from_ultralytics(results)
+        # from_ultralytics() passes torch-internal numpy arrays which fail
+        # supervision's isinstance(xyxy, np.ndarray) check (ABI mismatch).
+        # Bridge each array through np.array() to re-allocate in system numpy.
+        boxes = results.boxes
+        if boxes is not None and len(boxes):
+            xyxy      = np.array(boxes.xyxy.cpu().numpy(),      dtype=np.float32)
+            confidence = np.array(boxes.conf.cpu().numpy(),     dtype=np.float32)
+            class_id  = np.array(boxes.cls.cpu().numpy(),       dtype=np.int32)
+        else:
+            xyxy       = np.empty((0, 4), dtype=np.float32)
+            confidence = np.empty((0,),   dtype=np.float32)
+            class_id   = np.empty((0,),   dtype=np.int32)
+
+        detections = sv.Detections(
+            xyxy=xyxy,
+            confidence=confidence,
+            class_id=class_id,
+        )
 
         # Un-letterbox: predictions are in 640×640 padded tensor space
         if len(detections) > 0:
