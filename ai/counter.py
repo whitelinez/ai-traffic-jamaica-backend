@@ -41,6 +41,12 @@ class LineCounter:
         self._counts: dict[str, dict] = {}  # {class_name: {in, out}}
         # Cumulative per-class total for exact-count bet resolution
         self._per_class_total: dict[str, int] = {}
+        # Double-validation state:
+        # 1) track first seen in detect zone
+        # 2) confirm when it crosses count zone
+        self._prevalidated_track_ids: set[int] = set()
+        self._confirmed_track_ids: set[int] = set()
+        self._confirmed_total: int = 0
 
     async def _refresh_line(self) -> None:
         """Fetch count_line and detect_zone from Supabase cameras table."""
@@ -116,6 +122,20 @@ class LineCounter:
             await self._refresh_line()
 
         new_crossings = 0
+        tracker_ids = getattr(detections, "tracker_id", None)
+        has_tracker_ids = tracker_ids is not None and len(tracker_ids) == len(detections)
+
+        # Pre-validation: if a detect zone exists, mark tracked vehicles that have been
+        # observed inside detect zone at least once.
+        if self._detect_zone is not None and len(detections) > 0 and has_tracker_ids:
+            detect_mask_for_pre = self._detect_zone.trigger(detections=detections)
+            for i, inside in enumerate(detect_mask_for_pre):
+                if not inside:
+                    continue
+                tid = tracker_ids[i]
+                if tid is None:
+                    continue
+                self._prevalidated_track_ids.add(int(tid))
 
         if self._zone_type == "polygon":
             inside_mask = self._zone.trigger(detections=detections)
@@ -139,16 +159,34 @@ class LineCounter:
             for i, (in_flag, out_flag) in enumerate(zip(crossed_in, crossed_out)):
                 if i >= len(detections.class_id):
                     continue
+                if not in_flag and not out_flag:
+                    continue
+
+                tid = None
+                if has_tracker_ids:
+                    raw_tid = tracker_ids[i]
+                    if raw_tid is not None:
+                        tid = int(raw_tid)
+
+                # Double validation:
+                # - if detect zone exists, vehicle must have been seen there first
+                if self._detect_zone is not None and tid is not None and tid not in self._prevalidated_track_ids:
+                    continue
+                # Count each tracked vehicle crossing only once
+                if tid is not None and tid in self._confirmed_track_ids:
+                    continue
+
                 cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
                 bucket = self._counts.setdefault(cls_name, {"in": 0, "out": 0})
                 if in_flag:
                     bucket["in"] += 1
-                    new_crossings += 1
-                    self._per_class_total[cls_name] = self._per_class_total.get(cls_name, 0) + 1
                 if out_flag:
                     bucket["out"] += 1
-                    new_crossings += 1
-                    self._per_class_total[cls_name] = self._per_class_total.get(cls_name, 0) + 1
+                new_crossings += 1
+                self._per_class_total[cls_name] = self._per_class_total.get(cls_name, 0) + 1
+                self._confirmed_total += 1
+                if tid is not None:
+                    self._confirmed_track_ids.add(tid)
             total_in = self._zone.in_count
             total_out = self._zone.out_count
             total = total_in + total_out
@@ -193,6 +231,8 @@ class LineCounter:
             "detections": boxes,
             "new_crossings": new_crossings,
             "per_class_total": dict(self._per_class_total),
+            "pre_count_total": max(0, len(self._prevalidated_track_ids) - len(self._confirmed_track_ids)),
+            "confirmed_crossings_total": self._confirmed_total,
         }
         return snapshot
 
@@ -206,12 +246,9 @@ class LineCounter:
         if len(detections) == 0:
             return detections
 
-        # Prefer detect_zone for pre-tracking filter
-        if self._detect_zone is not None:
-            mask = self._detect_zone.trigger(detections=detections)
-            return detections[mask]
-
-        # Fall back to polygon count_zone filter
+        # Do not filter by detect_zone here; we need full track continuity so that
+        # detect-zone prevalidation can later be confirmed at count zone crossing.
+        # Keep polygon count-zone fallback when no detect zone exists.
         if self._zone is not None and self._zone_type == "polygon":
             mask = self._zone.trigger(detections=detections)
             return detections[mask]
@@ -231,6 +268,9 @@ class LineCounter:
         """Reset counters (called at round start)."""
         self._counts.clear()
         self._per_class_total.clear()
+        self._prevalidated_track_ids.clear()
+        self._confirmed_track_ids.clear()
+        self._confirmed_total = 0
         if self._zone and self._zone_type == "line":
             self._zone.in_count = 0
             self._zone.out_count = 0

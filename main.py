@@ -31,6 +31,7 @@ from ai.detector import VehicleDetector
 from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot
 from ai.url_refresher import url_refresh_loop, get_current_url
+from services.round_service import resolve_round_from_latest_snapshot
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,8 +54,10 @@ _counter_ref: LineCounter | None = None
 
 async def round_monitor_loop() -> None:
     """
-    Poll Supabase every 5s for an open bet round.
+    Poll Supabase every 5s for round lifecycle changes.
     - Resets counter when a new round becomes active.
+    - Auto-opens upcoming rounds when opens_at passes.
+    - Auto-resolves open rounds when ends_at passes.
     - Broadcasts 'round' event to public WS on change.
     """
     global _active_round, _counter_ref
@@ -75,15 +78,19 @@ async def round_monitor_loop() -> None:
                 await sb.table("bet_rounds").update({"status": "open"}).eq("id", row["id"]).execute()
                 logger.info("Auto-opened round: %s", row["id"])
 
-            # Auto-lock: open rounds whose ends_at has passed
+            # Auto-resolve: open rounds whose ends_at has passed
             ended_resp = await sb.table("bet_rounds") \
                 .select("id") \
                 .eq("status", "open") \
                 .lte("ends_at", now_iso) \
                 .execute()
             for row in ended_resp.data or []:
-                await sb.table("bet_rounds").update({"status": "locked"}).eq("id", row["id"]).execute()
-                logger.info("Auto-locked round: %s", row["id"])
+                round_id = row["id"]
+                try:
+                    result = await resolve_round_from_latest_snapshot(round_id)
+                    logger.info("Auto-resolved round: %s result=%s", round_id, result)
+                except Exception as resolve_exc:
+                    logger.warning("Auto-resolve failed for round %s: %s", round_id, resolve_exc)
 
             resp = await sb.table("bet_rounds") \
                 .select("id, status, market_type, opens_at, closes_at, ends_at") \

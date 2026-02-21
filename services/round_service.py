@@ -72,13 +72,21 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
         "result": result,
     }).eq("id", round_id).execute()
 
-    # Fetch all pending bets for this round with market outcome_key
-    bets_resp = await sb.table("bets").select(
-        "id, user_id, amount, potential_payout, markets(outcome_key)"
-    ).eq("round_id", round_id).eq("status", "pending").execute()
+    # Fetch all pending market bets for this round with market outcome_key
+    bets_resp = await (
+        sb.table("bets")
+        .select("id, user_id, amount, potential_payout, bet_type, markets(outcome_key)")
+        .eq("round_id", round_id)
+        .eq("status", "pending")
+        .eq("bet_type", "market")
+        .execute()
+    )
 
     for bet in (bets_resp.data or []):
-        outcome_key = bet["markets"]["outcome_key"]
+        market_data = bet.get("markets") or {}
+        outcome_key = market_data.get("outcome_key")
+        if not outcome_key:
+            continue
         won = outcome_key in winning_keys
 
         await sb.table("bets").update({
@@ -92,6 +100,39 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
                 "p_amount": bet["potential_payout"],
             }).execute()
             logger.info("Credited %d to user %s (bet %s)", bet["potential_payout"], bet["user_id"], bet["id"])
+
+
+async def resolve_round_from_latest_snapshot(round_id: str) -> dict[str, Any]:
+    """
+    Resolve a round using the latest count snapshot for its camera.
+    Returns the result payload used for resolution.
+    """
+    sb = await get_supabase()
+    rnd_resp = await sb.table("bet_rounds").select("id, camera_id").eq("id", round_id).single().execute()
+    if not rnd_resp.data:
+        raise ValueError(f"Round {round_id} not found")
+
+    camera_id = rnd_resp.data.get("camera_id")
+    result: dict[str, Any] = {"total": 0, "vehicle_breakdown": {}}
+
+    if camera_id:
+        snap_resp = await (
+            sb.table("count_snapshots")
+            .select("total, vehicle_breakdown")
+            .eq("camera_id", camera_id)
+            .order("captured_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if snap_resp.data:
+            snap = snap_resp.data[0]
+            result = {
+                "total": snap.get("total", 0) or 0,
+                "vehicle_breakdown": snap.get("vehicle_breakdown") or {},
+            }
+
+    await resolve_round(round_id, result)
+    return result
 
 
 def _compute_winners(market_type: str, params: dict, result: dict) -> list[str]:
