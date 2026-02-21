@@ -225,7 +225,6 @@ class LineCounter:
         valid_cls_ids = set(CLASS_NAMES.keys())
         boxes = []
         if len(detections) > 0 and detections.xyxy is not None:
-            detect_mask = self._detect_zone.trigger(detections=detections) if self._detect_zone is not None else None
             for i in range(min(len(detections.xyxy), 60)):
                 x1, y1, x2, y2 = detections.xyxy[i]
                 cls_id = int(detections.class_id[i]) if (
@@ -234,15 +233,17 @@ class LineCounter:
 
                 if cls_id not in valid_cls_ids:
                     continue
-                if detect_mask is not None and i < len(detect_mask) and not detect_mask[i]:
-                    continue
 
+                conf = None
+                if detections.confidence is not None and i < len(detections.confidence):
+                    conf = round(float(detections.confidence[i]), 4)
                 boxes.append({
                     "x1": round(float(x1) / self.frame_width, 4),
                     "y1": round(float(y1) / self.frame_height, 4),
                     "x2": round(float(x2) / self.frame_width, 4),
                     "y2": round(float(y2) / self.frame_height, 4),
                     "cls": CLASS_NAMES[cls_id],
+                    "conf": conf,
                 })
 
         snapshot = {

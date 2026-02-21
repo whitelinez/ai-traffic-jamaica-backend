@@ -3,6 +3,7 @@ ai/detector.py — YOLOv8n vehicle detector using Ultralytics + Supervision.
 COCO classes used: 2=car, 3=motorcycle, 5=bus, 7=truck
 """
 import logging
+import os
 
 import numpy as np
 import supervision as sv
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 VEHICLE_CLASSES = [2, 3, 5, 7]
 CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
-_INFER_SIZE = 512
+_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "448"))
 
 
 class VehicleDetector:

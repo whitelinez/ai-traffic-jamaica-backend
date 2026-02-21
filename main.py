@@ -32,6 +32,7 @@ from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot
 from ai.url_refresher import url_refresh_loop, get_current_url
 from services.round_service import resolve_round_from_latest_snapshot
+from services.analytics_service import write_ml_detection_event
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -290,6 +291,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         if (loop_now - last_db_write) >= cfg.DB_SNAPSHOT_INTERVAL_SEC:
             db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total")}
             asyncio.create_task(write_snapshot(db_snapshot))
+            asyncio.create_task(write_ml_detection_event(camera_id, snapshot, cfg.YOLO_MODEL, cfg.YOLO_CONF))
             last_db_write = loop_now
 
         if manager.public_count > 0:
