@@ -1,6 +1,6 @@
 """
-ai/detector.py — YOLOv8n vehicle detector using Ultralytics + Supervision.
-COCO classes used: 2=car, 3=motorcycle, 5=bus, 7=truck
+ai/detector.py - YOLOv8n road-user detector using Ultralytics + Supervision.
+COCO classes used: 0=person, 2=car, 3=motorcycle, 5=bus, 7=truck
 """
 import logging
 
@@ -12,18 +12,20 @@ from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
-# COCO class IDs for vehicles
-VEHICLE_CLASSES = [2, 3, 5, 7]
-CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+# COCO class IDs for road users
+ROAD_USER_CLASSES = [0, 2, 3, 5, 7]
+VEHICLE_ONLY_CLASSES = [2, 3, 5, 7]
+CLASS_NAMES = {0: "person", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
 _INFER_SIZE = 640
 
 
 class VehicleDetector:
-    def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.50):
-        logger.info("Loading YOLO model: %s (conf=%.2f)", model_path, conf_threshold)
+    def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.50, include_person: bool = True):
+        logger.info("Loading YOLO model: %s (conf=%.2f include_person=%s)", model_path, conf_threshold, include_person)
         self.model = YOLO(model_path)
         self.conf = conf_threshold
+        self.classes = ROAD_USER_CLASSES if include_person else VEHICLE_ONLY_CLASSES
 
     def detect(self, frame) -> sv.Detections:
         """
@@ -37,12 +39,12 @@ class VehicleDetector:
 
         Fix:
           1. np.array(frame) uses __array_interface__ to copy the cv2 array
-             into system numpy — works across ABI versions.
+             into system numpy - works across ABI versions.
           2. PIL letterboxes the frame with zero cv2 calls.
           3. A float torch.Tensor is passed as source.
-          4. ultralytics detects torch.Tensor → LoadTensor path → skips
+          4. ultralytics detects torch.Tensor -> LoadTensor path -> skips
              pre_transform / LetterBox / all cv2 entirely.
-          5. Predictions are in 640×640 padded space; we un-letterbox manually.
+          5. Predictions are in 640x640 padded space; we un-letterbox manually.
         """
         h, w = frame.shape[:2]
         scale = min(_INFER_SIZE / h, _INFER_SIZE / w)
@@ -50,20 +52,17 @@ class VehicleDetector:
         pad_top = (_INFER_SIZE - new_h) // 2
         pad_left = (_INFER_SIZE - new_w) // 2
 
-        # Bridge cv2 array → system numpy via __array_interface__
+        # Bridge cv2 array -> system numpy via __array_interface__
         frame_np = np.array(frame, dtype=np.uint8)                   # BGR, system numpy
-        frame_rgb = np.ascontiguousarray(frame_np[:, :, ::-1])       # BGR → RGB
+        frame_rgb = np.ascontiguousarray(frame_np[:, :, ::-1])       # BGR -> RGB
 
-        # Letterbox entirely in PIL — no cv2 calls
+        # Letterbox entirely in PIL - no cv2 calls
         pil = Image.fromarray(frame_rgb)
         pil = pil.resize((new_w, new_h), Image.BILINEAR)
         padded = Image.new("RGB", (_INFER_SIZE, _INFER_SIZE), (114, 114, 114))
         padded.paste(pil, (pad_left, pad_top))
 
-        # PIL → tensor via raw bytes — avoids torch.from_numpy() which requires
-        # identical numpy ABIs between torch's C extension and the system numpy.
-        # tobytes() returns a plain Python bytes object; frombuffer() on a
-        # bytearray uses Python's buffer protocol (no numpy involved at all).
+        # PIL -> tensor via raw bytes
         raw = padded.tobytes()  # RGB, length = _INFER_SIZE * _INFER_SIZE * 3
         tensor = (
             torch.frombuffer(bytearray(raw), dtype=torch.uint8)
@@ -74,26 +73,24 @@ class VehicleDetector:
             .unsqueeze(0)
         )
 
-        # Tensor source → ultralytics uses LoadTensor, skips LetterBox/cv2 entirely
+        # Tensor source -> ultralytics uses LoadTensor, skips LetterBox/cv2 entirely
         results = self.model.predict(
             source=tensor,
             conf=self.conf,
-            classes=VEHICLE_CLASSES,
+            classes=self.classes,
             verbose=False,
         )[0]
 
-        # from_ultralytics() passes torch-internal numpy arrays which fail
-        # supervision's isinstance(xyxy, np.ndarray) check (ABI mismatch).
-        # Bridge each array through np.array() to re-allocate in system numpy.
+        # Bridge arrays through np.array() to re-allocate in system numpy.
         boxes = results.boxes
         if boxes is not None and len(boxes):
-            xyxy      = np.array(boxes.xyxy.cpu().numpy(),      dtype=np.float32)
-            confidence = np.array(boxes.conf.cpu().numpy(),     dtype=np.float32)
-            class_id  = np.array(boxes.cls.cpu().numpy(),       dtype=np.int32)
+            xyxy = np.array(boxes.xyxy.cpu().numpy(), dtype=np.float32)
+            confidence = np.array(boxes.conf.cpu().numpy(), dtype=np.float32)
+            class_id = np.array(boxes.cls.cpu().numpy(), dtype=np.int32)
         else:
-            xyxy       = np.empty((0, 4), dtype=np.float32)
-            confidence = np.empty((0,),   dtype=np.float32)
-            class_id   = np.empty((0,),   dtype=np.int32)
+            xyxy = np.empty((0, 4), dtype=np.float32)
+            confidence = np.empty((0,), dtype=np.float32)
+            class_id = np.empty((0,), dtype=np.int32)
 
         detections = sv.Detections(
             xyxy=xyxy,
@@ -101,7 +98,7 @@ class VehicleDetector:
             class_id=class_id,
         )
 
-        # Un-letterbox: predictions are in 640×640 padded tensor space
+        # Un-letterbox: predictions are in 640x640 padded tensor space
         if len(detections) > 0:
             detections.xyxy[:, [0, 2]] -= pad_left
             detections.xyxy[:, [1, 3]] -= pad_top

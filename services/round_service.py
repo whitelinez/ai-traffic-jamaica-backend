@@ -73,12 +73,20 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
     }).eq("id", round_id).execute()
 
     # Fetch all pending bets for this round with market outcome_key
-    bets_resp = await sb.table("bets").select(
-        "id, user_id, amount, potential_payout, markets(outcome_key)"
-    ).eq("round_id", round_id).eq("status", "pending").execute()
+    bets_resp = await (
+        sb.table("bets")
+        .select("id, user_id, amount, potential_payout, bet_type, markets(outcome_key)")
+        .eq("round_id", round_id)
+        .eq("status", "pending")
+        .eq("bet_type", "market")
+        .execute()
+    )
 
     for bet in (bets_resp.data or []):
-        outcome_key = bet["markets"]["outcome_key"]
+        market_data = bet.get("markets") or {}
+        outcome_key = market_data.get("outcome_key")
+        if not outcome_key:
+            continue
         won = outcome_key in winning_keys
 
         await sb.table("bets").update({

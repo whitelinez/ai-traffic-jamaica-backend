@@ -8,6 +8,7 @@ main.py — FastAPI application entry point.
 """
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -31,6 +32,8 @@ from ai.detector import VehicleDetector
 from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot
 from ai.url_refresher import url_refresh_loop, get_current_url
+from services.analytics_service import write_ml_detection_event
+from services.ml_pipeline_service import get_active_model_uri
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -49,6 +52,7 @@ _resolver_task: asyncio.Task | None = None
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
 _counter_ref: LineCounter | None = None
+_model_in_use: str | None = None
 
 
 async def round_monitor_loop() -> None:
@@ -241,10 +245,27 @@ async def ai_loop(cfg, hls_stream: HLSStream) -> None:
 
 
 async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
-    global _counter_ref
+    global _counter_ref, _model_in_use
 
     logger.info("AI loop inner: initialising detector")
-    detector = VehicleDetector(model_path=cfg.YOLO_MODEL, conf_threshold=cfg.YOLO_CONF)
+    runtime_model = cfg.YOLO_MODEL
+    try:
+        promoted_model = await get_active_model_uri()
+        if promoted_model:
+            if promoted_model.startswith("http://") or promoted_model.startswith("https://") or os.path.exists(promoted_model):
+                runtime_model = promoted_model
+                logger.info("Using promoted model from registry: %s", runtime_model)
+            else:
+                logger.warning("Promoted model path is not accessible, using fallback model: %s", promoted_model)
+    except Exception as exc:
+        logger.warning("Failed to resolve promoted model: %s", exc)
+
+    _model_in_use = runtime_model
+    detector = VehicleDetector(
+        model_path=runtime_model,
+        conf_threshold=cfg.YOLO_CONF,
+        include_person=cfg.INCLUDE_PERSON_CLASS,
+    )
     logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
 
@@ -257,6 +278,9 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     logger.info("AI loop inner: opening HLS stream")
     frame_buf = None
     counter: LineCounter | None = None
+    last_db_write = 0.0
+    last_ws_emit = 0.0
+    last_ml_write = 0.0
 
     async for frame in hls_stream.frames():
         # Hot-reload stream URL if the refresher has a newer one
@@ -277,15 +301,32 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
 
-        # Write snapshot to DB — exclude detection boxes and per_class_total (WS-only)
-        db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total")}
-        asyncio.create_task(write_snapshot(db_snapshot))
+        loop_now = asyncio.get_running_loop().time()
 
-        if manager.public_count > 0:
+        # Write snapshots at a fixed interval to reduce DB pressure and keep latency stable
+        if (loop_now - last_db_write) >= cfg.AI_SNAPSHOT_INTERVAL_SEC:
+            db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total")}
+            asyncio.create_task(write_snapshot(db_snapshot))
+            last_db_write = loop_now
+
+        # Persist lightweight ML telemetry for drift tracking and retraining curation
+        if (loop_now - last_ml_write) >= cfg.ML_LOG_INTERVAL_SEC:
+            asyncio.create_task(
+                write_ml_detection_event(
+                    camera_id=camera_id,
+                    snapshot=snapshot,
+                    model_name=runtime_model,
+                    yolo_conf=cfg.YOLO_CONF,
+                )
+            )
+            last_ml_write = loop_now
+
+        if manager.public_count > 0 and (loop_now - last_ws_emit) >= cfg.AI_BROADCAST_INTERVAL_SEC:
             payload: dict = {"type": "count", **snapshot}
             if _active_round:
                 payload["round"] = _active_round
             await manager.broadcast_public(payload)
+            last_ws_emit = loop_now
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -391,6 +432,7 @@ async def health():
         "round_task_running": _round_task is not None and not _round_task.done(),
         "resolver_task_running": _resolver_task is not None and not _resolver_task.done(),
         "active_round_id": _active_round["id"] if _active_round else None,
+        "model_in_use": _model_in_use,
     }
 
 
