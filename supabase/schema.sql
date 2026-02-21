@@ -196,3 +196,67 @@ BEGIN
     SET balance = user_balances.balance + EXCLUDED.balance;
 END;
 $$;
+
+-- Profile table for avatars + display names (public read for chat, user-owned writes)
+CREATE TABLE IF NOT EXISTS profiles (
+  user_id UUID PRIMARY KEY REFERENCES auth.users ON DELETE CASCADE,
+  username TEXT NOT NULL CHECK (length(username) BETWEEN 1 AND 32),
+  avatar_url TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS public_read_profiles ON profiles;
+CREATE POLICY public_read_profiles ON profiles
+  FOR SELECT USING (true);
+
+DROP POLICY IF EXISTS own_write_profiles ON profiles;
+CREATE POLICY own_write_profiles ON profiles
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS own_update_profiles ON profiles;
+CREATE POLICY own_update_profiles ON profiles
+  FOR UPDATE USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+CREATE INDEX IF NOT EXISTS idx_profiles_username ON profiles(username);
+
+-- Optional storage bucket + policies for avatar uploads (run in Supabase SQL Editor)
+INSERT INTO storage.buckets (id, name, public)
+SELECT 'avatars', 'avatars', true
+WHERE NOT EXISTS (SELECT 1 FROM storage.buckets WHERE id = 'avatars');
+
+DROP POLICY IF EXISTS public_read_avatars ON storage.objects;
+CREATE POLICY public_read_avatars ON storage.objects
+  FOR SELECT
+  USING (bucket_id = 'avatars');
+
+DROP POLICY IF EXISTS own_insert_avatars ON storage.objects;
+CREATE POLICY own_insert_avatars ON storage.objects
+  FOR INSERT
+  WITH CHECK (
+    bucket_id = 'avatars'
+    AND auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+DROP POLICY IF EXISTS own_update_avatars ON storage.objects;
+CREATE POLICY own_update_avatars ON storage.objects
+  FOR UPDATE
+  USING (
+    bucket_id = 'avatars'
+    AND auth.uid()::text = (storage.foldername(name))[1]
+  )
+  WITH CHECK (
+    bucket_id = 'avatars'
+    AND auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+DROP POLICY IF EXISTS own_delete_avatars ON storage.objects;
+CREATE POLICY own_delete_avatars ON storage.objects
+  FOR DELETE
+  USING (
+    bucket_id = 'avatars'
+    AND auth.uid()::text = (storage.foldername(name))[1]
+  );

@@ -30,7 +30,7 @@ class HLSStream:
         logger.info("Opening HLS stream: %s", self.url)
         self._cap = cv2.VideoCapture(self.url)
         # FFMPEG backend, minimal buffering
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         ok = self._cap.isOpened()
         if ok:
             self._backoff = BASE_BACKOFF

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 VEHICLE_CLASSES = [2, 3, 5, 7]
 CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
-_INFER_SIZE = 640
+_INFER_SIZE = 512
 
 
 class VehicleDetector:

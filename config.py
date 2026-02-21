@@ -23,6 +23,7 @@ class Config:
     YOLO_MODEL: str
     YOLO_CONF: float
     COUNT_LINE_RATIO: float  # fallback ratio if no DB line
+    DB_SNAPSHOT_INTERVAL_SEC: float
 
     # Bet logic
     BET_LOCK_SECONDS: int
@@ -52,8 +53,9 @@ class Config:
 
         self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
         self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
-        self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.50"))
+        self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.45"))
         self.COUNT_LINE_RATIO = float(os.getenv("COUNT_LINE_RATIO", "0.55"))
+        self.DB_SNAPSHOT_INTERVAL_SEC = float(os.getenv("DB_SNAPSHOT_INTERVAL_SEC", "0.75"))
         self.BET_LOCK_SECONDS = int(os.getenv("BET_LOCK_SECONDS", "10"))
         self.WS_PORT = int(os.getenv("WS_PORT", "8000"))
 

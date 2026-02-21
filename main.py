@@ -257,6 +257,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     logger.info("AI loop inner: opening HLS stream")
     frame_buf = None
     counter: LineCounter | None = None
+    last_db_write = 0.0
 
     async for frame in hls_stream.frames():
         # Hot-reload stream URL if the refresher has a newer one
@@ -277,9 +278,12 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
 
-        # Write snapshot to DB — exclude detection boxes and per_class_total (WS-only)
-        db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total")}
-        asyncio.create_task(write_snapshot(db_snapshot))
+        # Write snapshots at a fixed interval to reduce DB pressure without slowing live WS updates.
+        loop_now = asyncio.get_running_loop().time()
+        if (loop_now - last_db_write) >= cfg.DB_SNAPSHOT_INTERVAL_SEC:
+            db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total")}
+            asyncio.create_task(write_snapshot(db_snapshot))
+            last_db_write = loop_now
 
         if manager.public_count > 0:
             payload: dict = {"type": "count", **snapshot}
