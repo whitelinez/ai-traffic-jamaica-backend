@@ -85,7 +85,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             frame_buf = True
             logger.info("AI loop started: frame size %dx%d", w, h)
 
-        detections = await asyncio.to_thread(detector.detect, frame.copy())
+        detections = await asyncio.to_thread(detector.detect, frame)
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
 
