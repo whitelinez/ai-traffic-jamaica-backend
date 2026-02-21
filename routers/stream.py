@@ -1,8 +1,8 @@
 """
 routers/stream.py — GET /stream/live.m3u8
-Validates HMAC token, proxies the top-level HLS manifest from HLS_STREAM_URL,
-and rewrites any relative URLs to absolute so the browser can load segments
-directly from the source. Source URL is never exposed to the client.
+Validates HMAC token, reads the current HLS URL from Supabase (kept fresh by
+the url_refresh_loop), proxies the manifest, and rewrites relative URLs to
+absolute so the browser can load segments directly from ipcamlive.
 """
 import logging
 from urllib.parse import urljoin
@@ -13,10 +13,19 @@ from fastapi.responses import Response
 
 from config import get_config
 from middleware.hmac_auth import validate_ws_token
+from supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/stream", tags=["stream"])
+
+_PROXY_HEADERS = {
+    "Referer": "https://www.ipcamlive.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
 
 
 @router.get("/live.m3u8")
@@ -26,26 +35,27 @@ async def stream_manifest(token: str = Query(...)):
     if not validate_ws_token(token, cfg.WS_AUTH_SECRET):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    # Base URL for resolving relative paths in the manifest
-    base_url = cfg.HLS_STREAM_URL.rsplit("/", 1)[0] + "/"
+    # Get the current stream URL from Supabase (kept fresh by url_refresh_loop)
+    supabase = await get_supabase()
+    cam = await supabase.table("cameras").select("stream_url").eq("ipcam_alias", cfg.CAMERA_ALIAS).limit(1).execute()
+
+    if not cam.data or not cam.data[0].get("stream_url"):
+        raise HTTPException(status_code=503, detail="Stream URL not yet available — refresher may still be starting")
+
+    stream_url = cam.data[0]["stream_url"]
+    base_url = stream_url.rsplit("/", 1)[0] + "/"
 
     try:
-        headers = {
-            "Referer": "https://www.ipcamlive.com/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        }
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(cfg.HLS_STREAM_URL, headers=headers, follow_redirects=True)
+            resp = await client.get(stream_url, headers=_PROXY_HEADERS, follow_redirects=True)
     except Exception as exc:
         logger.error("Failed to fetch HLS manifest: %s", exc)
         raise HTTPException(status_code=502, detail="Stream unavailable")
 
     if resp.status_code != 200:
-        logger.warning("HLS manifest returned %d", resp.status_code)
+        logger.warning("HLS manifest returned %d for URL: %s", resp.status_code, stream_url)
         raise HTTPException(status_code=502, detail="Stream unavailable")
 
-    # Rewrite relative URLs in the manifest to absolute so the browser can
-    # fetch sub-playlists and segments directly from the source.
     lines = []
     for line in resp.text.splitlines():
         stripped = line.strip()

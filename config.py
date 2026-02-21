@@ -11,8 +11,9 @@ class Config:
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
 
-    # Stream
-    HLS_STREAM_URL: str
+    # Stream — permanent ipcamlive camera alias (never changes, no session expiry)
+    CAMERA_ALIAS: str
+    URL_REFRESH_INTERVAL: int  # seconds between proactive URL refreshes (default 240)
 
     # WebSocket auth (HMAC)
     WS_AUTH_SECRET: str
@@ -33,7 +34,7 @@ class Config:
         required = [
             "SUPABASE_URL",
             "SUPABASE_SERVICE_ROLE_KEY",
-            "HLS_STREAM_URL",
+            "CAMERA_ALIAS",
             "WS_AUTH_SECRET",
             "ALLOWED_ORIGIN",
         ]
@@ -45,10 +46,11 @@ class Config:
 
         self.SUPABASE_URL = os.environ["SUPABASE_URL"]
         self.SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-        self.HLS_STREAM_URL = os.environ["HLS_STREAM_URL"]
+        self.CAMERA_ALIAS = os.environ["CAMERA_ALIAS"]
         self.WS_AUTH_SECRET = os.environ["WS_AUTH_SECRET"]
         self.ALLOWED_ORIGIN = os.environ["ALLOWED_ORIGIN"]
 
+        self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
         self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
         self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.50"))
         self.COUNT_LINE_RATIO = float(os.getenv("COUNT_LINE_RATIO", "0.55"))

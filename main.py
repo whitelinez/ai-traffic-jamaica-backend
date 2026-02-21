@@ -1,16 +1,15 @@
 """
 main.py — FastAPI application entry point.
 - Validates env at startup (fail-fast)
-- Starts AI background task
+- Starts URL refresher first, waits for first live stream URL
+- Starts AI background task with live URL
 - Mounts all routers and WebSocket endpoints
 """
 import asyncio
-import json
 import logging
 import sys
 from contextlib import asynccontextmanager
 
-import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -28,6 +27,7 @@ from ai.stream import HLSStream
 from ai.detector import VehicleDetector
 from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot
+from ai.url_refresher import url_refresh_loop, get_current_url
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,30 +37,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── AI background task ─────────────────────────────────────────────────────────
-
+# ── Background task handles ────────────────────────────────────────────────────
+_refresh_task: asyncio.Task | None = None
 _ai_task: asyncio.Task | None = None
 
 
-async def ai_loop(cfg) -> None:
+async def ai_loop(cfg, hls_stream: HLSStream) -> None:
     """
     Continuous AI pipeline:
     HLS frames → YOLO detect → ByteTrack → LineZone → Supabase snapshot + WS broadcast
+
+    Checks for URL updates from the refresh loop on every reconnect.
     """
-    stream = HLSStream(cfg.HLS_STREAM_URL)
     detector = VehicleDetector(model_path=cfg.YOLO_MODEL, conf_threshold=cfg.YOLO_CONF)
     tracker = VehicleTracker()
 
-    # Resolve camera_id (first active camera)
     sb = await get_supabase()
-    cam_resp = await sb.table("cameras").select("id").eq("is_active", True).limit(1).execute()
+    cam_resp = await sb.table("cameras").select("id").eq("ipcam_alias", cfg.CAMERA_ALIAS).limit(1).execute()
     camera_id = cam_resp.data[0]["id"] if cam_resp.data else "default"
     logger.info("AI loop using camera_id: %s", camera_id)
 
     frame_buf = None
     counter: LineCounter | None = None
 
-    async for frame in stream.frames():
+    async for frame in hls_stream.frames():
+        # Hot-reload stream URL if the refresher has a newer one
+        fresh = get_current_url()
+        if fresh and fresh != hls_stream.url:
+            logger.info("AI loop: updating stream URL → %s", fresh)
+            hls_stream.url = fresh
+
         if frame_buf is None:
             h, w = frame.shape[:2]
             counter = LineCounter(camera_id, w, h)
@@ -71,10 +77,8 @@ async def ai_loop(cfg) -> None:
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
 
-        # Write to Supabase (non-blocking)
         asyncio.create_task(write_snapshot(snapshot))
 
-        # Broadcast to all public WS subscribers
         if manager.public_count > 0:
             await manager.broadcast_public({
                 "type": "count",
@@ -86,28 +90,45 @@ async def ai_loop(cfg) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _ai_task
+    global _refresh_task, _ai_task
 
-    # Fail-fast config validation
     cfg = get_config()
     logger.info("Config validated — starting WHITELINEZ backend")
 
-    # Init Supabase client
     await get_supabase()
 
-    # Start AI background task
-    _ai_task = asyncio.create_task(ai_loop(cfg), name="ai_loop")
-    logger.info("AI loop task started")
+    # 1. Start URL refresher — fetches immediately, then every interval
+    _refresh_task = asyncio.create_task(
+        url_refresh_loop(cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL),
+        name="url_refresh_loop",
+    )
+    logger.info("URL refresh task started (alias=%s, interval=%ds)", cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL)
+
+    # 2. Wait up to 30s for first URL before starting AI loop
+    stream_url = None
+    for _ in range(30):
+        stream_url = get_current_url()
+        if stream_url:
+            break
+        await asyncio.sleep(1)
+
+    if not stream_url:
+        logger.error("No stream URL after 30s — AI loop will not start. Check CAMERA_ALIAS and ipcamlive connectivity.")
+    else:
+        hls_stream = HLSStream(stream_url)
+        _ai_task = asyncio.create_task(ai_loop(cfg, hls_stream), name="ai_loop")
+        logger.info("AI loop started with URL: %s", stream_url)
 
     yield
 
     # Shutdown
-    if _ai_task and not _ai_task.done():
-        _ai_task.cancel()
-        try:
-            await _ai_task
-        except asyncio.CancelledError:
-            pass
+    for task in (_ai_task, _refresh_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     await close_supabase()
     logger.info("WHITELINEZ backend shutdown complete")
@@ -123,11 +144,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS — only allow Vercel frontend
 cfg_once = None
 try:
     cfg_once = get_config()
@@ -156,9 +175,11 @@ app.include_router(ws_account_router)
 async def health():
     return {
         "status": "ok",
+        "stream_url": get_current_url(),
         "public_ws_connections": manager.public_count,
         "user_ws_connections": manager.user_count,
         "ai_task_running": _ai_task is not None and not _ai_task.done(),
+        "refresh_task_running": _refresh_task is not None and not _refresh_task.done(),
     }
 
 
