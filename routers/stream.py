@@ -30,8 +30,12 @@ async def stream_manifest(token: str = Query(...)):
     base_url = cfg.HLS_STREAM_URL.rsplit("/", 1)[0] + "/"
 
     try:
+        headers = {
+            "Referer": "https://www.ipcamlive.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        }
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(cfg.HLS_STREAM_URL, follow_redirects=True)
+            resp = await client.get(cfg.HLS_STREAM_URL, headers=headers, follow_redirects=True)
     except Exception as exc:
         logger.error("Failed to fetch HLS manifest: %s", exc)
         raise HTTPException(status_code=502, detail="Stream unavailable")
