@@ -125,6 +125,30 @@ async def fetch_fresh_stream_url(alias: str) -> str | None:
         return url
 
 
+async def _supabase_update_stream_url(alias: str, url: str) -> bool:
+    """
+    Update cameras.stream_url via direct REST PATCH (bypasses supabase-py client quirks).
+    Returns True on success.
+    """
+    from config import get_config
+    cfg = get_config()
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.patch(
+            f"{cfg.SUPABASE_URL}/rest/v1/cameras",
+            params={"ipcam_alias": f"eq.{alias}"},
+            json={"stream_url": url},
+            headers={
+                "apikey": cfg.SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+        )
+    logger.info("Supabase PATCH status=%d body=%s", resp.status_code, resp.text[:300])
+    return resp.status_code in (200, 204)
+
+
 async def url_refresh_loop(alias: str, interval_seconds: int = 240) -> None:
     """
     Background task: fetch a fresh URL immediately on startup, then every
@@ -133,33 +157,13 @@ async def url_refresh_loop(alias: str, interval_seconds: int = 240) -> None:
     Must be started before the AI loop so the URL is ready on first use.
     """
     global _current_url
-    from supabase_client import get_supabase  # deferred to avoid circular import
-
-    supabase = await get_supabase()
-
-    # Ensure a camera row exists for this alias
-    existing = await supabase.table("cameras").select("id").eq("ipcam_alias", alias).limit(1).execute()
-    if not existing.data:
-        logger.info("No camera row found for alias %s — creating one", alias)
-        await supabase.table("cameras").insert({
-            "name": alias,
-            "ipcam_alias": alias,
-            "stream_url": "",
-            "is_active": True,
-        }).execute()
 
     while True:
         try:
             url = await fetch_fresh_stream_url(alias)
             if url:
                 _current_url = url
-                await (
-                    supabase.table("cameras")
-                    .update({"stream_url": url})
-                    .eq("ipcam_alias", alias)
-                    .execute()
-                )
-                logger.info("Stream URL saved to Supabase (alias=%s)", alias)
+                await _supabase_update_stream_url(alias, url)
             else:
                 logger.warning("Refresh returned no URL — keeping existing (alias=%s)", alias)
         except Exception as exc:
