@@ -25,15 +25,15 @@ class VehicleDetector:
 
     def detect(self, frame: np.ndarray) -> sv.Detections:
         """
-        Run inference on a BGR frame.
-        Converts to PIL Image (RGB) before passing to ultralytics — PIL is an
-        explicitly supported type in ultralytics 8.3.x and avoids internal
-        LetterBox preprocessing issues with raw cv2 numpy arrays.
+        Run inference on a BGR frame. Must be called from a thread (not async context)
+        — ultralytics uses threading internally which conflicts with asyncio.
+        Use asyncio.to_thread(detector.detect, frame.copy()) from async code.
         """
-        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        # Fresh writable C-contiguous copy — required when called from thread pool
+        frame = np.ascontiguousarray(frame, dtype=np.uint8)
 
         results = self.model.predict(
-            source=pil_image,
+            source=frame,
             conf=self.conf,
             classes=VEHICLE_CLASSES,
             verbose=False,
