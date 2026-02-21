@@ -13,9 +13,41 @@ from models.round import CreateRoundRequest, RoundOut
 logger = logging.getLogger(__name__)
 
 
+def _is_valid_count_line(count_line: Any) -> bool:
+    """
+    Accepts either:
+    - 2-point line: x1,y1,x2,y2
+    - 4-point polygon: x1,y1,x2,y2,x3,y3,x4,y4
+    Values must be numeric and normalized in [0, 1].
+    """
+    if not isinstance(count_line, dict):
+        return False
+
+    has_poly = all(k in count_line for k in ("x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4"))
+    has_line = all(k in count_line for k in ("x1", "y1", "x2", "y2"))
+    if not (has_poly or has_line):
+        return False
+
+    keys = ("x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4") if has_poly else ("x1", "y1", "x2", "y2")
+    for k in keys:
+        v = count_line.get(k)
+        if not isinstance(v, (int, float)):
+            return False
+        if v < 0 or v > 1:
+            return False
+    return True
+
+
 async def create_round(req: CreateRoundRequest) -> RoundOut:
     """Create a new bet round + associated markets in one batch."""
     sb = await get_supabase()
+
+    cam_resp = await sb.table("cameras").select("id, count_line").eq("id", str(req.camera_id)).single().execute()
+    camera = cam_resp.data or {}
+    if not camera:
+        raise ValueError("Selected camera was not found.")
+    if not _is_valid_count_line(camera.get("count_line")):
+        raise ValueError("Count area is not set. Save a valid count zone before creating a round.")
 
     round_data = {
         "camera_id": str(req.camera_id),

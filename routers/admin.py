@@ -31,7 +31,10 @@ async def admin_create_round(
     body: CreateRoundRequest,
     admin: Annotated[dict, Depends(_require_admin_user)],
 ):
-    return await create_round(body)
+    try:
+        return await create_round(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/resolve")
