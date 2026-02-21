@@ -84,6 +84,8 @@ class LineCounter:
         if self._zone is None or (now - self._last_refresh) > LINE_REFRESH_INTERVAL:
             await self._refresh_line()
 
+        new_crossings = 0
+
         if self._zone_type == "polygon":
             # PolygonZone: count vehicles currently inside the zone
             inside_mask = self._zone.trigger(detections=detections)
@@ -95,6 +97,11 @@ class LineCounter:
                 if is_inside and i < len(detections.class_id):
                     cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
                     breakdown[cls_name] = breakdown.get(cls_name, 0) + 1
+            # "crossing" for polygon = change in occupancy vs previous frame
+            prev_total = getattr(self, "_prev_total", 0)
+            if total > prev_total:
+                new_crossings = total - prev_total
+            self._prev_total = total
         else:
             # LineZone: cumulative crossing count
             crossed_in, crossed_out = self._zone.trigger(detections=detections)
@@ -105,27 +112,33 @@ class LineCounter:
                 bucket = self._counts.setdefault(cls_name, {"in": 0, "out": 0})
                 if in_flag:
                     bucket["in"] += 1
+                    new_crossings += 1
                 if out_flag:
                     bucket["out"] += 1
+                    new_crossings += 1
             total_in = self._zone.in_count
             total_out = self._zone.out_count
             total = total_in + total_out
             breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
 
-        # Build relative-coord bounding boxes for frontend visualization
+        # Build relative-coord bounding boxes for frontend visualization.
+        # Only include detections with a known vehicle class — skips ghost predictions.
+        valid_cls_ids = set(CLASS_NAMES.keys())
         boxes = []
         if len(detections) > 0 and detections.xyxy is not None:
-            for i in range(min(len(detections.xyxy), 60)):  # cap at 60 boxes
+            for i in range(min(len(detections.xyxy), 60)):
                 x1, y1, x2, y2 = detections.xyxy[i]
                 cls_id = int(detections.class_id[i]) if (
                     detections.class_id is not None and i < len(detections.class_id)
                 ) else -1
+                if cls_id not in valid_cls_ids:
+                    continue  # skip unknown/ghost predictions
                 boxes.append({
                     "x1": round(float(x1) / self.frame_width,  4),
                     "y1": round(float(y1) / self.frame_height, 4),
                     "x2": round(float(x2) / self.frame_width,  4),
                     "y2": round(float(y2) / self.frame_height, 4),
-                    "cls": CLASS_NAMES.get(cls_id, "vehicle"),
+                    "cls": CLASS_NAMES[cls_id],
                 })
 
         snapshot = {
@@ -136,6 +149,7 @@ class LineCounter:
             "total": total,
             "vehicle_breakdown": breakdown,
             "detections": boxes,
+            "new_crossings": new_crossings,
         }
         return snapshot
 
