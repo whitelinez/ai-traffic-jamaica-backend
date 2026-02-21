@@ -181,9 +181,6 @@ class LineCounter:
                     "x2": round(float(x2) / self.frame_width,  4),
                     "y2": round(float(y2) / self.frame_height, 4),
                     "cls": CLASS_NAMES[cls_id],
-                    "conf": round(float(detections.confidence[i]), 3) if (
-                        detections.confidence is not None and i < len(detections.confidence)
-                    ) else None,
                 })
 
         snapshot = {

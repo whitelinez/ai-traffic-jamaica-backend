@@ -23,10 +23,6 @@ class Config:
     YOLO_MODEL: str
     YOLO_CONF: float
     COUNT_LINE_RATIO: float  # fallback ratio if no DB line
-    INCLUDE_PERSON_CLASS: bool
-    AI_SNAPSHOT_INTERVAL_SEC: float
-    AI_BROADCAST_INTERVAL_SEC: float
-    ML_LOG_INTERVAL_SEC: float
 
     # Bet logic
     BET_LOCK_SECONDS: int
@@ -58,10 +54,6 @@ class Config:
         self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
         self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.50"))
         self.COUNT_LINE_RATIO = float(os.getenv("COUNT_LINE_RATIO", "0.55"))
-        self.INCLUDE_PERSON_CLASS = os.getenv("INCLUDE_PERSON_CLASS", "true").lower() in ("1", "true", "yes", "on")
-        self.AI_SNAPSHOT_INTERVAL_SEC = float(os.getenv("AI_SNAPSHOT_INTERVAL_SEC", "1.0"))
-        self.AI_BROADCAST_INTERVAL_SEC = float(os.getenv("AI_BROADCAST_INTERVAL_SEC", "0.10"))
-        self.ML_LOG_INTERVAL_SEC = float(os.getenv("ML_LOG_INTERVAL_SEC", "2.0"))
         self.BET_LOCK_SECONDS = int(os.getenv("BET_LOCK_SECONDS", "10"))
         self.WS_PORT = int(os.getenv("WS_PORT", "8000"))
 
