@@ -11,18 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install CPU-only PyTorch first to avoid pulling 2.5GB GPU build
+# Install CPU-only PyTorch — 2.3.1 supports numpy 2.x (avoids ABI mismatch with opencv 4.11)
 RUN pip install --no-cache-dir \
-    torch==2.2.2+cpu \
-    torchvision==0.17.2+cpu \
+    torch==2.3.1+cpu \
+    torchvision==0.18.1+cpu \
     --index-url https://download.pytorch.org/whl/cpu
 
 # Install remaining deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Re-pin numpy to 1.x — torch 2.2.2 is compiled against numpy 1.x and breaks on numpy 2.x
-RUN pip install --no-cache-dir "numpy==1.26.4"
 
 # Pre-download YOLO weights so they're baked in — avoids 6MB download on every cold start
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
