@@ -6,12 +6,13 @@
 -- ── Tables ───────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS cameras (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name        TEXT NOT NULL,
-  stream_url  TEXT NOT NULL DEFAULT '',
-  count_line  JSONB,                        -- {x1,y1,x2,y2} as 0–1 relative coords
-  is_active   BOOLEAN DEFAULT TRUE,
-  created_at  TIMESTAMPTZ DEFAULT now()
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name         TEXT NOT NULL,
+  ipcam_alias  TEXT UNIQUE,                  -- ipcamlive camera alias (e.g. "abc123")
+  stream_url   TEXT NOT NULL DEFAULT '',     -- refreshed every ~4min by url_refresh_loop
+  count_line   JSONB,                        -- {x1,y1,x2,y2} as 0–1 relative coords
+  is_active    BOOLEAN DEFAULT TRUE,
+  created_at   TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS bet_rounds (
@@ -59,10 +60,24 @@ CREATE TABLE IF NOT EXISTS count_snapshots (
   vehicle_breakdown JSONB
 );
 
--- ── Seed: default camera (required for AI loop to start) ─────────────────────
+-- ── User balances ─────────────────────────────────────────────────────────────
 
-INSERT INTO cameras (name, stream_url, is_active)
-VALUES ('Kingston Feed', '', TRUE)
+CREATE TABLE IF NOT EXISTS user_balances (
+  user_id   UUID REFERENCES auth.users PRIMARY KEY,
+  balance   INT  NOT NULL DEFAULT 1000 CHECK (balance >= 0)
+);
+
+ALTER TABLE user_balances ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "own_balance_select" ON user_balances;
+CREATE POLICY "own_balance_select" ON user_balances
+  FOR SELECT USING (auth.uid() = user_id);
+
+-- ── Seed: default camera (required for AI loop to start) ─────────────────────
+-- Set ipcam_alias to your ipcamlive camera alias (e.g. "5e8a2f9c1b3d4").
+
+INSERT INTO cameras (name, ipcam_alias, stream_url, is_active)
+VALUES ('Kingston Feed', NULL, '', TRUE)
 ON CONFLICT DO NOTHING;
 
 -- ── Row Level Security ────────────────────────────────────────────────────────
@@ -74,29 +89,110 @@ ALTER TABLE bets             ENABLE ROW LEVEL SECURITY;
 ALTER TABLE count_snapshots  ENABLE ROW LEVEL SECURITY;
 
 -- Cameras: public read, admin write
+DROP POLICY IF EXISTS "public_read_cameras"  ON cameras;
+DROP POLICY IF EXISTS "admin_write_cameras"  ON cameras;
 CREATE POLICY "public_read_cameras" ON cameras
   FOR SELECT USING (true);
-
 CREATE POLICY "admin_write_cameras" ON cameras
   FOR ALL USING (
     (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
   );
 
 -- Bet rounds: public read, service role write (backend only)
+DROP POLICY IF EXISTS "public_read_rounds" ON bet_rounds;
 CREATE POLICY "public_read_rounds" ON bet_rounds
   FOR SELECT USING (true);
 
 -- Markets: public read, service role write
+DROP POLICY IF EXISTS "public_read_markets" ON markets;
 CREATE POLICY "public_read_markets" ON markets
   FOR SELECT USING (true);
 
 -- Bets: users see only their own
+DROP POLICY IF EXISTS "own_bets_select" ON bets;
+DROP POLICY IF EXISTS "own_bets_insert" ON bets;
 CREATE POLICY "own_bets_select" ON bets
   FOR SELECT USING (auth.uid() = user_id);
-
 CREATE POLICY "own_bets_insert" ON bets
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 -- Count snapshots: public read, service role write
+DROP POLICY IF EXISTS "public_read_snapshots" ON count_snapshots;
 CREATE POLICY "public_read_snapshots" ON count_snapshots
   FOR SELECT USING (true);
+
+-- ── Database functions ────────────────────────────────────────────────────────
+
+-- Atomically place a bet: check balance → deduct → insert bet → update staked.
+-- Called by bet_service.py via sb.rpc("place_bet_atomic", {...}).
+-- SECURITY DEFINER runs as table owner, bypassing RLS for internal writes.
+CREATE OR REPLACE FUNCTION place_bet_atomic(
+  p_user_id        UUID,
+  p_round_id       UUID,
+  p_market_id      UUID,
+  p_amount         INT,
+  p_potential_payout INT
+) RETURNS JSON
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_balance INT;
+  v_bet_id  UUID;
+BEGIN
+  -- Auto-init balance for new users
+  INSERT INTO user_balances (user_id, balance)
+  VALUES (p_user_id, 1000)
+  ON CONFLICT (user_id) DO NOTHING;
+
+  -- Lock the row to prevent race conditions
+  SELECT balance INTO v_balance
+  FROM user_balances
+  WHERE user_id = p_user_id
+  FOR UPDATE;
+
+  IF v_balance < p_amount THEN
+    RETURN json_build_object('error', 'Insufficient balance');
+  END IF;
+
+  -- Deduct stake
+  UPDATE user_balances
+  SET balance = balance - p_amount
+  WHERE user_id = p_user_id;
+
+  -- Insert bet
+  INSERT INTO bets (user_id, round_id, market_id, amount, potential_payout, status)
+  VALUES (p_user_id, p_round_id, p_market_id, p_amount, p_potential_payout, 'pending')
+  RETURNING id INTO v_bet_id;
+
+  -- Update market total_staked
+  UPDATE markets
+  SET total_staked = total_staked + p_amount
+  WHERE id = p_market_id;
+
+  RETURN json_build_object('bet_id', v_bet_id);
+END;
+$$;
+
+-- Return a user's current balance. Auto-initialises to 1000 for new users.
+CREATE OR REPLACE FUNCTION get_user_balance(p_user_id UUID)
+RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  INSERT INTO user_balances (user_id, balance)
+  VALUES (p_user_id, 1000)
+  ON CONFLICT (user_id) DO NOTHING;
+
+  RETURN (SELECT balance FROM user_balances WHERE user_id = p_user_id);
+END;
+$$;
+
+-- Add credits to a user's balance (called on bet resolution/payout).
+CREATE OR REPLACE FUNCTION credit_user_balance(p_user_id UUID, p_amount INT)
+RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  INSERT INTO user_balances (user_id, balance)
+  VALUES (p_user_id, p_amount)
+  ON CONFLICT (user_id) DO UPDATE
+    SET balance = user_balances.balance + EXCLUDED.balance;
+END;
+$$;
