@@ -28,27 +28,26 @@ class VehicleDetector:
         """
         Run inference on a BGR frame. Must be called from a thread.
 
-        OpenCV 4.11 in this build cannot call cv2.resize on Python-created numpy
-        arrays (PyArray_Check fails), only on arrays it created internally.
-        Work-around: letterbox the frame ourselves here (frame came from
-        VideoCapture so it passes cv2's check), then pass a pre-sized 640x640
-        padded image to ultralytics so its LetterBox finds no resize needed and
-        never calls cv2.resize internally.  Detection boxes are scaled back to
-        original frame coordinates before returning.
+        OpenCV 4.11.0 in this build rejects Python-created numpy arrays in cv2
+        operations (PyArray_Check ABI mismatch). Only arrays allocated by cv2's
+        own C code pass the check. Strategy:
+          1. Resize the frame ourselves using cv2.resize — frame is cv2-allocated
+             (from VideoCapture), and cv2.resize returns a cv2-allocated result.
+          2. Pass ONLY the resized frame to ultralytics. ultralytics' LetterBox
+             sees it already fits the width (640), so cv2.resize is skipped.
+             It then calls cv2.copyMakeBorder on our cv2-allocated array → works.
+          3. Scale detected boxes back to original frame dimensions.
         """
         h, w = frame.shape[:2]
 
-        # Letterbox: scale to fit _INFER_SIZE, preserve aspect ratio
+        # Scale to fit _INFER_SIZE on the longer side, maintaining aspect ratio.
+        # cv2.resize on a cv2-allocated frame returns a cv2-allocated result.
         scale = min(_INFER_SIZE / h, _INFER_SIZE / w)
         new_w, new_h = int(w * scale), int(h * scale)
-
-        # cv2.resize works here — frame was allocated by VideoCapture (C side)
         resized = cv2.resize(frame, (new_w, new_h))
-        padded = np.zeros((_INFER_SIZE, _INFER_SIZE, 3), dtype=np.uint8)
-        padded[:new_h, :new_w] = resized
 
         results = self.model.predict(
-            source=padded,
+            source=resized,
             conf=self.conf,
             classes=VEHICLE_CLASSES,
             verbose=False,
@@ -57,10 +56,10 @@ class VehicleDetector:
 
         detections = sv.Detections.from_ultralytics(results)
 
-        # Remap boxes from 640x640 padded space back to original frame space
+        # ultralytics maps boxes back to source (resized) space.
+        # Scale from resized to original frame coordinates.
         if len(detections) > 0:
-            detections.xyxy[:, [0, 2]] /= scale  # x
-            detections.xyxy[:, [1, 3]] /= scale  # y
+            detections.xyxy /= scale
 
         return detections
 
