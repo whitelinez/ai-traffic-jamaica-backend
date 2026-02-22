@@ -482,6 +482,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         if frame_buf is None:
             h, w = frame.shape[:2]
             counter = LineCounter(camera_id, w, h)
+            await counter.bootstrap_from_latest_snapshot()
             _counter_ref = counter
             frame_buf = True
             logger.info("AI loop started: frame size %dx%d", w, h)

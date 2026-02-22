@@ -50,6 +50,58 @@ class LineCounter:
         self._confirmed_out = 0
         self._confirmed_total = 0
 
+    async def bootstrap_from_latest_snapshot(self) -> None:
+        """
+        Restore in-memory totals from the latest DB snapshot so redeploys/restarts
+        do not reset the visible running count.
+        """
+        try:
+            sb = await get_supabase()
+            resp = await (
+                sb.table("count_snapshots")
+                .select("total, count_in, count_out, vehicle_breakdown")
+                .eq("camera_id", self.camera_id)
+                .order("captured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                return
+
+            latest = rows[0] or {}
+            breakdown = latest.get("vehicle_breakdown") or {}
+            if not isinstance(breakdown, dict):
+                breakdown = {}
+
+            rebuilt_per_class: dict[str, int] = {}
+            for cls_name, raw_val in breakdown.items():
+                try:
+                    rebuilt_per_class[str(cls_name)] = int(raw_val or 0)
+                except Exception:
+                    rebuilt_per_class[str(cls_name)] = 0
+
+            self._per_class_total = rebuilt_per_class
+            self._confirmed_total = int(
+                latest.get("total", 0) or sum(rebuilt_per_class.values())
+            )
+            self._confirmed_in = int(latest.get("count_in", 0) or 0)
+            self._confirmed_out = int(latest.get("count_out", 0) or 0)
+
+            # Preserve per-class totals while rebuilding display buckets.
+            self._counts = {
+                cls_name: {"in": total, "out": 0}
+                for cls_name, total in rebuilt_per_class.items()
+            }
+
+            logger.info(
+                "Counter bootstrapped from snapshot: total=%s classes=%s",
+                self._confirmed_total,
+                len(rebuilt_per_class),
+            )
+        except Exception as exc:
+            logger.warning("Counter bootstrap failed: %s", exc)
+
     async def _refresh_line(self) -> None:
         """Fetch count_line and detect_zone from Supabase cameras table."""
         sb = await get_supabase()
