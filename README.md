@@ -22,6 +22,33 @@
 - `BET_LOCK_SECONDS=10`
 - `WS_PORT=8000`
 
+## Optional Live Dataset Capture (Auto-collect from stream)
+- `AUTO_CAPTURE_ENABLED=1`
+- `AUTO_CAPTURE_DATASET_ROOT=dataset`
+- `AUTO_CAPTURE_CLASSES=car`
+- `AUTO_CAPTURE_MIN_CONF=0.45`
+- `AUTO_CAPTURE_COOLDOWN_SEC=5.0`
+- `AUTO_CAPTURE_VAL_SPLIT=0.2`
+- `AUTO_CAPTURE_JPEG_QUALITY=90`
+- `AUTO_CAPTURE_MAX_BOXES_PER_FRAME=30`
+
+When enabled, detected classes are written as YOLO files:
+- `dataset/images/train/*.jpg`
+- `dataset/images/val/*.jpg`
+- `dataset/labels/train/*.txt`
+- `dataset/labels/val/*.txt`
+
+### Optional: Auto-upload Captures to Supabase Storage
+- `AUTO_CAPTURE_UPLOAD_ENABLED=1`
+- `AUTO_CAPTURE_UPLOAD_BUCKET=ml-datasets`
+- `AUTO_CAPTURE_UPLOAD_PREFIX=datasets/live-capture`
+- `AUTO_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD=0`
+- `AUTO_CAPTURE_UPLOAD_TIMEOUT_SEC=20`
+
+Uploaded object layout:
+- `<prefix>/images/{train|val}/{camera_id}/*.jpg`
+- `<prefix>/labels/{train|val}/{camera_id}/*.txt`
+
 ## Quick Tuning (Safe)
 - More responsive detection:
   - Lower `YOLO_CONF` slightly (example `0.40` to `0.45`).

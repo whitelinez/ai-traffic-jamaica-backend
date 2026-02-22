@@ -30,10 +30,13 @@ from ai.stream import HLSStream
 from ai.detector import VehicleDetector
 from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot
+from ai.dataset_capture import LiveDatasetCapture
+from ai.dataset_upload import SupabaseDatasetUploader
 from ai.url_refresher import url_refresh_loop, get_current_url
 from services.round_service import resolve_round_from_latest_snapshot
 from services.analytics_service import write_ml_detection_event
 from services.ml_pipeline_service import auto_retrain_cycle
+from services.ml_capture_monitor import record_capture_event
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -307,6 +310,54 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     frame_buf = None
     counter: LineCounter | None = None
     last_db_write = 0.0
+    capture = LiveDatasetCapture(
+        enabled=(cfg.AUTO_CAPTURE_ENABLED == 1),
+        dataset_root=cfg.AUTO_CAPTURE_DATASET_ROOT,
+        classes=[c.strip() for c in cfg.AUTO_CAPTURE_CLASSES.split(",")],
+        min_conf=cfg.AUTO_CAPTURE_MIN_CONF,
+        cooldown_sec=cfg.AUTO_CAPTURE_COOLDOWN_SEC,
+        val_split=cfg.AUTO_CAPTURE_VAL_SPLIT,
+        jpeg_quality=cfg.AUTO_CAPTURE_JPEG_QUALITY,
+        max_boxes_per_frame=cfg.AUTO_CAPTURE_MAX_BOXES_PER_FRAME,
+    )
+    uploader = SupabaseDatasetUploader(
+        enabled=(cfg.AUTO_CAPTURE_UPLOAD_ENABLED == 1),
+        supabase_url=cfg.SUPABASE_URL,
+        service_role_key=cfg.SUPABASE_SERVICE_ROLE_KEY,
+        bucket=cfg.AUTO_CAPTURE_UPLOAD_BUCKET,
+        prefix=cfg.AUTO_CAPTURE_UPLOAD_PREFIX,
+        timeout_sec=cfg.AUTO_CAPTURE_UPLOAD_TIMEOUT_SEC,
+        delete_local_after_upload=(cfg.AUTO_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD == 1),
+    )
+
+    async def _upload_capture_async(capture_payload: dict) -> None:
+        upload_result = await uploader.upload_capture(
+            image_path=capture_payload["image_path"],
+            label_path=capture_payload["label_path"],
+            split=capture_payload["split"],
+            camera_id=str(camera_id),
+        )
+        if upload_result.get("ok"):
+            record_capture_event(
+                "upload_success",
+                "Uploaded capture to Supabase storage",
+                {
+                    "split": capture_payload["split"],
+                    "remote_image": upload_result.get("remote_image"),
+                    "remote_label": upload_result.get("remote_label"),
+                },
+            )
+        else:
+            record_capture_event(
+                "upload_failed",
+                "Failed to upload capture",
+                {
+                    "split": capture_payload["split"],
+                    "error": upload_result.get("error"),
+                    "image_path": capture_payload["image_path"],
+                    "label_path": capture_payload["label_path"],
+                },
+            )
 
     async for frame in hls_stream.frames():
         # Hot-reload stream URL if the refresher has a newer one
@@ -326,6 +377,31 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         detections = counter.zone_filter(detections)
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
+        capture_result = await asyncio.to_thread(
+            capture.maybe_capture,
+            frame,
+            snapshot.get("detections", []),
+            str(camera_id),
+        )
+        if capture_result is not None:
+            logger.info(
+                "Captured sample split=%s boxes=%s image=%s",
+                capture_result["split"],
+                capture_result["boxes"],
+                capture_result["image_path"],
+            )
+            record_capture_event(
+                "capture_saved",
+                "Captured live frame for dataset",
+                {
+                    "split": capture_result["split"],
+                    "boxes": capture_result["boxes"],
+                    "image_path": capture_result["image_path"],
+                    "label_path": capture_result["label_path"],
+                },
+            )
+            if cfg.AUTO_CAPTURE_UPLOAD_ENABLED == 1:
+                asyncio.create_task(_upload_capture_async(capture_result))
 
         # Write snapshots at a fixed interval to reduce DB pressure without slowing live WS updates.
         loop_now = asyncio.get_running_loop().time()

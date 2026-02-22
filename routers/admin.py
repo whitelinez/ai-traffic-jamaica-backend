@@ -12,6 +12,7 @@ from models.round import CreateRoundRequest, ResolveRoundRequest, RoundOut
 from services.auth_service import validate_supabase_jwt, require_admin, get_user_id
 from services.round_service import create_round, resolve_round, resolve_round_from_latest_snapshot
 from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models
+from services.ml_capture_monitor import get_capture_status
 from config import get_config
 from supabase_client import get_supabase
 from middleware.rate_limiter import limiter
@@ -202,3 +203,18 @@ async def admin_ml_models(
     limit: int = Query(default=50, ge=1, le=500),
 ):
     return {"models": await list_models(limit=limit)}
+
+
+@router.get("/ml/capture-status")
+async def admin_ml_capture_status(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    cfg = get_config()
+    status = get_capture_status(limit=limit)
+    return {
+        "capture_enabled": cfg.AUTO_CAPTURE_ENABLED == 1,
+        "upload_enabled": cfg.AUTO_CAPTURE_UPLOAD_ENABLED == 1,
+        "capture_classes": [c.strip() for c in cfg.AUTO_CAPTURE_CLASSES.split(",") if c.strip()],
+        **status,
+    }

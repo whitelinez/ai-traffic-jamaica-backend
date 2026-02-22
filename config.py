@@ -45,6 +45,19 @@ class Config:
     ML_AUTO_RETRAIN_HOURS: int
     ML_AUTO_RETRAIN_MIN_ROWS: int
     ML_AUTO_RETRAIN_MIN_SCORE_GAIN: float
+    AUTO_CAPTURE_ENABLED: int
+    AUTO_CAPTURE_DATASET_ROOT: str
+    AUTO_CAPTURE_CLASSES: str
+    AUTO_CAPTURE_MIN_CONF: float
+    AUTO_CAPTURE_COOLDOWN_SEC: float
+    AUTO_CAPTURE_VAL_SPLIT: float
+    AUTO_CAPTURE_JPEG_QUALITY: int
+    AUTO_CAPTURE_MAX_BOXES_PER_FRAME: int
+    AUTO_CAPTURE_UPLOAD_ENABLED: int
+    AUTO_CAPTURE_UPLOAD_BUCKET: str
+    AUTO_CAPTURE_UPLOAD_PREFIX: str
+    AUTO_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD: int
+    AUTO_CAPTURE_UPLOAD_TIMEOUT_SEC: float
 
     # Bet logic
     BET_LOCK_SECONDS: int
@@ -98,6 +111,19 @@ class Config:
         self.ML_AUTO_RETRAIN_HOURS = int(os.getenv("ML_AUTO_RETRAIN_HOURS", "24"))
         self.ML_AUTO_RETRAIN_MIN_ROWS = int(os.getenv("ML_AUTO_RETRAIN_MIN_ROWS", "1000"))
         self.ML_AUTO_RETRAIN_MIN_SCORE_GAIN = float(os.getenv("ML_AUTO_RETRAIN_MIN_SCORE_GAIN", "0.015"))
+        self.AUTO_CAPTURE_ENABLED = int(os.getenv("AUTO_CAPTURE_ENABLED", "0"))
+        self.AUTO_CAPTURE_DATASET_ROOT = os.getenv("AUTO_CAPTURE_DATASET_ROOT", "dataset")
+        self.AUTO_CAPTURE_CLASSES = os.getenv("AUTO_CAPTURE_CLASSES", "car")
+        self.AUTO_CAPTURE_MIN_CONF = float(os.getenv("AUTO_CAPTURE_MIN_CONF", "0.45"))
+        self.AUTO_CAPTURE_COOLDOWN_SEC = float(os.getenv("AUTO_CAPTURE_COOLDOWN_SEC", "5.0"))
+        self.AUTO_CAPTURE_VAL_SPLIT = float(os.getenv("AUTO_CAPTURE_VAL_SPLIT", "0.2"))
+        self.AUTO_CAPTURE_JPEG_QUALITY = int(os.getenv("AUTO_CAPTURE_JPEG_QUALITY", "90"))
+        self.AUTO_CAPTURE_MAX_BOXES_PER_FRAME = int(os.getenv("AUTO_CAPTURE_MAX_BOXES_PER_FRAME", "30"))
+        self.AUTO_CAPTURE_UPLOAD_ENABLED = int(os.getenv("AUTO_CAPTURE_UPLOAD_ENABLED", "0"))
+        self.AUTO_CAPTURE_UPLOAD_BUCKET = os.getenv("AUTO_CAPTURE_UPLOAD_BUCKET", "ml-datasets")
+        self.AUTO_CAPTURE_UPLOAD_PREFIX = os.getenv("AUTO_CAPTURE_UPLOAD_PREFIX", "datasets/live-capture")
+        self.AUTO_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD = int(os.getenv("AUTO_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD", "0"))
+        self.AUTO_CAPTURE_UPLOAD_TIMEOUT_SEC = float(os.getenv("AUTO_CAPTURE_UPLOAD_TIMEOUT_SEC", "20"))
         self.BET_LOCK_SECONDS = int(os.getenv("BET_LOCK_SECONDS", "10"))
         self.WS_PORT = int(os.getenv("WS_PORT", "8000"))
 
