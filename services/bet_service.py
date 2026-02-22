@@ -71,15 +71,17 @@ def _extract_bet_id_from_rpc_data(data) -> str:
 
 
 async def _pending_bets_for_round(sb, user_id: str, round_id: str) -> int:
+    # `head=True` is not supported on some supabase-py versions.
+    # Use a compatible query and count rows client-side.
     resp = await (
         sb.table("bets")
-        .select("id", count="exact", head=True)
+        .select("id")
         .eq("user_id", user_id)
         .eq("round_id", round_id)
         .eq("status", "pending")
         .execute()
     )
-    return int(resp.count or 0)
+    return len(resp.data or [])
 
 
 async def _get_baseline_count(sb, camera_id: str | None, market_type: str, params: dict | None) -> int:
