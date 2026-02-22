@@ -332,34 +332,44 @@ async def get_ml_diagnostics(*, cfg=None) -> dict[str, Any]:
 
     since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
-    total_rows_resp = await sb.table("ml_detection_events").select("id", count="exact", head=True).execute()
-    rows_24h_resp = await (
-        sb.table("ml_detection_events")
-        .select("id", count="exact", head=True)
-        .gte("captured_at", since_24h)
-        .execute()
-    )
-    latest_det_resp = await (
-        sb.table("ml_detection_events")
-        .select("captured_at, avg_confidence, model_name")
-        .order("captured_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    latest_job_resp = await (
-        sb.table("ml_training_jobs")
-        .select("id, job_type, status, created_at, completed_at, notes")
-        .eq("job_type", "train")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    active_model = await get_active_model()
+    schema_error: str | None = None
+    total_rows = 0
+    rows_24h = 0
+    latest_det = None
+    latest_job = None
+    active_model = None
 
-    total_rows = int(total_rows_resp.count or 0)
-    rows_24h = int(rows_24h_resp.count or 0)
-    latest_det = (latest_det_resp.data or [None])[0]
-    latest_job = (latest_job_resp.data or [None])[0]
+    try:
+        total_rows_resp = await sb.table("ml_detection_events").select("id", count="exact", head=True).execute()
+        rows_24h_resp = await (
+            sb.table("ml_detection_events")
+            .select("id", count="exact", head=True)
+            .gte("captured_at", since_24h)
+            .execute()
+        )
+        latest_det_resp = await (
+            sb.table("ml_detection_events")
+            .select("captured_at, avg_confidence, model_name")
+            .order("captured_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest_job_resp = await (
+            sb.table("ml_training_jobs")
+            .select("id, job_type, status, created_at, completed_at, notes")
+            .eq("job_type", "train")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        active_model = await get_active_model()
+
+        total_rows = int(total_rows_resp.count or 0)
+        rows_24h = int(rows_24h_resp.count or 0)
+        latest_det = (latest_det_resp.data or [None])[0]
+        latest_job = (latest_job_resp.data or [None])[0]
+    except Exception as exc:
+        schema_error = str(exc)
 
     checks: list[dict[str, Any]] = []
 
@@ -382,6 +392,13 @@ async def get_ml_diagnostics(*, cfg=None) -> dict[str, Any]:
     push("Trainer webhook", webhook_ok, "TRAINER_WEBHOOK_URL is set" if webhook_ok else "Missing TRAINER_WEBHOOK_URL", value=getattr(cfg, "TRAINER_WEBHOOK_URL", ""))
     push("Trainer secret", webhook_secret_ok, "TRAINER_WEBHOOK_SECRET is set" if webhook_secret_ok else "Missing TRAINER_WEBHOOK_SECRET")
     push("Dataset YAML URL", dataset_yaml_ok, "TRAINER_DATASET_YAML_URL is set" if dataset_yaml_ok else "Missing TRAINER_DATASET_YAML_URL", value=getattr(cfg, "TRAINER_DATASET_YAML_URL", ""))
+    if schema_error:
+        push(
+            "ML schema",
+            False,
+            f"ML tables unavailable or not migrated: {schema_error}",
+            value="missing_or_incompatible_tables",
+        )
     push(
         "Auto retrain loop",
         auto_loop_on,

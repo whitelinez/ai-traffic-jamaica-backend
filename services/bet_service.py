@@ -40,6 +40,36 @@ def _parse_round_closes_at(rnd: dict) -> datetime:
         raise HTTPException(status_code=400, detail="Round timing is invalid (bad closes_at format)")
 
 
+def _extract_bet_id_from_rpc_data(data) -> str:
+    """
+    Supabase RPC payloads can vary by client version.
+    Accept common shapes and fail with a clear error if unknown.
+    """
+    # {"bet_id": "..."}
+    if isinstance(data, dict):
+        if data.get("bet_id"):
+            return str(data["bet_id"])
+        # {"place_bet_atomic": {"bet_id": "..."}}
+        inner = data.get("place_bet_atomic")
+        if isinstance(inner, dict) and inner.get("bet_id"):
+            return str(inner["bet_id"])
+
+    # [{"bet_id": "..."}] or [{"place_bet_atomic": {"bet_id":"..."}}]
+    if isinstance(data, list) and data:
+        row = data[0]
+        if isinstance(row, dict):
+            if row.get("bet_id"):
+                return str(row["bet_id"])
+            inner = row.get("place_bet_atomic")
+            if isinstance(inner, dict) and inner.get("bet_id"):
+                return str(inner["bet_id"])
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"Unexpected RPC response format from place_bet_atomic: {type(data).__name__}",
+    )
+
+
 async def _pending_bets_for_round(sb, user_id: str, round_id: str) -> int:
     resp = await (
         sb.table("bets")
@@ -151,7 +181,7 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
     if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
         raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
 
-    bet_id = rpc_resp.data["bet_id"] if isinstance(rpc_resp.data, dict) else rpc_resp.data[0]["bet_id"]
+    bet_id = _extract_bet_id_from_rpc_data(rpc_resp.data)
     baseline_count = await _get_baseline_count(
         sb,
         rnd.get("camera_id"),
@@ -263,7 +293,7 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
         raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
 
-    bet_id = rpc_resp.data["bet_id"] if isinstance(rpc_resp.data, dict) else rpc_resp.data[0]["bet_id"]
+    bet_id = _extract_bet_id_from_rpc_data(rpc_resp.data)
 
     # 5. Update inserted bet with live-bet specific metadata
     window_start = now
