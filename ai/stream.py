@@ -1,14 +1,15 @@
 """
-ai/stream.py — HLS stream reader with exponential backoff reconnect.
+ai/stream.py - HLS stream reader with exponential backoff reconnect.
 Yields raw BGR frames from the live feed.
 """
 import asyncio
 import logging
-import time
 from typing import AsyncGenerator
 
 import cv2
 import numpy as np
+
+from config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class HLSStream:
         self.url = url
         self._cap: cv2.VideoCapture | None = None
         self._backoff = BASE_BACKOFF
+        self._grab_latest = get_config().STREAM_GRAB_LATEST == 1
 
     def _open(self) -> bool:
         if self._cap:
@@ -51,9 +53,12 @@ class HLSStream:
                 continue
 
             while True:
+                if self._grab_latest:
+                    # Drop one queued frame when possible to reduce stale-latency feel.
+                    self._cap.grab()
                 ret, frame = self._cap.read()
                 if not ret:
-                    logger.warning("Frame read failed — reconnecting in %.1fs", self._backoff)
+                    logger.warning("Frame read failed - reconnecting in %.1fs", self._backoff)
                     break
                 yield frame
                 # Yield control so asyncio can process other tasks

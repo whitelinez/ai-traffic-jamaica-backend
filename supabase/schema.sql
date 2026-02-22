@@ -260,3 +260,43 @@ CREATE POLICY own_delete_avatars ON storage.objects
     bucket_id = 'avatars'
     AND auth.uid()::text = (storage.foldername(name))[1]
   );
+
+-- ── ML dataset bucket (YOLO training data for Modal) ─────────────────────────
+-- Public read is required so Modal can download data.yaml/images/labels by URL.
+-- Writes are restricted to admins.
+INSERT INTO storage.buckets (id, name, public)
+SELECT 'ml-datasets', 'ml-datasets', true
+WHERE NOT EXISTS (SELECT 1 FROM storage.buckets WHERE id = 'ml-datasets');
+
+DROP POLICY IF EXISTS public_read_ml_datasets ON storage.objects;
+CREATE POLICY public_read_ml_datasets ON storage.objects
+  FOR SELECT
+  USING (bucket_id = 'ml-datasets');
+
+DROP POLICY IF EXISTS admin_insert_ml_datasets ON storage.objects;
+CREATE POLICY admin_insert_ml_datasets ON storage.objects
+  FOR INSERT
+  WITH CHECK (
+    bucket_id = 'ml-datasets'
+    AND (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+  );
+
+DROP POLICY IF EXISTS admin_update_ml_datasets ON storage.objects;
+CREATE POLICY admin_update_ml_datasets ON storage.objects
+  FOR UPDATE
+  USING (
+    bucket_id = 'ml-datasets'
+    AND (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+  )
+  WITH CHECK (
+    bucket_id = 'ml-datasets'
+    AND (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+  );
+
+DROP POLICY IF EXISTS admin_delete_ml_datasets ON storage.objects;
+CREATE POLICY admin_delete_ml_datasets ON storage.objects
+  FOR DELETE
+  USING (
+    bucket_id = 'ml-datasets'
+    AND (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+  );

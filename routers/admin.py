@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from models.round import CreateRoundRequest, ResolveRoundRequest, RoundOut
 from services.auth_service import validate_supabase_jwt, require_admin, get_user_id
 from services.round_service import create_round, resolve_round, resolve_round_from_latest_snapshot
+from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models
+from config import get_config
 from supabase_client import get_supabase
 from middleware.rate_limiter import limiter
 
@@ -139,3 +141,64 @@ async def set_user_role(
         {"app_metadata": {"role": role}},
     )
     return {"message": f"User {target_user_id} role set to {role}"}
+
+
+@router.post("/ml/retrain")
+async def admin_ml_retrain(
+    body: dict,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Manual ML retrain trigger.
+    Optional body overrides:
+    - hours
+    - min_rows
+    - min_score_gain
+    """
+    cfg = get_config()
+    hours = int(body.get("hours", cfg.ML_AUTO_RETRAIN_HOURS))
+    min_rows = int(body.get("min_rows", cfg.ML_AUTO_RETRAIN_MIN_ROWS))
+    min_score_gain = float(body.get("min_score_gain", cfg.ML_AUTO_RETRAIN_MIN_SCORE_GAIN))
+
+    dataset_yaml_url = str(body.get("dataset_yaml_url") or cfg.TRAINER_DATASET_YAML_URL).strip()
+    if not dataset_yaml_url:
+        raise HTTPException(
+            status_code=400,
+            detail="dataset_yaml_url is required. Set TRAINER_DATASET_YAML_URL or pass it in request body.",
+        )
+    epochs = int(body.get("epochs", cfg.TRAINER_EPOCHS))
+    imgsz = int(body.get("imgsz", cfg.TRAINER_IMGSZ))
+    batch = int(body.get("batch", cfg.TRAINER_BATCH))
+
+    result = await auto_retrain_cycle(
+        hours=hours,
+        min_rows=min_rows,
+        min_score_gain=min_score_gain,
+        base_model=cfg.YOLO_MODEL,
+        provider="webhook",
+        params={
+            "trainer_webhook_url": cfg.TRAINER_WEBHOOK_URL,
+            "trainer_webhook_secret": cfg.TRAINER_WEBHOOK_SECRET,
+            "dataset_yaml_url": dataset_yaml_url,
+            "epochs": epochs,
+            "imgsz": imgsz,
+            "batch": batch,
+        },
+    )
+    return result
+
+
+@router.get("/ml/jobs")
+async def admin_ml_jobs(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    return {"jobs": await list_jobs(limit=limit)}
+
+
+@router.get("/ml/models")
+async def admin_ml_models(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    return {"models": await list_models(limit=limit)}

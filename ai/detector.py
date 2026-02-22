@@ -17,14 +17,21 @@ logger = logging.getLogger(__name__)
 VEHICLE_CLASSES = [2, 3, 5, 7]
 CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
-_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "448"))
-
-
 class VehicleDetector:
-    def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.50):
+    def __init__(
+        self,
+        model_path: str = "yolov8n.pt",
+        conf_threshold: float = 0.50,
+        infer_size: int | None = None,
+        iou_threshold: float | None = None,
+        max_det: int | None = None,
+    ):
         logger.info("Loading YOLO model: %s (conf=%.2f)", model_path, conf_threshold)
         self.model = YOLO(model_path)
         self.conf = conf_threshold
+        self.infer_size = int(infer_size or int(os.getenv("DETECT_INFER_SIZE", "448")))
+        self.iou = float(iou_threshold if iou_threshold is not None else float(os.getenv("DETECT_IOU", "0.50")))
+        self.max_det = int(max_det or int(os.getenv("DETECT_MAX_DET", "80")))
 
     def detect(self, frame) -> sv.Detections:
         """
@@ -46,10 +53,10 @@ class VehicleDetector:
           5. Predictions are in 640×640 padded space; we un-letterbox manually.
         """
         h, w = frame.shape[:2]
-        scale = min(_INFER_SIZE / h, _INFER_SIZE / w)
+        scale = min(self.infer_size / h, self.infer_size / w)
         new_w, new_h = int(w * scale), int(h * scale)
-        pad_top = (_INFER_SIZE - new_h) // 2
-        pad_left = (_INFER_SIZE - new_w) // 2
+        pad_top = (self.infer_size - new_h) // 2
+        pad_left = (self.infer_size - new_w) // 2
 
         # Bridge cv2 array → system numpy via __array_interface__
         frame_np = np.array(frame, dtype=np.uint8)                   # BGR, system numpy
@@ -58,17 +65,17 @@ class VehicleDetector:
         # Letterbox entirely in PIL — no cv2 calls
         pil = Image.fromarray(frame_rgb)
         pil = pil.resize((new_w, new_h), Image.BILINEAR)
-        padded = Image.new("RGB", (_INFER_SIZE, _INFER_SIZE), (114, 114, 114))
+        padded = Image.new("RGB", (self.infer_size, self.infer_size), (114, 114, 114))
         padded.paste(pil, (pad_left, pad_top))
 
         # PIL → tensor via raw bytes — avoids torch.from_numpy() which requires
         # identical numpy ABIs between torch's C extension and the system numpy.
         # tobytes() returns a plain Python bytes object; frombuffer() on a
         # bytearray uses Python's buffer protocol (no numpy involved at all).
-        raw = padded.tobytes()  # RGB, length = _INFER_SIZE * _INFER_SIZE * 3
+        raw = padded.tobytes()  # RGB bytes
         tensor = (
             torch.frombuffer(bytearray(raw), dtype=torch.uint8)
-            .reshape(_INFER_SIZE, _INFER_SIZE, 3)
+            .reshape(self.infer_size, self.infer_size, 3)
             .to(dtype=torch.float32)
             .div(255.0)
             .permute(2, 0, 1)
@@ -79,6 +86,8 @@ class VehicleDetector:
         results = self.model.predict(
             source=tensor,
             conf=self.conf,
+            iou=self.iou,
+            max_det=self.max_det,
             classes=VEHICLE_CLASSES,
             verbose=False,
         )[0]

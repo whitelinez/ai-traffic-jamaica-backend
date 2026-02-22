@@ -33,6 +33,7 @@ from ai.counter import LineCounter, write_snapshot
 from ai.url_refresher import url_refresh_loop, get_current_url
 from services.round_service import resolve_round_from_latest_snapshot
 from services.analytics_service import write_ml_detection_event
+from services.ml_pipeline_service import auto_retrain_cycle
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -47,6 +48,7 @@ _refresh_task: asyncio.Task | None = None
 _ai_task: asyncio.Task | None = None
 _round_task: asyncio.Task | None = None
 _resolver_task: asyncio.Task | None = None
+_ml_retrain_task: asyncio.Task | None = None
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
@@ -248,11 +250,50 @@ async def ai_loop(cfg, hls_stream: HLSStream) -> None:
         raise
 
 
+async def ml_auto_retrain_loop(cfg) -> None:
+    """
+    Run periodic ML retrain cycles.
+    Real training is delegated to an external webhook GPU trainer.
+    """
+    if cfg.ML_AUTO_RETRAIN_ENABLED != 1:
+        logger.info("ML auto-retrain is disabled")
+        return
+
+    while True:
+        try:
+            result = await auto_retrain_cycle(
+                hours=cfg.ML_AUTO_RETRAIN_HOURS,
+                min_rows=cfg.ML_AUTO_RETRAIN_MIN_ROWS,
+                min_score_gain=cfg.ML_AUTO_RETRAIN_MIN_SCORE_GAIN,
+                base_model=cfg.YOLO_MODEL,
+                provider="webhook",
+                params={
+                    "trainer_webhook_url": cfg.TRAINER_WEBHOOK_URL,
+                    "trainer_webhook_secret": cfg.TRAINER_WEBHOOK_SECRET,
+                    "dataset_yaml_url": cfg.TRAINER_DATASET_YAML_URL,
+                    "epochs": cfg.TRAINER_EPOCHS,
+                    "imgsz": cfg.TRAINER_IMGSZ,
+                    "batch": cfg.TRAINER_BATCH,
+                },
+            )
+            logger.info("ML auto-retrain cycle: %s", result)
+        except Exception as exc:
+            logger.warning("ML auto-retrain cycle failed: %s", exc)
+
+        await asyncio.sleep(max(60, cfg.ML_AUTO_RETRAIN_INTERVAL_MIN * 60))
+
+
 async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     global _counter_ref
 
     logger.info("AI loop inner: initialising detector")
-    detector = VehicleDetector(model_path=cfg.YOLO_MODEL, conf_threshold=cfg.YOLO_CONF)
+    detector = VehicleDetector(
+        model_path=cfg.YOLO_MODEL,
+        conf_threshold=cfg.YOLO_CONF,
+        infer_size=cfg.DETECT_INFER_SIZE,
+        iou_threshold=cfg.DETECT_IOU,
+        max_det=cfg.DETECT_MAX_DET,
+    )
     logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
 
@@ -305,7 +346,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task, _resolver_task
+    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task
 
     cfg = get_config()
     logger.info("Config validated — starting WHITELINEZ backend")
@@ -340,10 +381,16 @@ async def lifespan(app: FastAPI):
     _resolver_task = asyncio.create_task(bet_resolver_loop(), name="bet_resolver")
     logger.info("Bet resolver started")
 
+    if cfg.ML_AUTO_RETRAIN_ENABLED == 1:
+        _ml_retrain_task = asyncio.create_task(ml_auto_retrain_loop(cfg), name="ml_auto_retrain")
+        logger.info("ML auto-retrain loop started")
+    else:
+        logger.info("ML auto-retrain loop disabled")
+
     yield
 
     # Shutdown
-    for task in (_ai_task, _refresh_task, _round_task, _resolver_task):
+    for task in (_ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
         if task and not task.done():
             task.cancel()
             try:
@@ -403,6 +450,7 @@ async def health():
         "refresh_task_running": _refresh_task is not None and not _refresh_task.done(),
         "round_task_running": _round_task is not None and not _round_task.done(),
         "resolver_task_running": _resolver_task is not None and not _resolver_task.done(),
+        "ml_retrain_task_running": _ml_retrain_task is not None and not _ml_retrain_task.done(),
         "active_round_id": _active_round["id"] if _active_round else None,
     }
 

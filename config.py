@@ -22,8 +22,29 @@ class Config:
     # AI config
     YOLO_MODEL: str
     YOLO_CONF: float
+    DETECT_INFER_SIZE: int
+    DETECT_IOU: float
+    DETECT_MAX_DET: int
+    TRACK_ACTIVATION_THRESHOLD: float
+    TRACK_LOST_BUFFER: int
+    TRACK_MATCH_THRESHOLD: float
+    TRACK_FRAME_RATE: int
     COUNT_LINE_RATIO: float  # fallback ratio if no DB line
     DB_SNAPSHOT_INTERVAL_SEC: float
+    STREAM_GRAB_LATEST: int
+    OPENAI_API_KEY: str
+    OPENAI_MODEL: str
+    TRAINER_WEBHOOK_URL: str
+    TRAINER_WEBHOOK_SECRET: str
+    TRAINER_DATASET_YAML_URL: str
+    TRAINER_EPOCHS: int
+    TRAINER_IMGSZ: int
+    TRAINER_BATCH: int
+    ML_AUTO_RETRAIN_ENABLED: int
+    ML_AUTO_RETRAIN_INTERVAL_MIN: int
+    ML_AUTO_RETRAIN_HOURS: int
+    ML_AUTO_RETRAIN_MIN_ROWS: int
+    ML_AUTO_RETRAIN_MIN_SCORE_GAIN: float
 
     # Bet logic
     BET_LOCK_SECONDS: int
@@ -54,8 +75,29 @@ class Config:
         self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
         self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
         self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.45"))
+        self.DETECT_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "448"))
+        self.DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
+        self.DETECT_MAX_DET = int(os.getenv("DETECT_MAX_DET", "80"))
+        self.TRACK_ACTIVATION_THRESHOLD = float(os.getenv("TRACK_ACTIVATION_THRESHOLD", "0.2"))
+        self.TRACK_LOST_BUFFER = int(os.getenv("TRACK_LOST_BUFFER", "20"))
+        self.TRACK_MATCH_THRESHOLD = float(os.getenv("TRACK_MATCH_THRESHOLD", "0.65"))
+        self.TRACK_FRAME_RATE = int(os.getenv("TRACK_FRAME_RATE", "25"))
         self.COUNT_LINE_RATIO = float(os.getenv("COUNT_LINE_RATIO", "0.55"))
         self.DB_SNAPSHOT_INTERVAL_SEC = float(os.getenv("DB_SNAPSHOT_INTERVAL_SEC", "0.75"))
+        self.STREAM_GRAB_LATEST = int(os.getenv("STREAM_GRAB_LATEST", "1"))
+        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+        self.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.TRAINER_WEBHOOK_URL = os.getenv("TRAINER_WEBHOOK_URL", "")
+        self.TRAINER_WEBHOOK_SECRET = os.getenv("TRAINER_WEBHOOK_SECRET", "")
+        self.TRAINER_DATASET_YAML_URL = os.getenv("TRAINER_DATASET_YAML_URL", "")
+        self.TRAINER_EPOCHS = int(os.getenv("TRAINER_EPOCHS", "20"))
+        self.TRAINER_IMGSZ = int(os.getenv("TRAINER_IMGSZ", "640"))
+        self.TRAINER_BATCH = int(os.getenv("TRAINER_BATCH", "16"))
+        self.ML_AUTO_RETRAIN_ENABLED = int(os.getenv("ML_AUTO_RETRAIN_ENABLED", "0"))
+        self.ML_AUTO_RETRAIN_INTERVAL_MIN = int(os.getenv("ML_AUTO_RETRAIN_INTERVAL_MIN", "180"))
+        self.ML_AUTO_RETRAIN_HOURS = int(os.getenv("ML_AUTO_RETRAIN_HOURS", "24"))
+        self.ML_AUTO_RETRAIN_MIN_ROWS = int(os.getenv("ML_AUTO_RETRAIN_MIN_ROWS", "1000"))
+        self.ML_AUTO_RETRAIN_MIN_SCORE_GAIN = float(os.getenv("ML_AUTO_RETRAIN_MIN_SCORE_GAIN", "0.015"))
         self.BET_LOCK_SECONDS = int(os.getenv("BET_LOCK_SECONDS", "10"))
         self.WS_PORT = int(os.getenv("WS_PORT", "8000"))
 
