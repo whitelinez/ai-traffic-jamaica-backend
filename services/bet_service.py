@@ -222,9 +222,16 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     if balance < req.amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    # Deduct balance
+    # Deduct balance (schema-safe: direct table update; avoids missing set_user_balance RPC)
     new_balance = balance - req.amount
-    await sb.rpc("set_user_balance", {"p_user_id": user_id, "p_balance": new_balance}).execute()
+    upd_resp = await (
+        sb.table("user_balances")
+        .update({"balance": new_balance})
+        .eq("user_id", user_id)
+        .execute()
+    )
+    if not upd_resp.data:
+        raise HTTPException(status_code=500, detail="Failed to update user balance")
 
     # 5. Insert bet
     window_start = now

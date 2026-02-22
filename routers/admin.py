@@ -178,7 +178,7 @@ async def admin_list_users(
     per_page: int = Query(default=200, ge=1, le=1000),
 ):
     """
-    List registered auth users (admin-only) with minimal safe fields.
+    List registered users (admin-only) with auth info + betting summary.
     """
     sb = await get_supabase()
 
@@ -218,14 +218,25 @@ async def admin_list_users(
         else:
             rec = {}
         app_meta = rec.get("app_metadata") or {}
+        raw_meta = rec.get("user_metadata") or rec.get("raw_user_meta_data") or {}
+        identities = rec.get("identities") or []
+        identity_email = None
+        for ident in identities:
+            if not isinstance(ident, dict):
+                continue
+            id_data = ident.get("identity_data") or {}
+            if isinstance(id_data, dict) and id_data.get("email"):
+                identity_email = id_data.get("email")
+                break
         users.append(
             {
                 "id": rec.get("id"),
-                "email": rec.get("email"),
+                "email": rec.get("email") or raw_meta.get("email") or identity_email,
                 "created_at": rec.get("created_at"),
-                "last_sign_in_at": rec.get("last_sign_in_at"),
+                "last_sign_in_at": rec.get("last_sign_in_at") or rec.get("updated_at"),
                 "role": app_meta.get("role", "user"),
                 "email_confirmed_at": rec.get("email_confirmed_at"),
+                "username": raw_meta.get("username"),
             }
         )
 
@@ -235,7 +246,7 @@ async def admin_list_users(
         try:
             prof_resp = await (
                 sb.table("profiles")
-                .select("user_id,username,created_at")
+                .select("user_id,username,created_at,updated_at")
                 .order("created_at", desc=True)
                 .limit(per_page)
                 .execute()
@@ -249,13 +260,114 @@ async def admin_list_users(
                         "id": uid,
                         "email": None,
                         "created_at": p.get("created_at"),
-                        "last_sign_in_at": None,
+                        "last_sign_in_at": p.get("updated_at") or p.get("created_at"),
                         "role": "user",
                         "email_confirmed_at": None,
+                        "username": p.get("username"),
                     }
                 )
         except Exception:
             pass
+
+    # Enrich from profiles + bets so admin can see user activity at a glance.
+    user_ids = [str(u.get("id")) for u in users if u.get("id")]
+    profile_map: dict[str, dict] = {}
+    bet_summary_map: dict[str, dict] = {}
+
+    if user_ids:
+        try:
+            prof_resp = await (
+                sb.table("profiles")
+                .select("user_id,username,avatar_url,created_at,updated_at")
+                .in_("user_id", user_ids)
+                .execute()
+            )
+            for p in (prof_resp.data or []):
+                uid = p.get("user_id")
+                if uid:
+                    profile_map[str(uid)] = p
+        except Exception:
+            pass
+
+        try:
+            bets_resp = await (
+                sb.table("bets")
+                .select(
+                    "user_id,amount,status,placed_at,bet_type,vehicle_class,exact_count,"
+                    "markets(label)"
+                )
+                .in_("user_id", user_ids)
+                .order("placed_at", desc=True)
+                .limit(5000)
+                .execute()
+            )
+            for b in (bets_resp.data or []):
+                uid = b.get("user_id")
+                if not uid:
+                    continue
+                key = str(uid)
+                if key not in bet_summary_map:
+                    bet_summary_map[key] = {
+                        "bet_count": 0,
+                        "total_staked": 0,
+                        "pending_count": 0,
+                        "won_count": 0,
+                        "lost_count": 0,
+                        "last_bet_at": None,
+                        "last_bet_status": None,
+                        "last_bet_amount": 0,
+                        "last_bet_label": None,
+                    }
+                s = bet_summary_map[key]
+                amount = int(b.get("amount") or 0)
+                status = str(b.get("status") or "pending")
+                s["bet_count"] += 1
+                s["total_staked"] += amount
+                if status == "won":
+                    s["won_count"] += 1
+                elif status == "lost":
+                    s["lost_count"] += 1
+                else:
+                    s["pending_count"] += 1
+
+                # First item is most recent due to desc ordering.
+                if not s["last_bet_at"]:
+                    bet_type = str(b.get("bet_type") or "market")
+                    market = b.get("markets") or {}
+                    market_label = market.get("label") if isinstance(market, dict) else None
+                    if bet_type == "exact_count":
+                        cls = b.get("vehicle_class") or "vehicles"
+                        label = f"Exact {b.get('exact_count') or 0} {cls}"
+                    else:
+                        label = market_label or "Market bet"
+                    s["last_bet_at"] = b.get("placed_at")
+                    s["last_bet_status"] = status
+                    s["last_bet_amount"] = amount
+                    s["last_bet_label"] = label
+        except Exception:
+            pass
+
+    for u in users:
+        uid = str(u.get("id") or "")
+        p = profile_map.get(uid) or {}
+        # Prefer auth username, then profile username.
+        u["username"] = u.get("username") or p.get("username")
+        u["avatar_url"] = p.get("avatar_url")
+        if not u.get("created_at"):
+            u["created_at"] = p.get("created_at")
+        if not u.get("last_sign_in_at"):
+            u["last_sign_in_at"] = p.get("updated_at") or p.get("created_at")
+        u["bet_summary"] = bet_summary_map.get(uid) or {
+            "bet_count": 0,
+            "total_staked": 0,
+            "pending_count": 0,
+            "won_count": 0,
+            "lost_count": 0,
+            "last_bet_at": None,
+            "last_bet_status": None,
+            "last_bet_amount": 0,
+            "last_bet_label": None,
+        }
 
     return {"users": users, "page": page, "per_page": per_page}
 

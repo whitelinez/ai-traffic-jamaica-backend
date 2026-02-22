@@ -112,7 +112,24 @@ async def _run_external_training(
             detail += f" body={body}"
         raise HTTPException(status_code=502, detail=detail)
 
-    data = resp.json()
+    raw_body = (resp.text or "").strip()
+    try:
+        data = resp.json()
+    except Exception:
+        body_preview = raw_body
+        if len(body_preview) > 400:
+            body_preview = body_preview[:400] + "...(truncated)"
+        content_type = resp.headers.get("content-type", "unknown")
+        detail = (
+            "Trainer webhook returned non-JSON success response: "
+            f"status={resp.status_code} content_type={content_type}"
+        )
+        if body_preview:
+            detail += f" body={body_preview}"
+        raise HTTPException(status_code=502, detail=detail)
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Trainer webhook JSON response must be an object")
     if not data.get("model_uri"):
         raise HTTPException(status_code=502, detail="Trainer webhook missing model_uri")
     metrics = data.get("metrics") or {}

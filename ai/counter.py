@@ -80,7 +80,18 @@ class LineCounter:
             self._zone_type = "line"
 
         self._detect_zone_data = detect_data
-        if detect_data and "x3" in detect_data:
+        if detect_data and isinstance(detect_data.get("points"), list):
+            pts = detect_data.get("points") or []
+            pts = [p for p in pts if isinstance(p, dict) and "x" in p and "y" in p]
+            if len(pts) >= 3:
+                dz_polygon = np.array(
+                    [[int(float(p["x"]) * w), int(float(p["y"]) * h)] for p in pts],
+                    dtype=np.int32,
+                )
+                self._detect_zone = sv.PolygonZone(polygon=dz_polygon)
+            else:
+                self._detect_zone = None
+        elif detect_data and "x3" in detect_data:
             dz_polygon = np.array([
                 [int(detect_data["x1"] * w), int(detect_data["y1"] * h)],
                 [int(detect_data["x2"] * w), int(detect_data["y2"] * h)],
