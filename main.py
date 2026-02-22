@@ -34,6 +34,7 @@ from ai.dataset_capture import LiveDatasetCapture
 from ai.dataset_upload import SupabaseDatasetUploader
 from ai.url_refresher import url_refresh_loop, get_current_url
 from services.round_service import resolve_round_from_latest_snapshot
+from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
 from services.ml_pipeline_service import auto_retrain_cycle
 from services.ml_capture_monitor import record_capture_event
@@ -73,6 +74,9 @@ async def round_monitor_loop() -> None:
         try:
             sb = await get_supabase()
             now_iso = datetime.now(timezone.utc).isoformat()
+
+            # Auto-create rounds from active session loops.
+            await session_scheduler_tick()
 
             # Auto-open: upcoming rounds whose opens_at has passed
             up_resp = await sb.table("bet_rounds") \
@@ -237,6 +241,90 @@ async def bet_resolver_loop() -> None:
 
                 except Exception as bet_exc:
                     logger.warning("Error resolving bet %s: %s", bet.get("id"), bet_exc)
+
+            # Early resolve market bets when "over" is already guaranteed.
+            rounds_resp = await (
+                sb.table("bet_rounds")
+                .select("id, camera_id, market_type, params, status")
+                .in_("status", ["open", "locked"])
+                .in_("market_type", ["over_under", "vehicle_count"])
+                .execute()
+            )
+            for rnd in (rounds_resp.data or []):
+                try:
+                    round_id = rnd.get("id")
+                    params = rnd.get("params") or {}
+                    threshold = int(params.get("threshold", 0) or 0)
+                    vehicle_class = params.get("vehicle_class") if rnd.get("market_type") == "vehicle_count" else None
+
+                    current_count = 0
+                    if _counter_ref is not None:
+                        current_count = _counter_ref.get_class_total(vehicle_class)
+                    else:
+                        camera_id = rnd.get("camera_id")
+                        if camera_id:
+                            snap_resp = await (
+                                sb.table("count_snapshots")
+                                .select("total, vehicle_breakdown")
+                                .eq("camera_id", camera_id)
+                                .order("captured_at", desc=True)
+                                .limit(1)
+                                .execute()
+                            )
+                            if snap_resp.data:
+                                snap = snap_resp.data[0]
+                                if vehicle_class is None:
+                                    current_count = int(snap.get("total", 0) or 0)
+                                else:
+                                    current_count = int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
+
+                    bets_resp = await (
+                        sb.table("bets")
+                        .select("id, user_id, potential_payout, baseline_count, markets(outcome_key)")
+                        .eq("round_id", round_id)
+                        .eq("status", "pending")
+                        .or_("bet_type.eq.market,bet_type.is.null")
+                        .execute()
+                    )
+                    for bet in (bets_resp.data or []):
+                        market = bet.get("markets") or {}
+                        outcome = str(market.get("outcome_key") or "").lower()
+                        if outcome not in {"over", "under", "exact"}:
+                            continue
+
+                        baseline = int(bet.get("baseline_count") or 0)
+                        actual = max(0, current_count - baseline)
+                        if actual <= threshold:
+                            continue
+
+                        # Once threshold is exceeded, over is won; under/exact cannot win.
+                        won = (outcome == "over")
+                        await sb.table("bets").update({
+                            "status": "won" if won else "lost",
+                            "actual_count": actual,
+                            "resolved_at": datetime.now(timezone.utc).isoformat(),
+                        }).eq("id", bet["id"]).execute()
+
+                        if won:
+                            await sb.rpc(
+                                "credit_user_balance",
+                                {
+                                    "p_user_id": bet["user_id"],
+                                    "p_amount": int(bet["potential_payout"]),
+                                },
+                            ).execute()
+
+                        await manager.send_to_user(bet["user_id"], {
+                            "type": "bet_resolved",
+                            "bet_id": str(bet["id"]),
+                            "won": won,
+                            "payout": bet["potential_payout"] if won else 0,
+                            "actual": actual,
+                            "exact": threshold,
+                            "vehicle_class": vehicle_class,
+                        })
+                except Exception as early_exc:
+                    logger.warning("Early market resolve error for round %s: %s", rnd.get("id"), early_exc)
 
         except Exception as exc:
             logger.warning("Bet resolver loop error: %s", exc)
@@ -520,6 +608,26 @@ app.include_router(ws_account_router)
 
 @app.get("/health")
 async def health():
+    next_round_at: str | None = None
+    try:
+        sb = await get_supabase()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        up_resp = await (
+            sb.table("bet_rounds")
+            .select("opens_at")
+            .eq("status", "upcoming")
+            .gte("opens_at", now_iso)
+            .order("opens_at", ascending=True)
+            .limit(1)
+            .maybeSingle()
+            .execute()
+        )
+        next_round_at = (up_resp.data or {}).get("opens_at")
+        if not next_round_at:
+            next_round_at = await next_session_round_at()
+    except Exception:
+        next_round_at = None
+
     return {
         "status": "ok",
         "stream_url": get_current_url(),
@@ -531,6 +639,7 @@ async def health():
         "resolver_task_running": _resolver_task is not None and not _resolver_task.done(),
         "ml_retrain_task_running": _ml_retrain_task is not None and not _ml_retrain_task.done(),
         "active_round_id": _active_round["id"] if _active_round else None,
+        "next_round_at": next_round_at,
     }
 
 

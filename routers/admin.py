@@ -9,8 +9,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 
 from models.round import CreateRoundRequest, ResolveRoundRequest, RoundOut
+from models.round_session import CreateRoundSessionRequest
 from services.auth_service import validate_supabase_jwt, require_admin, get_user_id
 from services.round_service import create_round, resolve_round, resolve_round_from_latest_snapshot
+from services.round_session_service import create_round_session, list_round_sessions, stop_round_session
 from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models
 from services.ml_capture_monitor import get_capture_status
 from config import get_config
@@ -65,6 +67,31 @@ async def admin_resolve_round_latest(
 
     result = await resolve_round_from_latest_snapshot(str(round_id))
     return {"message": "Round resolved", "round_id": str(round_id), "result": result}
+
+
+@router.post("/round-sessions", status_code=201)
+async def admin_create_round_session(
+    body: CreateRoundSessionRequest,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    return await create_round_session(body)
+
+
+@router.get("/round-sessions")
+async def admin_list_round_sessions(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    return {"sessions": await list_round_sessions(limit=limit)}
+
+
+@router.patch("/round-sessions/{session_id}/stop")
+async def admin_stop_round_session(
+    session_id: str,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    data = await stop_round_session(session_id)
+    return {"session": data}
 
 
 @router.get("/bets")

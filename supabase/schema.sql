@@ -60,6 +60,26 @@ CREATE TABLE IF NOT EXISTS count_snapshots (
   vehicle_breakdown JSONB
 );
 
+-- Automated round sessions (admin schedules looping rounds)
+CREATE TABLE IF NOT EXISTS round_sessions (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  camera_id            UUID REFERENCES cameras ON DELETE CASCADE,
+  status               TEXT NOT NULL DEFAULT 'active', -- active|stopped|completed
+  market_type          TEXT NOT NULL,                  -- over_under|vehicle_count|vehicle_type
+  threshold            INT,
+  vehicle_class        TEXT,
+  round_duration_min   INT NOT NULL,
+  bet_cutoff_min       INT NOT NULL DEFAULT 1,
+  interval_min         INT NOT NULL DEFAULT 0,
+  session_duration_min INT NOT NULL,
+  max_rounds           INT,
+  created_rounds       INT NOT NULL DEFAULT 0,
+  starts_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ends_at              TIMESTAMPTZ NOT NULL,
+  next_round_at        TIMESTAMPTZ,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ── User balances ─────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS user_balances (
@@ -87,6 +107,7 @@ ALTER TABLE bet_rounds       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE markets          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bets             ENABLE ROW LEVEL SECURITY;
 ALTER TABLE count_snapshots  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE round_sessions   ENABLE ROW LEVEL SECURITY;
 
 -- Cameras: public read, admin write
 DROP POLICY IF EXISTS "public_read_cameras"  ON cameras;
@@ -120,6 +141,16 @@ CREATE POLICY "own_bets_insert" ON bets
 DROP POLICY IF EXISTS "public_read_snapshots" ON count_snapshots;
 CREATE POLICY "public_read_snapshots" ON count_snapshots
   FOR SELECT USING (true);
+
+-- Round sessions: public read (for next round timer), admin writes
+DROP POLICY IF EXISTS "public_read_round_sessions" ON round_sessions;
+DROP POLICY IF EXISTS "admin_write_round_sessions" ON round_sessions;
+CREATE POLICY "public_read_round_sessions" ON round_sessions
+  FOR SELECT USING (true);
+CREATE POLICY "admin_write_round_sessions" ON round_sessions
+  FOR ALL USING (
+    (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+  );
 
 -- ── Database functions ────────────────────────────────────────────────────────
 

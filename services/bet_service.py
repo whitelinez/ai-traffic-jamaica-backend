@@ -5,6 +5,7 @@ import logging
 from uuid import UUID
 from datetime import datetime, timezone, timedelta
 
+from fastapi import HTTPException
 from supabase_client import get_supabase
 from models.bet import PlaceBetRequest, PlaceBetResponse, PlaceLiveBetRequest, PlaceLiveBetResponse
 
@@ -12,6 +13,41 @@ logger = logging.getLogger(__name__)
 
 INITIAL_BALANCE = 1000
 LIVE_BET_ODDS = 8.0  # fixed 8x for exact-count micro-bets
+MAX_PENDING_BETS_PER_ROUND = 2
+
+
+async def _pending_bets_for_round(sb, user_id: str, round_id: str) -> int:
+    resp = await (
+        sb.table("bets")
+        .select("id", count="exact", head=True)
+        .eq("user_id", user_id)
+        .eq("round_id", round_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    return int(resp.count or 0)
+
+
+async def _get_baseline_count(sb, camera_id: str | None, market_type: str, params: dict | None) -> int:
+    if not camera_id:
+        return 0
+    snap_resp = await (
+        sb.table("count_snapshots")
+        .select("total, vehicle_breakdown")
+        .eq("camera_id", camera_id)
+        .order("captured_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not snap_resp.data:
+        return 0
+    snap = snap_resp.data[0]
+    if market_type == "vehicle_count":
+        cls = (params or {}).get("vehicle_class")
+        if not cls:
+            return 0
+        return int((snap.get("vehicle_breakdown") or {}).get(cls, 0) or 0)
+    return int(snap.get("total", 0) or 0)
 
 
 async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
@@ -27,24 +63,27 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
 
     round_resp = await sb.table("bet_rounds").select("*").eq("id", str(req.round_id)).single().execute()
     if not round_resp.data:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Round not found")
 
     rnd = round_resp.data
     now = datetime.now(timezone.utc)
 
     if rnd["status"] != "open":
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=f"Round is {rnd['status']}, bets not accepted")
 
     closes_at = datetime.fromisoformat(rnd["closes_at"].replace("Z", "+00:00"))
     if now >= closes_at:
-        from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="Betting window has closed")
+
+    pending = await _pending_bets_for_round(sb, user_id, str(req.round_id))
+    if pending >= MAX_PENDING_BETS_PER_ROUND:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Maximum {MAX_PENDING_BETS_PER_ROUND} active bets per round reached",
+        )
 
     mkt_resp = await sb.table("markets").select("*").eq("id", str(req.market_id)).eq("round_id", str(req.round_id)).single().execute()
     if not mkt_resp.data:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Market not found in this round")
 
     market = mkt_resp.data
@@ -60,10 +99,22 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
     }).execute()
 
     if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
 
     bet_id = rpc_resp.data["bet_id"] if isinstance(rpc_resp.data, dict) else rpc_resp.data[0]["bet_id"]
+    baseline_count = await _get_baseline_count(
+        sb,
+        rnd.get("camera_id"),
+        str(rnd.get("market_type") or ""),
+        rnd.get("params") or {},
+    )
+
+    await (
+        sb.table("bets")
+        .update({"bet_type": "market", "baseline_count": baseline_count})
+        .eq("id", str(bet_id))
+        .execute()
+    )
 
     return PlaceBetResponse(
         bet_id=bet_id,
@@ -83,7 +134,6 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     4. Insert bet with bet_type='exact_count'
     Returns bet details including window_end time.
     """
-    from fastapi import HTTPException
     sb = await get_supabase()
 
     # 1. Validate round
@@ -100,6 +150,13 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     closes_at = datetime.fromisoformat(rnd["closes_at"].replace("Z", "+00:00"))
     if now >= closes_at:
         raise HTTPException(status_code=403, detail="Betting window has closed")
+
+    pending = await _pending_bets_for_round(sb, user_id, str(req.round_id))
+    if pending >= MAX_PENDING_BETS_PER_ROUND:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Maximum {MAX_PENDING_BETS_PER_ROUND} active bets per round reached",
+        )
 
     # 2. Validate vehicle_class
     valid_classes = {"car", "truck", "bus", "motorcycle"}

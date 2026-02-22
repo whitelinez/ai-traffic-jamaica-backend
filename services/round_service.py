@@ -91,12 +91,8 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
         raise ValueError(f"Round {round_id} not found")
 
     rnd = round_resp.data
-    params = rnd["params"]
+    params = rnd["params"] or {}
     market_type = rnd["market_type"]
-
-    # Compute winning outcome key(s) from result
-    winning_keys = _compute_winners(market_type, params, result)
-    logger.info("Round %s resolved. Winners: %s", round_id, winning_keys)
 
     # Mark round resolved
     await sb.table("bet_rounds").update({
@@ -107,12 +103,55 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
     # Fetch all pending market bets for this round with market outcome_key
     bets_resp = await (
         sb.table("bets")
-        .select("id, user_id, amount, potential_payout, bet_type, markets(outcome_key)")
+        .select("id, user_id, potential_payout, baseline_count, markets(outcome_key)")
         .eq("round_id", round_id)
         .eq("status", "pending")
-        .eq("bet_type", "market")
+        .or_("bet_type.eq.market,bet_type.is.null")
         .execute()
     )
+
+    total = int(result.get("total", 0) or 0)
+    breakdown = result.get("vehicle_breakdown", result.get("by_class", {})) or {}
+    threshold = int(params.get("threshold", 0) or 0)
+    vehicle_class = str(params.get("vehicle_class") or "")
+
+    # For over/under and vehicle_count, settlement is per-bet from placement baseline.
+    if market_type in ("over_under", "vehicle_count"):
+        logger.info("Round %s resolved with per-bet settlement (%s)", round_id, market_type)
+        for bet in (bets_resp.data or []):
+            market_data = bet.get("markets") or {}
+            outcome_key = (market_data.get("outcome_key") or "").lower()
+            if outcome_key not in {"over", "under", "exact"}:
+                continue
+
+            baseline = int(bet.get("baseline_count") or 0)
+            current = total if market_type == "over_under" else int(breakdown.get(vehicle_class, 0) or 0)
+            actual = max(0, current - baseline)
+            if actual > threshold:
+                win_key = "over"
+            elif actual < threshold:
+                win_key = "under"
+            else:
+                win_key = "exact"
+            won = (outcome_key == win_key)
+
+            await sb.table("bets").update({
+                "status": "won" if won else "lost",
+                "actual_count": actual,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", bet["id"]).execute()
+
+            if won:
+                await sb.rpc("credit_user_balance", {
+                    "p_user_id": bet["user_id"],
+                    "p_amount": int(bet["potential_payout"]),
+                }).execute()
+                logger.info("Credited %d to user %s (bet %s)", bet["potential_payout"], bet["user_id"], bet["id"])
+        return
+
+    # Other market types remain round-global settlement.
+    winning_keys = _compute_winners(market_type, params, result)
+    logger.info("Round %s resolved. Winners: %s", round_id, winning_keys)
 
     for bet in (bets_resp.data or []):
         market_data = bet.get("markets") or {}
@@ -129,7 +168,7 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
         if won:
             await sb.rpc("credit_user_balance", {
                 "p_user_id": bet["user_id"],
-                "p_amount": bet["potential_payout"],
+                "p_amount": int(bet["potential_payout"]),
             }).execute()
             logger.info("Credited %d to user %s (bet %s)", bet["potential_payout"], bet["user_id"], bet["id"])
 
