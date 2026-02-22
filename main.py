@@ -280,7 +280,7 @@ async def bet_resolver_loop() -> None:
 
                     bets_resp = await (
                         sb.table("bets")
-                        .select("id, user_id, potential_payout, baseline_count, markets(outcome_key)")
+                        .select("id, user_id, potential_payout, baseline_count, placed_at, markets(outcome_key)")
                         .eq("round_id", round_id)
                         .eq("status", "pending")
                         .or_("bet_type.eq.market,bet_type.is.null")
@@ -292,7 +292,29 @@ async def bet_resolver_loop() -> None:
                         if outcome not in {"over", "under", "exact"}:
                             continue
 
-                        baseline = int(bet.get("baseline_count") or 0)
+                        if bet.get("baseline_count") is not None:
+                            baseline = int(bet.get("baseline_count") or 0)
+                        else:
+                            baseline = 0
+                            if rnd.get("camera_id") and bet.get("placed_at"):
+                                try:
+                                    snap_before_bet = await (
+                                        sb.table("count_snapshots")
+                                        .select("total, vehicle_breakdown")
+                                        .eq("camera_id", rnd["camera_id"])
+                                        .lte("captured_at", bet.get("placed_at"))
+                                        .order("captured_at", desc=True)
+                                        .limit(1)
+                                        .execute()
+                                    )
+                                    if snap_before_bet.data:
+                                        snap = snap_before_bet.data[0]
+                                        if vehicle_class is None:
+                                            baseline = int(snap.get("total", 0) or 0)
+                                        else:
+                                            baseline = int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
+                                except Exception:
+                                    baseline = 0
                         actual = max(0, current_count - baseline)
                         if actual <= threshold:
                             continue
