@@ -211,10 +211,13 @@ async def bet_resolver_loop() -> None:
 
                     # Credit winner
                     if won:
-                        balance_resp = await sb.rpc("get_user_balance", {"p_user_id": user_id}).execute()
-                        cur_balance = int(balance_resp.data) if balance_resp.data is not None else 0
-                        new_balance = cur_balance + bet["potential_payout"]
-                        await sb.rpc("set_user_balance", {"p_user_id": user_id, "p_balance": new_balance}).execute()
+                        await sb.rpc(
+                            "credit_user_balance",
+                            {
+                                "p_user_id": user_id,
+                                "p_amount": int(bet["potential_payout"]),
+                            },
+                        ).execute()
 
                     # Broadcast resolution to user
                     await manager.send_to_user(user_id, {
