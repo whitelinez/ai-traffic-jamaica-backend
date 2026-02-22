@@ -30,6 +30,16 @@ def _as_actionable_db_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="Bet placement failed due to database error")
 
 
+def _parse_round_closes_at(rnd: dict) -> datetime:
+    raw = rnd.get("closes_at")
+    if not raw:
+        raise HTTPException(status_code=400, detail="Round timing is misconfigured (missing closes_at)")
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Round timing is invalid (bad closes_at format)")
+
+
 async def _pending_bets_for_round(sb, user_id: str, round_id: str) -> int:
     resp = await (
         sb.table("bets")
@@ -90,7 +100,7 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
     if rnd["status"] != "open":
         raise HTTPException(status_code=400, detail=f"Round is {rnd['status']}, bets not accepted")
 
-    closes_at = datetime.fromisoformat(rnd["closes_at"].replace("Z", "+00:00"))
+    closes_at = _parse_round_closes_at(rnd)
     if now >= closes_at:
         raise HTTPException(status_code=403, detail="Betting window has closed")
 
@@ -136,7 +146,7 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
             raise HTTPException(status_code=400, detail="Insufficient balance")
         if "duplicate" in low or "unique" in low:
             raise HTTPException(status_code=400, detail="You already placed a bet on this market")
-        raise HTTPException(status_code=400, detail="Unable to place bet")
+        raise _as_actionable_db_error(exc)
 
     if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
         raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
@@ -181,8 +191,13 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     sb = await get_supabase()
 
     # 1. Validate round
-    round_resp = await sb.table("bet_rounds").select("*").eq("id", str(req.round_id)).single().execute()
-    if not round_resp.data:
+    try:
+        round_resp = await sb.table("bet_rounds").select("*").eq("id", str(req.round_id)).single().execute()
+        if not round_resp.data:
+            raise HTTPException(status_code=404, detail="Round not found")
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(status_code=404, detail="Round not found")
 
     rnd = round_resp.data
@@ -191,7 +206,7 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     if rnd["status"] != "open":
         raise HTTPException(status_code=400, detail=f"Round is {rnd['status']}, bets not accepted")
 
-    closes_at = datetime.fromisoformat(rnd["closes_at"].replace("Z", "+00:00"))
+    closes_at = _parse_round_closes_at(rnd)
     if now >= closes_at:
         raise HTTPException(status_code=403, detail="Betting window has closed")
 
@@ -230,50 +245,43 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     # 4. Check balance and deduct atomically
     potential_payout = int(req.amount * LIVE_BET_ODDS)
 
-    balance_resp = await sb.rpc("get_user_balance", {"p_user_id": user_id}).execute()
-    balance = int(balance_resp.data) if balance_resp.data is not None else INITIAL_BALANCE
+    # Route through existing DB atomic function so balance + insert stay in one transaction.
+    try:
+        rpc_resp = await sb.rpc("place_bet_atomic", {
+            "p_user_id": user_id,
+            "p_round_id": str(req.round_id),
+            "p_market_id": None,
+            "p_amount": req.amount,
+            "p_potential_payout": potential_payout,
+        }).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "insufficient balance" in msg:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
+        raise _as_actionable_db_error(exc)
 
-    if balance < req.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+    if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
+        raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
 
-    # Deduct balance (schema-safe: direct table update; avoids missing set_user_balance RPC)
-    new_balance = balance - req.amount
-    upd_resp = await (
-        sb.table("user_balances")
-        .update({"balance": new_balance})
-        .eq("user_id", user_id)
-        .execute()
-    )
-    if not upd_resp.data:
-        raise HTTPException(status_code=500, detail="Failed to update user balance")
+    bet_id = rpc_resp.data["bet_id"] if isinstance(rpc_resp.data, dict) else rpc_resp.data[0]["bet_id"]
 
-    # 5. Insert bet
+    # 5. Update inserted bet with live-bet specific metadata
     window_start = now
     window_end = now + timedelta(seconds=req.window_duration_sec)
 
-    bet_data = {
-        "user_id": user_id,
-        "round_id": str(req.round_id),
-        "amount": req.amount,
-        "potential_payout": potential_payout,
-        "status": "pending",
+    live_update = {
         "bet_type": "exact_count",
         "window_start": window_start.isoformat(),
         "window_duration_sec": req.window_duration_sec,
         "vehicle_class": req.vehicle_class,
         "exact_count": req.exact_count,
         "baseline_count": baseline_count,
-        "placed_at": window_start.isoformat(),
     }
 
     try:
-        insert_resp = await sb.table("bets").insert(bet_data).execute()
+        await sb.table("bets").update(live_update).eq("id", str(bet_id)).execute()
     except Exception as exc:
         raise _as_actionable_db_error(exc)
-    if not insert_resp.data:
-        raise HTTPException(status_code=500, detail="Failed to place bet")
-
-    bet_id = insert_resp.data[0]["id"]
 
     return PlaceLiveBetResponse(
         bet_id=bet_id,
