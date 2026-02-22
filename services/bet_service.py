@@ -16,6 +16,20 @@ LIVE_BET_ODDS = 8.0  # fixed 8x for exact-count micro-bets
 MAX_PENDING_BETS_PER_ROUND = 2
 
 
+def _as_actionable_db_error(exc: Exception) -> HTTPException:
+    msg = str(exc)
+    low = msg.lower()
+    if ("column" in low and "does not exist" in low) or ("null value in column \"market_id\"" in low):
+        return HTTPException(
+            status_code=500,
+            detail=(
+                "Database schema is out of date for betting. "
+                "Run latest supabase/schema.sql migration (bets columns + nullable market_id)."
+            ),
+        )
+    return HTTPException(status_code=500, detail="Bet placement failed due to database error")
+
+
 async def _pending_bets_for_round(sb, user_id: str, round_id: str) -> int:
     resp = await (
         sb.table("bets")
@@ -252,7 +266,10 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
         "placed_at": window_start.isoformat(),
     }
 
-    insert_resp = await sb.table("bets").insert(bet_data).execute()
+    try:
+        insert_resp = await sb.table("bets").insert(bet_data).execute()
+    except Exception as exc:
+        raise _as_actionable_db_error(exc)
     if not insert_resp.data:
         raise HTTPException(status_code=500, detail="Failed to place bet")
 

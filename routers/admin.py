@@ -13,7 +13,7 @@ from models.round_session import CreateRoundSessionRequest
 from services.auth_service import validate_supabase_jwt, require_admin, get_user_id
 from services.round_service import create_round, resolve_round, resolve_round_from_latest_snapshot
 from services.round_session_service import create_round_session, list_round_sessions, stop_round_session
-from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models
+from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models, get_ml_diagnostics
 from services.ml_capture_monitor import get_capture_status
 from config import get_config
 from supabase_client import get_supabase
@@ -445,4 +445,58 @@ async def admin_ml_capture_status(
         "upload_enabled": cfg.AUTO_CAPTURE_UPLOAD_ENABLED == 1,
         "capture_classes": [c.strip() for c in cfg.AUTO_CAPTURE_CLASSES.split(",") if c.strip()],
         **status,
+    }
+
+
+@router.get("/ml/diagnostics")
+async def admin_ml_diagnostics(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    cfg = get_config()
+    return await get_ml_diagnostics(cfg=cfg)
+
+
+@router.post("/ml/one-click")
+async def admin_ml_one_click(
+    body: dict,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    cfg = get_config()
+    diagnostics = await get_ml_diagnostics(cfg=cfg)
+    if not diagnostics.get("ready_for_one_click"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "One-click pipeline blocked by missing required setup",
+                "diagnostics": diagnostics,
+            },
+        )
+
+    hours = int(body.get("hours", cfg.ML_AUTO_RETRAIN_HOURS))
+    min_rows = int(body.get("min_rows", cfg.ML_AUTO_RETRAIN_MIN_ROWS))
+    min_score_gain = float(body.get("min_score_gain", cfg.ML_AUTO_RETRAIN_MIN_SCORE_GAIN))
+    epochs = int(body.get("epochs", cfg.TRAINER_EPOCHS))
+    imgsz = int(body.get("imgsz", cfg.TRAINER_IMGSZ))
+    batch = int(body.get("batch", cfg.TRAINER_BATCH))
+    dataset_yaml_url = str(body.get("dataset_yaml_url") or cfg.TRAINER_DATASET_YAML_URL).strip()
+
+    result = await auto_retrain_cycle(
+        hours=hours,
+        min_rows=min_rows,
+        min_score_gain=min_score_gain,
+        base_model=cfg.YOLO_MODEL,
+        provider="webhook",
+        params={
+            "trainer_webhook_url": cfg.TRAINER_WEBHOOK_URL,
+            "trainer_webhook_secret": cfg.TRAINER_WEBHOOK_SECRET,
+            "dataset_yaml_url": dataset_yaml_url,
+            "epochs": epochs,
+            "imgsz": imgsz,
+            "batch": batch,
+        },
+    )
+    return {
+        "message": "One-click model pipeline completed",
+        "result": result,
+        "diagnostics": await get_ml_diagnostics(cfg=cfg),
     }

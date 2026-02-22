@@ -50,6 +50,21 @@ CREATE TABLE IF NOT EXISTS bets (
   UNIQUE (user_id, market_id)
 );
 
+-- Bets schema evolution for market + exact-count live bets.
+-- Keep migration-safe so older databases can be upgraded in place.
+ALTER TABLE bets
+  ADD COLUMN IF NOT EXISTS bet_type TEXT DEFAULT 'market',           -- market|exact_count
+  ADD COLUMN IF NOT EXISTS baseline_count INT DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS actual_count INT,
+  ADD COLUMN IF NOT EXISTS window_start TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS window_duration_sec INT,
+  ADD COLUMN IF NOT EXISTS vehicle_class TEXT,
+  ADD COLUMN IF NOT EXISTS exact_count INT;
+
+-- Live exact-count bets are not tied to a specific market row.
+ALTER TABLE bets
+  ALTER COLUMN market_id DROP NOT NULL;
+
 CREATE TABLE IF NOT EXISTS count_snapshots (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   camera_id         UUID REFERENCES cameras ON DELETE SET NULL,

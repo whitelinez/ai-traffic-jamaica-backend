@@ -324,3 +324,114 @@ async def get_active_model_uri() -> str | None:
     if active:
         return active.get("model_uri")
     return None
+
+
+async def get_ml_diagnostics(*, cfg=None) -> dict[str, Any]:
+    cfg = cfg or get_config()
+    sb = await get_supabase()
+
+    since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+    total_rows_resp = await sb.table("ml_detection_events").select("id", count="exact", head=True).execute()
+    rows_24h_resp = await (
+        sb.table("ml_detection_events")
+        .select("id", count="exact", head=True)
+        .gte("captured_at", since_24h)
+        .execute()
+    )
+    latest_det_resp = await (
+        sb.table("ml_detection_events")
+        .select("captured_at, avg_confidence, model_name")
+        .order("captured_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    latest_job_resp = await (
+        sb.table("ml_training_jobs")
+        .select("id, job_type, status, created_at, completed_at, notes")
+        .eq("job_type", "train")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    active_model = await get_active_model()
+
+    total_rows = int(total_rows_resp.count or 0)
+    rows_24h = int(rows_24h_resp.count or 0)
+    latest_det = (latest_det_resp.data or [None])[0]
+    latest_job = (latest_job_resp.data or [None])[0]
+
+    checks: list[dict[str, Any]] = []
+
+    def push(name: str, ok: bool, detail: str, *, required: bool = True, value: Any = None) -> None:
+        checks.append(
+            {
+                "name": name,
+                "status": "ok" if ok else "fail",
+                "required": required,
+                "detail": detail,
+                "value": value,
+            }
+        )
+
+    webhook_ok = bool(str(getattr(cfg, "TRAINER_WEBHOOK_URL", "") or "").strip())
+    webhook_secret_ok = bool(str(getattr(cfg, "TRAINER_WEBHOOK_SECRET", "") or "").strip())
+    dataset_yaml_ok = bool(str(getattr(cfg, "TRAINER_DATASET_YAML_URL", "") or "").strip())
+    auto_loop_on = int(getattr(cfg, "ML_AUTO_RETRAIN_ENABLED", 0) or 0) == 1
+
+    push("Trainer webhook", webhook_ok, "TRAINER_WEBHOOK_URL is set" if webhook_ok else "Missing TRAINER_WEBHOOK_URL", value=getattr(cfg, "TRAINER_WEBHOOK_URL", ""))
+    push("Trainer secret", webhook_secret_ok, "TRAINER_WEBHOOK_SECRET is set" if webhook_secret_ok else "Missing TRAINER_WEBHOOK_SECRET")
+    push("Dataset YAML URL", dataset_yaml_ok, "TRAINER_DATASET_YAML_URL is set" if dataset_yaml_ok else "Missing TRAINER_DATASET_YAML_URL", value=getattr(cfg, "TRAINER_DATASET_YAML_URL", ""))
+    push(
+        "Auto retrain loop",
+        auto_loop_on,
+        "ML_AUTO_RETRAIN_ENABLED=1" if auto_loop_on else "ML_AUTO_RETRAIN_ENABLED is disabled",
+        required=False,
+        value=int(getattr(cfg, "ML_AUTO_RETRAIN_ENABLED", 0) or 0),
+    )
+    push(
+        "Telemetry volume",
+        total_rows > 0,
+        f"{total_rows:,} total rows collected" if total_rows > 0 else "No ml_detection_events rows yet",
+        value=total_rows,
+    )
+    push(
+        "24h throughput",
+        rows_24h >= int(getattr(cfg, "ML_AUTO_RETRAIN_MIN_ROWS", 1000) or 1000),
+        f"{rows_24h:,} rows in last 24h",
+        required=False,
+        value=rows_24h,
+    )
+    push(
+        "Active model",
+        bool(active_model),
+        f"Active model: {active_model.get('model_name')}" if active_model else "No active model promoted yet",
+        required=False,
+        value=(active_model or {}).get("model_name"),
+    )
+
+    latest_error = None
+    if latest_job and latest_job.get("status") == "failed":
+        latest_error = str(latest_job.get("notes") or "Training failed")
+
+    blocking = [c for c in checks if c["required"] and c["status"] != "ok"]
+    ready_for_one_click = len(blocking) == 0
+
+    return {
+        "ready_for_one_click": ready_for_one_click,
+        "checks": checks,
+        "latest_train_job": latest_job,
+        "latest_error": latest_error,
+        "latest_detection": latest_det,
+        "targets": {
+            "min_rows_24h": int(getattr(cfg, "ML_AUTO_RETRAIN_MIN_ROWS", 1000) or 1000),
+            "min_score_gain": float(getattr(cfg, "ML_AUTO_RETRAIN_MIN_SCORE_GAIN", 0.015) or 0.015),
+            "interval_min": int(getattr(cfg, "ML_AUTO_RETRAIN_INTERVAL_MIN", 180) or 180),
+        },
+        "summary": {
+            "total_rows": total_rows,
+            "rows_24h": rows_24h,
+            "active_model_name": (active_model or {}).get("model_name"),
+            "latest_model_name": (latest_det or {}).get("model_name"),
+        },
+    }
