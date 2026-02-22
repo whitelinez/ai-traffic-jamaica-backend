@@ -61,8 +61,13 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
     """
     sb = await get_supabase()
 
-    round_resp = await sb.table("bet_rounds").select("*").eq("id", str(req.round_id)).single().execute()
-    if not round_resp.data:
+    try:
+        round_resp = await sb.table("bet_rounds").select("*").eq("id", str(req.round_id)).single().execute()
+        if not round_resp.data:
+            raise HTTPException(status_code=404, detail="Round not found")
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(status_code=404, detail="Round not found")
 
     rnd = round_resp.data
@@ -82,21 +87,42 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
             detail=f"Maximum {MAX_PENDING_BETS_PER_ROUND} active bets per round reached",
         )
 
-    mkt_resp = await sb.table("markets").select("*").eq("id", str(req.market_id)).eq("round_id", str(req.round_id)).single().execute()
-    if not mkt_resp.data:
+    try:
+        mkt_resp = await (
+            sb.table("markets")
+            .select("*")
+            .eq("id", str(req.market_id))
+            .eq("round_id", str(req.round_id))
+            .single()
+            .execute()
+        )
+        if not mkt_resp.data:
+            raise HTTPException(status_code=404, detail="Market not found in this round")
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(status_code=404, detail="Market not found in this round")
 
     market = mkt_resp.data
     odds = float(market["odds"])
     potential_payout = int(req.amount * odds)
 
-    rpc_resp = await sb.rpc("place_bet_atomic", {
-        "p_user_id": user_id,
-        "p_round_id": str(req.round_id),
-        "p_market_id": str(req.market_id),
-        "p_amount": req.amount,
-        "p_potential_payout": potential_payout,
-    }).execute()
+    try:
+        rpc_resp = await sb.rpc("place_bet_atomic", {
+            "p_user_id": user_id,
+            "p_round_id": str(req.round_id),
+            "p_market_id": str(req.market_id),
+            "p_amount": req.amount,
+            "p_potential_payout": potential_payout,
+        }).execute()
+    except Exception as exc:
+        msg = str(exc)
+        low = msg.lower()
+        if "insufficient balance" in low:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
+        if "duplicate" in low or "unique" in low:
+            raise HTTPException(status_code=400, detail="You already placed a bet on this market")
+        raise HTTPException(status_code=400, detail="Unable to place bet")
 
     if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
         raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
@@ -109,12 +135,16 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
         rnd.get("params") or {},
     )
 
-    await (
-        sb.table("bets")
-        .update({"bet_type": "market", "baseline_count": baseline_count})
-        .eq("id", str(bet_id))
-        .execute()
-    )
+    # Optional enrichment fields for newer schemas; ignore if columns do not exist.
+    try:
+        await (
+            sb.table("bets")
+            .update({"bet_type": "market", "baseline_count": baseline_count})
+            .eq("id", str(bet_id))
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Skipping optional bet enrichment columns for bet %s: %s", bet_id, exc)
 
     return PlaceBetResponse(
         bet_id=bet_id,

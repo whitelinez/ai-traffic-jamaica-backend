@@ -188,11 +188,25 @@ async def admin_list_users(
     except TypeError:
         resp = await sb.auth.admin.list_users({"page": page, "per_page": per_page})
 
-    users_raw = getattr(resp, "users", None)
-    if users_raw is None and isinstance(resp, dict):
-        users_raw = resp.get("users")
-    if users_raw is None and hasattr(resp, "model_dump"):
-        users_raw = (resp.model_dump() or {}).get("users")
+    # list_users response shape differs across SDK versions:
+    # - resp.users
+    # - {"users": [...]}
+    # - {"data": {"users": [...]}}
+    # - model_dump() with one of the above
+    payload = None
+    if hasattr(resp, "model_dump"):
+        payload = resp.model_dump() or {}
+    elif isinstance(resp, dict):
+        payload = resp
+    else:
+        payload = {}
+
+    users_raw = (
+        getattr(resp, "users", None)
+        or payload.get("users")
+        or (payload.get("data") or {}).get("users")
+        or getattr(resp, "data", {}).get("users") if hasattr(resp, "data") else None
+    )
     users_raw = users_raw or []
 
     users = []
@@ -214,6 +228,34 @@ async def admin_list_users(
                 "email_confirmed_at": rec.get("email_confirmed_at"),
             }
         )
+
+    # Fallback: if auth admin list is empty but profiles exist, surface those users.
+    # This helps when auth list shape/permissions differ but app users are present.
+    if not users:
+        try:
+            prof_resp = await (
+                sb.table("profiles")
+                .select("user_id,username,created_at")
+                .order("created_at", desc=True)
+                .limit(per_page)
+                .execute()
+            )
+            for p in (prof_resp.data or []):
+                uid = p.get("user_id")
+                if not uid:
+                    continue
+                users.append(
+                    {
+                        "id": uid,
+                        "email": None,
+                        "created_at": p.get("created_at"),
+                        "last_sign_in_at": None,
+                        "role": "user",
+                        "email_confirmed_at": None,
+                    }
+                )
+        except Exception:
+            pass
 
     return {"users": users, "page": page, "per_page": per_page}
 
