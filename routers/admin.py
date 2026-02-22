@@ -144,6 +144,53 @@ async def set_user_role(
     return {"message": f"User {target_user_id} role set to {role}"}
 
 
+@router.get("/users")
+async def admin_list_users(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=200, ge=1, le=1000),
+):
+    """
+    List registered auth users (admin-only) with minimal safe fields.
+    """
+    sb = await get_supabase()
+
+    # supabase-py signatures vary by version; support both call styles.
+    try:
+        resp = await sb.auth.admin.list_users(page=page, per_page=per_page)
+    except TypeError:
+        resp = await sb.auth.admin.list_users({"page": page, "per_page": per_page})
+
+    users_raw = getattr(resp, "users", None)
+    if users_raw is None and isinstance(resp, dict):
+        users_raw = resp.get("users")
+    if users_raw is None and hasattr(resp, "model_dump"):
+        users_raw = (resp.model_dump() or {}).get("users")
+    users_raw = users_raw or []
+
+    users = []
+    for u in users_raw:
+        if hasattr(u, "model_dump"):
+            rec = u.model_dump()
+        elif isinstance(u, dict):
+            rec = u
+        else:
+            rec = {}
+        app_meta = rec.get("app_metadata") or {}
+        users.append(
+            {
+                "id": rec.get("id"),
+                "email": rec.get("email"),
+                "created_at": rec.get("created_at"),
+                "last_sign_in_at": rec.get("last_sign_in_at"),
+                "role": app_meta.get("role", "user"),
+                "email_confirmed_at": rec.get("email_confirmed_at"),
+            }
+        )
+
+    return {"users": users, "page": page, "per_page": per_page}
+
+
 @router.post("/ml/retrain")
 async def admin_ml_retrain(
     body: dict,
