@@ -104,7 +104,13 @@ async def _run_external_training(
     async with httpx.AsyncClient(timeout=timeout_sec) as client:
         resp = await client.post(webhook, json=payload, headers=headers)
     if resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Trainer webhook failed: {resp.status_code}")
+        body = (resp.text or "").strip()
+        if len(body) > 400:
+            body = body[:400] + "...(truncated)"
+        detail = f"Trainer webhook failed: {resp.status_code}"
+        if body:
+            detail += f" body={body}"
+        raise HTTPException(status_code=502, detail=detail)
 
     data = resp.json()
     if not data.get("model_uri"):
