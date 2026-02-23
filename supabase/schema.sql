@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS cameras (
 -- Camera AI/counter config (migration-safe additions for older projects).
 ALTER TABLE cameras
   ADD COLUMN IF NOT EXISTS detect_zone JSONB, -- polygon points used for pre-validation
-  ADD COLUMN IF NOT EXISTS count_settings JSONB NOT NULL DEFAULT '{}'; -- per-camera thresholds
+  ADD COLUMN IF NOT EXISTS count_settings JSONB NOT NULL DEFAULT '{}', -- per-camera thresholds
+  ADD COLUMN IF NOT EXISTS feed_appearance JSONB NOT NULL DEFAULT '{}'; -- admin/public video appearance
 
 CREATE TABLE IF NOT EXISTS bet_rounds (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
