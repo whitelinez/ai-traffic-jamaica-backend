@@ -16,6 +16,7 @@ from services.round_service import create_round, resolve_round, resolve_round_fr
 from services.round_session_service import create_round_session, list_round_sessions, stop_round_session
 from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models, get_ml_diagnostics
 from services.ml_capture_monitor import get_capture_status, set_capture_paused, is_capture_paused, record_capture_event
+from services.runtime_tuner import RUNTIME_PROFILES
 from config import get_config
 from supabase_client import get_supabase
 from middleware.rate_limiter import limiter
@@ -689,3 +690,122 @@ async def admin_ml_night_profile_patch(
         },
         "note": "Applied in-memory immediately. Set env vars to persist across restart/redeploy.",
     }
+
+
+@router.get("/ml/runtime-profile")
+async def admin_ml_runtime_profile_get(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    camera_id: str | None = Query(default=None),
+):
+    """
+    Read adaptive runtime profile controls from cameras.count_settings.
+    """
+    cfg = get_config()
+    sb = await get_supabase()
+    cam_id = await _resolve_runtime_camera_id(sb, cfg, camera_id)
+    cam_resp = await (
+        sb.table("cameras")
+        .select("id,name,count_settings")
+        .eq("id", cam_id)
+        .single()
+        .execute()
+    )
+    row = cam_resp.data or {}
+    settings = row.get("count_settings") or {}
+    if not isinstance(settings, dict):
+        settings = {}
+
+    return {
+        "camera_id": row.get("id"),
+        "camera_name": row.get("name"),
+        "mode": settings.get("runtime_profile_mode", "auto"),
+        "manual_profile": settings.get("runtime_manual_profile", ""),
+        "manual_until": settings.get("runtime_manual_until"),
+        "auto_enabled": settings.get("runtime_auto_enabled", 1),
+        "autotune_interval_sec": settings.get("runtime_autotune_interval_sec", 20),
+        "profile_cooldown_sec": settings.get("runtime_profile_cooldown_sec", 600),
+        "stream_grab_latest": settings.get("runtime_stream_grab_latest", None),
+        "available_profiles": sorted(RUNTIME_PROFILES.keys()),
+        "count_settings": settings,
+    }
+
+
+@router.patch("/ml/runtime-profile")
+async def admin_ml_runtime_profile_patch(
+    body: dict,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Update adaptive runtime profile controls in cameras.count_settings.
+    """
+    cfg = get_config()
+    sb = await get_supabase()
+    cam_id = await _resolve_runtime_camera_id(sb, cfg, body.get("camera_id"))
+    cam_resp = await (
+        sb.table("cameras")
+        .select("count_settings")
+        .eq("id", cam_id)
+        .single()
+        .execute()
+    )
+    settings = (cam_resp.data or {}).get("count_settings") or {}
+    if not isinstance(settings, dict):
+        settings = {}
+
+    if "mode" in body:
+        mode = str(body.get("mode") or "auto").strip().lower()
+        if mode not in {"auto", "manual"}:
+            raise HTTPException(status_code=400, detail="mode must be 'auto' or 'manual'")
+        settings["runtime_profile_mode"] = mode
+    if "manual_profile" in body:
+        profile = str(body.get("manual_profile") or "").strip()
+        if profile and profile not in RUNTIME_PROFILES:
+            raise HTTPException(status_code=400, detail=f"manual_profile must be one of {sorted(RUNTIME_PROFILES.keys())}")
+        settings["runtime_manual_profile"] = profile
+    if "manual_until" in body:
+        settings["runtime_manual_until"] = body.get("manual_until")
+    if "auto_enabled" in body:
+        settings["runtime_auto_enabled"] = 1 if bool(body.get("auto_enabled")) else 0
+    if "autotune_interval_sec" in body:
+        settings["runtime_autotune_interval_sec"] = max(5, min(300, int(body.get("autotune_interval_sec"))))
+    if "profile_cooldown_sec" in body:
+        settings["runtime_profile_cooldown_sec"] = max(15, min(3600, int(body.get("profile_cooldown_sec"))))
+    if "stream_grab_latest" in body:
+        settings["runtime_stream_grab_latest"] = 1 if bool(body.get("stream_grab_latest")) else 0
+
+    await (
+        sb.table("cameras")
+        .update({"count_settings": settings})
+        .eq("id", cam_id)
+        .execute()
+    )
+    return {
+        "ok": True,
+        "camera_id": cam_id,
+        "count_settings": settings,
+        "note": "Persisted to cameras.count_settings. Runtime applies on next counter refresh.",
+    }
+async def _resolve_runtime_camera_id(sb, cfg, camera_id: str | None) -> str:
+    if camera_id:
+        return str(camera_id)
+    cam_resp = await (
+        sb.table("cameras")
+        .select("id")
+        .eq("ipcam_alias", cfg.CAMERA_ALIAS)
+        .limit(1)
+        .execute()
+    )
+    if cam_resp.data:
+        return str(cam_resp.data[0]["id"])
+    active_resp = await (
+        sb.table("cameras")
+        .select("id")
+        .eq("is_active", True)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if active_resp.data:
+        return str(active_resp.data[0]["id"])
+    raise HTTPException(status_code=404, detail="No camera found for runtime profile controls")
+

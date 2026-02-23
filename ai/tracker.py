@@ -13,11 +13,15 @@ from config import get_config
 class VehicleTracker:
     def __init__(self):
         cfg = get_config()
+        self._track_activation_threshold = cfg.TRACK_ACTIVATION_THRESHOLD
+        self._track_match_threshold = cfg.TRACK_MATCH_THRESHOLD
+        self._track_frame_rate = cfg.TRACK_FRAME_RATE
+        self._lost_track_buffer = int(cfg.TRACK_LOST_BUFFER)
         self.tracker = sv.ByteTrack(
-            track_activation_threshold=cfg.TRACK_ACTIVATION_THRESHOLD,
-            lost_track_buffer=cfg.TRACK_LOST_BUFFER,   # keep IDs stable through brief occlusions/frame drops
-            minimum_matching_threshold=cfg.TRACK_MATCH_THRESHOLD,
-            frame_rate=cfg.TRACK_FRAME_RATE,
+            track_activation_threshold=self._track_activation_threshold,
+            lost_track_buffer=self._lost_track_buffer,   # keep IDs stable through brief occlusions/frame drops
+            minimum_matching_threshold=self._track_match_threshold,
+            frame_rate=self._track_frame_rate,
         )
         self.fallback_enabled = int(getattr(cfg, "TRACK_FALLBACK_ENABLED", 1) or 0) == 1
         self.fallback_dist_ratio_day = float(
@@ -28,6 +32,51 @@ class VehicleTracker:
         self._night_mode = False
         self._fallback_next_id = 10_000_000
         self._tracks: dict[int, tuple[float, float, float]] = {}
+
+    def _rebuild_tracker(self, lost_buffer: int) -> None:
+        self._lost_track_buffer = int(max(1, lost_buffer))
+        self.tracker = sv.ByteTrack(
+            track_activation_threshold=self._track_activation_threshold,
+            lost_track_buffer=self._lost_track_buffer,
+            minimum_matching_threshold=self._track_match_threshold,
+            frame_rate=self._track_frame_rate,
+        )
+
+    def apply_runtime_profile(self, profile: dict) -> None:
+        """
+        Apply runtime tracking tuning from adaptive profile.
+        Supported keys:
+        - lost_buffer
+        - fallback_ttl_sec
+        - fallback_dist_ratio
+        """
+        if not isinstance(profile, dict):
+            return
+
+        lost_buffer = profile.get("lost_buffer")
+        if lost_buffer is not None:
+            try:
+                lb = int(lost_buffer)
+                if lb != self._lost_track_buffer:
+                    self._rebuild_tracker(lb)
+            except Exception:
+                pass
+
+        ttl = profile.get("fallback_ttl_sec")
+        if ttl is not None:
+            try:
+                self.fallback_ttl_sec = max(0.2, float(ttl))
+            except Exception:
+                pass
+
+        dist_ratio = profile.get("fallback_dist_ratio")
+        if dist_ratio is not None:
+            try:
+                base = max(0.01, min(0.3, float(dist_ratio)))
+                self.fallback_dist_ratio_day = base
+                self.fallback_dist_ratio_night = base * 1.35
+            except Exception:
+                pass
 
     def set_night_mode(self, enabled: bool) -> None:
         self._night_mode = bool(enabled)

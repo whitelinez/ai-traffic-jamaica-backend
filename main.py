@@ -9,6 +9,7 @@ main.py — FastAPI application entry point.
 import asyncio
 import logging
 import sys
+from collections import deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -38,6 +39,11 @@ from services.round_session_service import session_scheduler_tick, next_session_
 from services.analytics_service import write_ml_detection_event
 from services.ml_pipeline_service import auto_retrain_cycle
 from services.ml_capture_monitor import record_capture_event, is_capture_paused
+from services.runtime_tuner import (
+    RUNTIME_PROFILES,
+    TrafficStats,
+    select_runtime_profile,
+)
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -414,21 +420,11 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             return start <= hour < end
         return hour >= start or hour < end
 
-    def _apply_detector_profile(*, night: bool) -> None:
-        if night:
-            detector.conf = float(getattr(cfg, "NIGHT_YOLO_CONF", cfg.YOLO_CONF))
-            detector.infer_size = int(getattr(cfg, "NIGHT_DETECT_INFER_SIZE", cfg.DETECT_INFER_SIZE))
-            detector.iou = float(getattr(cfg, "NIGHT_DETECT_IOU", cfg.DETECT_IOU))
-            detector.max_det = int(getattr(cfg, "NIGHT_DETECT_MAX_DET", cfg.DETECT_MAX_DET))
-            detector.set_night_mode(True)
-            tracker.set_night_mode(True)
-        else:
-            detector.conf = float(cfg.YOLO_CONF)
-            detector.infer_size = int(cfg.DETECT_INFER_SIZE)
-            detector.iou = float(cfg.DETECT_IOU)
-            detector.max_det = int(cfg.DETECT_MAX_DET)
-            detector.set_night_mode(False)
-            tracker.set_night_mode(False)
+    def _bounded_float(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, float(v)))
+
+    def _bounded_int(v: int, lo: int, hi: int) -> int:
+        return max(lo, min(hi, int(v)))
 
     logger.info("AI loop inner: initialising detector")
     detector = VehicleDetector(
@@ -452,6 +448,13 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     frame_buf = None
     counter: LineCounter | None = None
     last_db_write = 0.0
+    frame_index = 0
+    process_every_n = 1
+    runtime_profile_name = ""
+    runtime_profile_reason = ""
+    last_runtime_eval = 0.0
+    last_runtime_switch = 0.0
+    runtime_events: deque[tuple[float, int, int, float]] = deque()
     capture = LiveDatasetCapture(
         enabled=(cfg.AUTO_CAPTURE_ENABLED == 1),
         dataset_root=cfg.AUTO_CAPTURE_DATASET_ROOT,
@@ -502,18 +505,12 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             )
 
     async for frame in hls_stream.frames():
+        frame_index += 1
         now_is_night = _is_night_hour()
         if profile_is_night is None or now_is_night != profile_is_night:
-            _apply_detector_profile(night=now_is_night)
+            detector.set_night_mode(now_is_night)
+            tracker.set_night_mode(now_is_night)
             profile_is_night = now_is_night
-            logger.info(
-                "AI detector profile switched: %s (conf=%.2f, infer=%s, iou=%.2f, max_det=%s)",
-                "night" if now_is_night else "day",
-                detector.conf,
-                detector.infer_size,
-                detector.iou,
-                detector.max_det,
-            )
 
         # Hot-reload stream URL if the refresher has a newer one
         fresh = get_current_url()
@@ -529,11 +526,124 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             frame_buf = True
             logger.info("AI loop started: frame size %dx%d", w, h)
 
+        loop_now = asyncio.get_running_loop().time()
+        runtime_interval_sec = 20.0
+        runtime_cooldown_sec = 600.0
+        controls: dict[str, object] = {}
+        if counter is not None:
+            controls = {
+                "runtime_profile_mode": counter.get_setting("runtime_profile_mode", "auto"),
+                "runtime_manual_profile": counter.get_setting("runtime_manual_profile", ""),
+                "runtime_manual_until": counter.get_setting("runtime_manual_until"),
+                "runtime_auto_enabled": counter.get_setting("runtime_auto_enabled", 1),
+                "runtime_profile_cooldown_sec": counter.get_setting("runtime_profile_cooldown_sec", 600),
+                "runtime_autotune_interval_sec": counter.get_setting("runtime_autotune_interval_sec", 20),
+                "runtime_stream_grab_latest": counter.get_setting("runtime_stream_grab_latest"),
+            }
+            try:
+                runtime_interval_sec = max(5.0, float(controls.get("runtime_autotune_interval_sec", 20) or 20))
+            except Exception:
+                runtime_interval_sec = 20.0
+            try:
+                runtime_cooldown_sec = max(15.0, float(controls.get("runtime_profile_cooldown_sec", 600) or 600))
+            except Exception:
+                runtime_cooldown_sec = 600.0
+
+        force_eval = (runtime_profile_name == "")
+        if (loop_now - last_runtime_eval) >= runtime_interval_sec or force_eval:
+            now_utc = datetime.now(timezone.utc)
+            horizon_sec = 120.0
+            while runtime_events and (loop_now - runtime_events[0][0]) > horizon_sec:
+                runtime_events.popleft()
+            if runtime_events:
+                window_sec = max(1.0, loop_now - runtime_events[0][0])
+                det_pm = (sum(ev[1] for ev in runtime_events) / window_sec) * 60.0
+                cross_pm = (sum(ev[2] for ev in runtime_events) / window_sec) * 60.0
+                conf_vals = [ev[3] for ev in runtime_events if ev[3] > 0]
+                avg_conf = (sum(conf_vals) / len(conf_vals)) if conf_vals else 0.0
+            else:
+                det_pm = 0.0
+                cross_pm = 0.0
+                avg_conf = 0.0
+
+            stats = TrafficStats(
+                detections_per_min=det_pm,
+                crossings_per_min=cross_pm,
+                avg_confidence=avg_conf,
+            )
+
+            mode = str(controls.get("runtime_profile_mode", "auto") or "auto").strip().lower()
+            try:
+                auto_enabled = 1 if int(controls.get("runtime_auto_enabled", 1) or 0) == 1 else 0
+            except Exception:
+                auto_enabled = 1
+            if mode != "manual" and auto_enabled != 1:
+                desired_profile = "night_balanced" if now_is_night else "day_balanced"
+                reason = "auto_disabled"
+            else:
+                desired_profile, reason = select_runtime_profile(
+                    now_utc=now_utc,
+                    stats=stats,
+                    controls=controls,
+                    night_start_hour=int(getattr(cfg, "NIGHT_PROFILE_START_HOUR", 18) or 18),
+                    night_end_hour=int(getattr(cfg, "NIGHT_PROFILE_END_HOUR", 6) or 6),
+                )
+
+            can_switch = (
+                runtime_profile_name == ""
+                or desired_profile == runtime_profile_name
+                or reason == "manual_override"
+                or (loop_now - last_runtime_switch) >= runtime_cooldown_sec
+            )
+            if can_switch and desired_profile in RUNTIME_PROFILES and desired_profile != runtime_profile_name:
+                profile = RUNTIME_PROFILES[desired_profile]
+                det = profile.get("detector", {})
+                trk = profile.get("tracker", {})
+                lp = profile.get("loop", {})
+
+                detector.conf = _bounded_float(det.get("conf", detector.conf), 0.05, 0.95)
+                detector.infer_size = _bounded_int(det.get("infer_size", detector.infer_size), 320, 1280)
+                detector.iou = _bounded_float(det.get("iou", detector.iou), 0.05, 0.95)
+                detector.max_det = _bounded_int(det.get("max_det", detector.max_det), 10, 600)
+                tracker.apply_runtime_profile(trk)
+                process_every_n = _bounded_int(lp.get("process_every_n", process_every_n), 1, 4)
+
+                stream_latest = controls.get("runtime_stream_grab_latest")
+                if stream_latest is not None:
+                    hls_stream._grab_latest = bool(stream_latest)
+
+                runtime_profile_name = desired_profile
+                runtime_profile_reason = reason
+                last_runtime_switch = loop_now
+                logger.info(
+                    "Runtime profile applied: %s (%s) conf=%.2f infer=%s iou=%.2f max_det=%s process_every_n=%s",
+                    runtime_profile_name,
+                    runtime_profile_reason,
+                    detector.conf,
+                    detector.infer_size,
+                    detector.iou,
+                    detector.max_det,
+                    process_every_n,
+                )
+            last_runtime_eval = loop_now
+
+        if process_every_n > 1 and (frame_index % process_every_n) != 0:
+            await asyncio.sleep(0)
+            continue
+
         detections = await asyncio.to_thread(detector.detect, frame)
         # Keep full-frame detections for tracking/overlay visibility.
         # Count logic still applies detect/count zones inside LineCounter.process().
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
+        det_boxes = snapshot.get("detections") or []
+        conf_vals = [float(d.get("conf")) for d in det_boxes if d.get("conf") is not None]
+        runtime_events.append((
+            loop_now,
+            len(det_boxes),
+            int(snapshot.get("new_crossings", 0) or 0),
+            (sum(conf_vals) / len(conf_vals)) if conf_vals else 0.0,
+        ))
         capture_result = None
         capture_is_paused = is_capture_paused()
         if capture_is_paused:
@@ -580,6 +690,8 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
         if manager.public_count > 0:
             payload: dict = {"type": "count", **snapshot}
+            payload["runtime_profile"] = runtime_profile_name or None
+            payload["runtime_profile_reason"] = runtime_profile_reason or None
             if _active_round:
                 payload["round"] = _active_round
             await manager.broadcast_public(payload)
@@ -687,6 +799,8 @@ async def health():
     next_round_at: str | None = None
     active_round_id: str | None = _active_round["id"] if _active_round else None
     active_round_status: str | None = _active_round.get("status") if _active_round else None
+    latest_snapshot: dict | None = None
+    latest_ml_detection: dict | None = None
     try:
         sb = await get_supabase()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -733,6 +847,39 @@ async def health():
         next_round_at = (up_resp.data or {}).get("opens_at")
         if not next_round_at:
             next_round_at = await next_session_round_at()
+
+        cam_resp = await (
+            sb.table("cameras")
+            .select("id")
+            .eq("ipcam_alias", get_config().CAMERA_ALIAS)
+            .limit(1)
+            .execute()
+        )
+        camera_id = cam_resp.data[0]["id"] if cam_resp.data else None
+        if camera_id:
+            snap_resp = await (
+                sb.table("count_snapshots")
+                .select("camera_id,captured_at,count_in,count_out,total,vehicle_breakdown")
+                .eq("camera_id", camera_id)
+                .order("captured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            snap_rows = snap_resp.data or []
+            if snap_rows:
+                latest_snapshot = snap_rows[0]
+
+            ml_resp = await (
+                sb.table("ml_detection_events")
+                .select("captured_at,avg_confidence,model_name,detections_count,new_crossings")
+                .eq("camera_id", camera_id)
+                .order("captured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            ml_rows = ml_resp.data or []
+            if ml_rows:
+                latest_ml_detection = ml_rows[0]
     except Exception:
         next_round_at = None
 
@@ -749,6 +896,8 @@ async def health():
         "active_round_id": active_round_id,
         "active_round_status": active_round_status,
         "next_round_at": next_round_at,
+        "latest_snapshot": latest_snapshot,
+        "latest_ml_detection": latest_ml_detection,
     }
 
 

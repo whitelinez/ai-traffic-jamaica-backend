@@ -51,6 +51,7 @@ class LineCounter:
         self._detect_zone_data = None
         self._last_refresh = 0.0
         self._count_settings = dict(DEFAULT_COUNT_SETTINGS)
+        self._raw_count_settings: dict[str, Any] = {}
 
         self._counts: dict[str, dict[str, int]] = {}
         self._per_class_total: dict[str, int] = {}
@@ -166,6 +167,7 @@ class LineCounter:
         count_settings = data.get("count_settings") or {}
         if not isinstance(count_settings, dict):
             count_settings = {}
+        self._raw_count_settings = dict(count_settings)
 
         merged = dict(DEFAULT_COUNT_SETTINGS)
         merged.update(count_settings)
@@ -525,6 +527,13 @@ class LineCounter:
         if vehicle_class is None:
             return sum(self._per_class_total.values())
         return self._per_class_total.get(vehicle_class, 0)
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        """
+        Return a raw per-camera count_settings value.
+        Useful for runtime controls that are not part of core counter filters.
+        """
+        return self._raw_count_settings.get(key, default)
 
     def reset(self) -> None:
         self._counts.clear()
