@@ -24,6 +24,12 @@ DEFAULT_COUNT_SETTINGS = {
     "min_confidence": 0.0,
     "allowed_classes": [],
     "class_min_confidence": {},
+    # Track-level temporal smoothing + hysteresis for stable counting.
+    "track_conf_smoothing_alpha": 0.35,
+    "track_conf_enter": 0.42,
+    "track_conf_exit": 0.30,
+    # Polygon count confirmation: require N consecutive inside frames.
+    "count_zone_confirm_frames": 2,
 }
 
 
@@ -54,10 +60,43 @@ class LineCounter:
         self._track_last_seen: dict[int, float] = {}
         self._track_seen_frames: dict[int, int] = {}
         self._track_in_count_zone: set[int] = set()
+        self._track_in_zone_frames: dict[int, int] = {}
+        self._track_conf_ema: dict[int, float] = {}
+        self._track_conf_stable: dict[int, bool] = {}
 
         self._confirmed_in = 0
         self._confirmed_out = 0
         self._confirmed_total = 0
+
+    @staticmethod
+    def _normalize_polygon(points: list[tuple[int, int]]) -> np.ndarray:
+        """
+        Return a stable, clockwise polygon for zone checks.
+        Admin clicks can arrive in arbitrary order; sorting around centroid avoids
+        self-intersections that break PolygonZone.trigger().
+        """
+        if len(points) < 3:
+            return np.empty((0, 2), dtype=np.int32)
+        uniq = list(dict.fromkeys((int(x), int(y)) for x, y in points))
+        if len(uniq) < 3:
+            return np.empty((0, 2), dtype=np.int32)
+        cx = sum(p[0] for p in uniq) / len(uniq)
+        cy = sum(p[1] for p in uniq) / len(uniq)
+        ordered = sorted(uniq, key=lambda p: np.arctan2(p[1] - cy, p[0] - cx))
+        return np.array(ordered, dtype=np.int32)
+
+    @staticmethod
+    def _safe_tracker_id(raw_tid: Any) -> int | None:
+        """Coerce tracker id and drop invalid/untracked values."""
+        if raw_tid is None:
+            return None
+        try:
+            tid = int(raw_tid)
+        except Exception:
+            return None
+        if tid < 0:
+            return None
+        return tid
 
     async def bootstrap_from_latest_snapshot(self) -> None:
         """
@@ -152,19 +191,36 @@ class LineCounter:
                 except Exception:
                     continue
         merged["class_min_confidence"] = class_conf
+        merged["track_conf_smoothing_alpha"] = max(
+            0.05, min(1.0, float(merged.get("track_conf_smoothing_alpha", 0.35) or 0.35))
+        )
+        merged["track_conf_enter"] = max(
+            0.0, min(1.0, float(merged.get("track_conf_enter", 0.42) or 0.42))
+        )
+        merged["track_conf_exit"] = max(
+            0.0, min(1.0, float(merged.get("track_conf_exit", 0.30) or 0.30))
+        )
+        if merged["track_conf_exit"] > merged["track_conf_enter"]:
+            merged["track_conf_exit"] = merged["track_conf_enter"]
+        merged["count_zone_confirm_frames"] = max(
+            1, int(merged.get("count_zone_confirm_frames", 2) or 2)
+        )
         self._count_settings = merged
 
         w, h = self.frame_width, self.frame_height
 
         if line_data and "x3" in line_data:
-            polygon = np.array([
-                [int(line_data["x1"] * w), int(line_data["y1"] * h)],
-                [int(line_data["x2"] * w), int(line_data["y2"] * h)],
-                [int(line_data["x3"] * w), int(line_data["y3"] * h)],
-                [int(line_data["x4"] * w), int(line_data["y4"] * h)],
-            ], dtype=np.int32)
-            self._zone = sv.PolygonZone(polygon=polygon)
-            self._zone_type = "polygon"
+            polygon = self._normalize_polygon([
+                (int(line_data["x1"] * w), int(line_data["y1"] * h)),
+                (int(line_data["x2"] * w), int(line_data["y2"] * h)),
+                (int(line_data["x3"] * w), int(line_data["y3"] * h)),
+                (int(line_data["x4"] * w), int(line_data["y4"] * h)),
+            ])
+            if len(polygon) >= 3:
+                self._zone = sv.PolygonZone(polygon=polygon)
+                self._zone_type = "polygon"
+            else:
+                self._zone = None
         elif line_data:
             x1, y1 = int(line_data["x1"] * w), int(line_data["y1"] * h)
             x2, y2 = int(line_data["x2"] * w), int(line_data["y2"] * h)
@@ -180,21 +236,20 @@ class LineCounter:
             pts = detect_data.get("points") or []
             pts = [p for p in pts if isinstance(p, dict) and "x" in p and "y" in p]
             if len(pts) >= 3:
-                dz_polygon = np.array(
-                    [[int(float(p["x"]) * w), int(float(p["y"]) * h)] for p in pts],
-                    dtype=np.int32,
+                dz_polygon = self._normalize_polygon(
+                    [(int(float(p["x"]) * w), int(float(p["y"]) * h)) for p in pts]
                 )
-                self._detect_zone = sv.PolygonZone(polygon=dz_polygon)
+                self._detect_zone = sv.PolygonZone(polygon=dz_polygon) if len(dz_polygon) >= 3 else None
             else:
                 self._detect_zone = None
         elif detect_data and "x3" in detect_data:
-            dz_polygon = np.array([
-                [int(detect_data["x1"] * w), int(detect_data["y1"] * h)],
-                [int(detect_data["x2"] * w), int(detect_data["y2"] * h)],
-                [int(detect_data["x3"] * w), int(detect_data["y3"] * h)],
-                [int(detect_data["x4"] * w), int(detect_data["y4"] * h)],
-            ], dtype=np.int32)
-            self._detect_zone = sv.PolygonZone(polygon=dz_polygon)
+            dz_polygon = self._normalize_polygon([
+                (int(detect_data["x1"] * w), int(detect_data["y1"] * h)),
+                (int(detect_data["x2"] * w), int(detect_data["y2"] * h)),
+                (int(detect_data["x3"] * w), int(detect_data["y3"] * h)),
+                (int(detect_data["x4"] * w), int(detect_data["y4"] * h)),
+            ])
+            self._detect_zone = sv.PolygonZone(polygon=dz_polygon) if len(dz_polygon) >= 3 else None
         elif detect_data and "x1" in detect_data:
             dz_polygon = np.array([
                 [int(detect_data["x1"] * w), int(detect_data["y1"] * h)],
@@ -219,6 +274,9 @@ class LineCounter:
         for tid in stale:
             self._track_last_seen.pop(tid, None)
             self._track_seen_frames.pop(tid, None)
+            self._track_in_zone_frames.pop(tid, None)
+            self._track_conf_ema.pop(tid, None)
+            self._track_conf_stable.pop(tid, None)
         self._prevalidated_track_ids.difference_update(stale_set)
         self._track_in_count_zone.difference_update(stale_set)
 
@@ -250,6 +308,7 @@ class LineCounter:
         new_crossings = 0
         tracker_ids = getattr(detections, "tracker_id", None)
         has_tracker_ids = tracker_ids is not None and len(tracker_ids) == len(detections)
+        detect_inside_mask: list[bool] = [False] * len(detections)
 
         eligible_mask = [True] * len(detections)
         allowed_classes = set(self._count_settings.get("allowed_classes", []))
@@ -257,6 +316,10 @@ class LineCounter:
         min_conf = float(self._count_settings.get("min_confidence", 0.0) or 0.0)
         min_area_ratio = float(self._count_settings.get("min_box_area_ratio", 0.0) or 0.0)
         min_track_frames = int(self._count_settings.get("min_track_frames", 3) or 3)
+        conf_alpha = float(self._count_settings.get("track_conf_smoothing_alpha", 0.35) or 0.35)
+        conf_enter = float(self._count_settings.get("track_conf_enter", 0.42) or 0.42)
+        conf_exit = float(self._count_settings.get("track_conf_exit", 0.30) or 0.30)
+        zone_confirm_frames = int(self._count_settings.get("count_zone_confirm_frames", 2) or 2)
         frame_area = float(max(1, self.frame_width * self.frame_height))
 
         for i in range(len(detections)):
@@ -286,27 +349,50 @@ class LineCounter:
                     eligible_mask[i] = False
                     continue
 
+            # Track-level confidence smoothing + hysteresis:
+            # avoids one-frame confidence dips causing flicker/miscounts.
+            if has_tracker_ids and detections.confidence is not None and i < len(detections.confidence):
+                tid = self._safe_tracker_id(tracker_ids[i])
+                if tid is not None:
+                    conf_now = float(detections.confidence[i])
+                    prev_ema = self._track_conf_ema.get(tid, conf_now)
+                    ema = (conf_alpha * conf_now) + ((1.0 - conf_alpha) * prev_ema)
+                    self._track_conf_ema[tid] = ema
+                    was_stable = self._track_conf_stable.get(tid, False)
+                    if was_stable:
+                        is_stable = ema >= conf_exit
+                    else:
+                        is_stable = ema >= conf_enter
+                    self._track_conf_stable[tid] = is_stable
+                    if not is_stable:
+                        eligible_mask[i] = False
+                        continue
+
         if has_tracker_ids:
             seen_this_frame: set[int] = set()
             for raw_tid in tracker_ids:
-                if raw_tid is None:
+                tid = self._safe_tracker_id(raw_tid)
+                if tid is None:
                     continue
-                tid = int(raw_tid)
                 self._touch_track(tid, now_mono)
                 if tid not in seen_this_frame:
                     self._track_seen_frames[tid] = self._track_seen_frames.get(tid, 0) + 1
                     seen_this_frame.add(tid)
             self._cleanup_stale_tracks(now_mono)
 
-        if self._detect_zone is not None and len(detections) > 0 and has_tracker_ids:
+        if self._detect_zone is not None and len(detections) > 0:
             detect_mask = self._detect_zone.trigger(detections=detections)
-            for i, inside in enumerate(detect_mask):
-                if not inside or not eligible_mask[i]:
-                    continue
-                raw_tid = tracker_ids[i]
-                if raw_tid is None:
-                    continue
-                self._prevalidated_track_ids.add(int(raw_tid))
+            detect_inside_mask = [bool(x) for x in detect_mask]
+            if has_tracker_ids:
+                for i, inside in enumerate(detect_mask):
+                    if not inside or not eligible_mask[i]:
+                        continue
+                    tid = self._safe_tracker_id(tracker_ids[i])
+                    if tid is None:
+                        continue
+                    self._prevalidated_track_ids.add(tid)
+        if self._detect_zone is None:
+            detect_inside_mask = [True] * len(detections)
 
         if self._zone_type == "polygon":
             inside_mask = self._zone.trigger(detections=detections) if len(detections) > 0 else []
@@ -320,24 +406,29 @@ class LineCounter:
 
                 tid = None
                 if has_tracker_ids:
-                    raw_tid = tracker_ids[i]
-                    if raw_tid is not None:
-                        tid = int(raw_tid)
+                    tid = self._safe_tracker_id(tracker_ids[i])
 
                 if tid is None:
                     continue
 
                 inside_now.add(tid)
+                self._track_in_zone_frames[tid] = self._track_in_zone_frames.get(tid, 0) + 1
 
                 if self._detect_zone is not None and tid not in self._prevalidated_track_ids:
                     continue
                 if self._track_seen_frames.get(tid, 0) < min_track_frames:
+                    continue
+                if self._track_in_zone_frames.get(tid, 0) < zone_confirm_frames:
                     continue
 
                 if tid not in self._track_in_count_zone and tid not in self._confirmed_track_ids:
                     new_crossings += self._confirm_crossing(cls_name, True, False, tid)
 
             self._track_in_count_zone = inside_now
+            # Reset inside streak for tracks no longer inside.
+            for tid in list(self._track_in_zone_frames.keys()):
+                if tid not in inside_now:
+                    self._track_in_zone_frames[tid] = 0
             total_in = self._confirmed_in
             total_out = self._confirmed_out
             total = self._confirmed_total
@@ -356,9 +447,7 @@ class LineCounter:
 
                 tid = None
                 if has_tracker_ids:
-                    raw_tid = tracker_ids[i]
-                    if raw_tid is not None:
-                        tid = int(raw_tid)
+                    tid = self._safe_tracker_id(tracker_ids[i])
 
                 if tid is None:
                     continue
@@ -398,6 +487,7 @@ class LineCounter:
                     "y2": round(float(y2) / self.frame_height, 4),
                     "cls": CLASS_NAMES[cls_id],
                     "conf": conf,
+                    "in_detect_zone": bool(detect_inside_mask[i]) if i < len(detect_inside_mask) else True,
                 })
 
         snapshot = {
@@ -444,6 +534,9 @@ class LineCounter:
         self._track_last_seen.clear()
         self._track_seen_frames.clear()
         self._track_in_count_zone.clear()
+        self._track_in_zone_frames.clear()
+        self._track_conf_ema.clear()
+        self._track_conf_stable.clear()
         self._confirmed_in = 0
         self._confirmed_out = 0
         self._confirmed_total = 0

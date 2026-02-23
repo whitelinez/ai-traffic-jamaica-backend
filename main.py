@@ -37,7 +37,7 @@ from services.round_service import resolve_round_from_latest_snapshot
 from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
 from services.ml_pipeline_service import auto_retrain_cycle
-from services.ml_capture_monitor import record_capture_event
+from services.ml_capture_monitor import record_capture_event, is_capture_paused
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -420,11 +420,15 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             detector.infer_size = int(getattr(cfg, "NIGHT_DETECT_INFER_SIZE", cfg.DETECT_INFER_SIZE))
             detector.iou = float(getattr(cfg, "NIGHT_DETECT_IOU", cfg.DETECT_IOU))
             detector.max_det = int(getattr(cfg, "NIGHT_DETECT_MAX_DET", cfg.DETECT_MAX_DET))
+            detector.set_night_mode(True)
+            tracker.set_night_mode(True)
         else:
             detector.conf = float(cfg.YOLO_CONF)
             detector.infer_size = int(cfg.DETECT_INFER_SIZE)
             detector.iou = float(cfg.DETECT_IOU)
             detector.max_det = int(cfg.DETECT_MAX_DET)
+            detector.set_night_mode(False)
+            tracker.set_night_mode(False)
 
     logger.info("AI loop inner: initialising detector")
     detector = VehicleDetector(
@@ -530,12 +534,22 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         # Count logic still applies detect/count zones inside LineCounter.process().
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
-        capture_result = await asyncio.to_thread(
-            capture.maybe_capture,
-            frame,
-            snapshot.get("detections", []),
-            str(camera_id),
-        )
+        capture_result = None
+        capture_is_paused = is_capture_paused()
+        if capture_is_paused:
+            if not getattr(_ai_loop_inner, "_capture_pause_logged", False):
+                logger.info("Live capture is paused by admin control")
+                setattr(_ai_loop_inner, "_capture_pause_logged", True)
+        else:
+            if getattr(_ai_loop_inner, "_capture_pause_logged", False):
+                logger.info("Live capture resumed by admin control")
+                setattr(_ai_loop_inner, "_capture_pause_logged", False)
+            capture_result = await asyncio.to_thread(
+                capture.maybe_capture,
+                frame,
+                snapshot.get("detections", []),
+                str(camera_id),
+            )
         if capture_result is not None:
             logger.info(
                 "Captured sample split=%s boxes=%s image=%s",

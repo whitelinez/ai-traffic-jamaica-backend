@@ -14,6 +14,7 @@ _lock = Lock()
 _capture_total = 0
 _upload_success_total = 0
 _upload_fail_total = 0
+_capture_paused = False
 
 
 def record_capture_event(event: str, message: str, meta: dict[str, Any] | None = None) -> None:
@@ -43,5 +44,18 @@ def get_capture_status(limit: int = 50) -> dict[str, Any]:
             "capture_total": _capture_total,
             "upload_success_total": _upload_success_total,
             "upload_fail_total": _upload_fail_total,
+            "capture_paused": bool(_capture_paused),
             "events": events,
         }
+
+
+def set_capture_paused(paused: bool) -> bool:
+    global _capture_paused
+    with _lock:
+        _capture_paused = bool(paused)
+        return _capture_paused
+
+
+def is_capture_paused() -> bool:
+    with _lock:
+        return bool(_capture_paused)

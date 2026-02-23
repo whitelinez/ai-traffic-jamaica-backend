@@ -32,10 +32,17 @@ class Config:
     NIGHT_DETECT_INFER_SIZE: int
     NIGHT_DETECT_IOU: float
     NIGHT_DETECT_MAX_DET: int
+    NIGHT_LIGHT_TRACK_ENABLED: int
+    NIGHT_LIGHT_BRIGHTNESS: float
+    NIGHT_LIGHT_CONTRAST: float
+    NIGHT_LIGHT_SHARPNESS: float
     TRACK_ACTIVATION_THRESHOLD: float
     TRACK_LOST_BUFFER: int
     TRACK_MATCH_THRESHOLD: float
     TRACK_FRAME_RATE: int
+    TRACK_FALLBACK_ENABLED: int
+    TRACK_FALLBACK_MAX_CENTER_DIST_RATIO: float
+    TRACK_FALLBACK_TTL_SEC: float
     COUNT_LINE_RATIO: float  # fallback ratio if no DB line
     DB_SNAPSHOT_INTERVAL_SEC: float
     STREAM_GRAB_LATEST: int
@@ -105,10 +112,19 @@ class Config:
         self.NIGHT_DETECT_INFER_SIZE = int(os.getenv("NIGHT_DETECT_INFER_SIZE", "640"))
         self.NIGHT_DETECT_IOU = float(os.getenv("NIGHT_DETECT_IOU", "0.45"))
         self.NIGHT_DETECT_MAX_DET = int(os.getenv("NIGHT_DETECT_MAX_DET", "120"))
+        self.NIGHT_LIGHT_TRACK_ENABLED = int(os.getenv("NIGHT_LIGHT_TRACK_ENABLED", "1"))
+        self.NIGHT_LIGHT_BRIGHTNESS = float(os.getenv("NIGHT_LIGHT_BRIGHTNESS", "1.18"))
+        self.NIGHT_LIGHT_CONTRAST = float(os.getenv("NIGHT_LIGHT_CONTRAST", "1.22"))
+        self.NIGHT_LIGHT_SHARPNESS = float(os.getenv("NIGHT_LIGHT_SHARPNESS", "1.10"))
         self.TRACK_ACTIVATION_THRESHOLD = float(os.getenv("TRACK_ACTIVATION_THRESHOLD", "0.2"))
         self.TRACK_LOST_BUFFER = int(os.getenv("TRACK_LOST_BUFFER", "20"))
         self.TRACK_MATCH_THRESHOLD = float(os.getenv("TRACK_MATCH_THRESHOLD", "0.65"))
         self.TRACK_FRAME_RATE = int(os.getenv("TRACK_FRAME_RATE", "25"))
+        self.TRACK_FALLBACK_ENABLED = int(os.getenv("TRACK_FALLBACK_ENABLED", "1"))
+        self.TRACK_FALLBACK_MAX_CENTER_DIST_RATIO = float(
+            os.getenv("TRACK_FALLBACK_MAX_CENTER_DIST_RATIO", "0.08")
+        )
+        self.TRACK_FALLBACK_TTL_SEC = float(os.getenv("TRACK_FALLBACK_TTL_SEC", "1.5"))
         self.COUNT_LINE_RATIO = float(os.getenv("COUNT_LINE_RATIO", "0.55"))
         self.DB_SNAPSHOT_INTERVAL_SEC = float(os.getenv("DB_SNAPSHOT_INTERVAL_SEC", "0.75"))
         self.STREAM_GRAB_LATEST = int(os.getenv("STREAM_GRAB_LATEST", "1"))

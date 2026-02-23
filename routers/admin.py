@@ -15,7 +15,7 @@ from services.auth_service import validate_supabase_jwt, require_admin, get_user
 from services.round_service import create_round, resolve_round, resolve_round_from_latest_snapshot
 from services.round_session_service import create_round_session, list_round_sessions, stop_round_session
 from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models, get_ml_diagnostics
-from services.ml_capture_monitor import get_capture_status
+from services.ml_capture_monitor import get_capture_status, set_capture_paused, is_capture_paused, record_capture_event
 from config import get_config
 from supabase_client import get_supabase
 from middleware.rate_limiter import limiter
@@ -559,7 +559,27 @@ async def admin_ml_capture_status(
         "capture_enabled": cfg.AUTO_CAPTURE_ENABLED == 1,
         "upload_enabled": cfg.AUTO_CAPTURE_UPLOAD_ENABLED == 1,
         "capture_classes": [c.strip() for c in cfg.AUTO_CAPTURE_CLASSES.split(",") if c.strip()],
+        "capture_paused": is_capture_paused(),
         **status,
+    }
+
+
+@router.patch("/ml/capture-status")
+async def admin_ml_capture_status_patch(
+    body: dict,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    paused = bool(body.get("paused"))
+    new_state = set_capture_paused(paused)
+    record_capture_event(
+        "capture_paused" if new_state else "capture_resumed",
+        "Live capture paused by admin" if new_state else "Live capture resumed by admin",
+        {"by_user": get_user_id(admin)},
+    )
+    return {
+        "ok": True,
+        "capture_paused": new_state,
+        "note": "Applied in-memory immediately. Persists until backend restart/redeploy.",
     }
 
 

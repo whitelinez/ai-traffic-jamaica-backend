@@ -8,7 +8,7 @@ import os
 import numpy as np
 import supervision as sv
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance
 from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,14 @@ class VehicleDetector:
         self.infer_size = int(infer_size or int(os.getenv("DETECT_INFER_SIZE", "448")))
         self.iou = float(iou_threshold if iou_threshold is not None else float(os.getenv("DETECT_IOU", "0.50")))
         self.max_det = int(max_det or int(os.getenv("DETECT_MAX_DET", "80")))
+        self.night_light_track_enabled = int(os.getenv("NIGHT_LIGHT_TRACK_ENABLED", "1")) == 1
+        self.night_light_brightness = float(os.getenv("NIGHT_LIGHT_BRIGHTNESS", "1.18"))
+        self.night_light_contrast = float(os.getenv("NIGHT_LIGHT_CONTRAST", "1.22"))
+        self.night_light_sharpness = float(os.getenv("NIGHT_LIGHT_SHARPNESS", "1.10"))
+        self._night_mode = False
+
+    def set_night_mode(self, enabled: bool) -> None:
+        self._night_mode = bool(enabled)
 
     def detect(self, frame) -> sv.Detections:
         """
@@ -62,8 +70,13 @@ class VehicleDetector:
         frame_np = np.array(frame, dtype=np.uint8)                   # BGR, system numpy
         frame_rgb = np.ascontiguousarray(frame_np[:, :, ::-1])       # BGR → RGB
 
-        # Letterbox entirely in PIL — no cv2 calls
+        # Letterbox entirely in PIL — no cv2 calls.
+        # At night, boost bright points/edges to help headlight/taillight tracking.
         pil = Image.fromarray(frame_rgb)
+        if self._night_mode and self.night_light_track_enabled:
+            pil = ImageEnhance.Brightness(pil).enhance(self.night_light_brightness)
+            pil = ImageEnhance.Contrast(pil).enhance(self.night_light_contrast)
+            pil = ImageEnhance.Sharpness(pil).enhance(self.night_light_sharpness)
         pil = pil.resize((new_w, new_h), Image.BILINEAR)
         padded = Image.new("RGB", (self.infer_size, self.infer_size), (114, 114, 114))
         padded.paste(pil, (pad_left, pad_top))
