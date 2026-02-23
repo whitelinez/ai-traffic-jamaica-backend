@@ -402,6 +402,30 @@ async def ml_auto_retrain_loop(cfg) -> None:
 async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     global _counter_ref
 
+    def _is_night_hour() -> bool:
+        if int(getattr(cfg, "NIGHT_PROFILE_ENABLED", 0) or 0) != 1:
+            return False
+        hour = datetime.now().hour
+        start = int(getattr(cfg, "NIGHT_PROFILE_START_HOUR", 18) or 18) % 24
+        end = int(getattr(cfg, "NIGHT_PROFILE_END_HOUR", 6) or 6) % 24
+        if start == end:
+            return True
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
+    def _apply_detector_profile(*, night: bool) -> None:
+        if night:
+            detector.conf = float(getattr(cfg, "NIGHT_YOLO_CONF", cfg.YOLO_CONF))
+            detector.infer_size = int(getattr(cfg, "NIGHT_DETECT_INFER_SIZE", cfg.DETECT_INFER_SIZE))
+            detector.iou = float(getattr(cfg, "NIGHT_DETECT_IOU", cfg.DETECT_IOU))
+            detector.max_det = int(getattr(cfg, "NIGHT_DETECT_MAX_DET", cfg.DETECT_MAX_DET))
+        else:
+            detector.conf = float(cfg.YOLO_CONF)
+            detector.infer_size = int(cfg.DETECT_INFER_SIZE)
+            detector.iou = float(cfg.DETECT_IOU)
+            detector.max_det = int(cfg.DETECT_MAX_DET)
+
     logger.info("AI loop inner: initialising detector")
     detector = VehicleDetector(
         model_path=cfg.YOLO_MODEL,
@@ -410,6 +434,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         iou_threshold=cfg.DETECT_IOU,
         max_det=cfg.DETECT_MAX_DET,
     )
+    profile_is_night: bool | None = None
     logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
 
@@ -473,6 +498,19 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             )
 
     async for frame in hls_stream.frames():
+        now_is_night = _is_night_hour()
+        if profile_is_night is None or now_is_night != profile_is_night:
+            _apply_detector_profile(night=now_is_night)
+            profile_is_night = now_is_night
+            logger.info(
+                "AI detector profile switched: %s (conf=%.2f, infer=%s, iou=%.2f, max_det=%s)",
+                "night" if now_is_night else "day",
+                detector.conf,
+                detector.infer_size,
+                detector.iou,
+                detector.max_det,
+            )
+
         # Hot-reload stream URL if the refresher has a newer one
         fresh = get_current_url()
         if fresh and fresh != hls_stream.url:
@@ -522,7 +560,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         if (loop_now - last_db_write) >= cfg.DB_SNAPSHOT_INTERVAL_SEC:
             db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total")}
             asyncio.create_task(write_snapshot(db_snapshot))
-            asyncio.create_task(write_ml_detection_event(camera_id, snapshot, cfg.YOLO_MODEL, cfg.YOLO_CONF))
+            asyncio.create_task(write_ml_detection_event(camera_id, snapshot, cfg.YOLO_MODEL, detector.conf))
             last_db_write = loop_now
 
         if manager.public_count > 0:

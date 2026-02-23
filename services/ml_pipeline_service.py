@@ -340,11 +340,17 @@ async def get_ml_diagnostics(*, cfg=None) -> dict[str, Any]:
     active_model = None
 
     try:
-        total_rows_resp = await sb.table("ml_detection_events").select("id", count="exact", head=True).execute()
+        total_rows_resp = await (
+            sb.table("ml_detection_events")
+            .select("id", count="exact")
+            .limit(1)
+            .execute()
+        )
         rows_24h_resp = await (
             sb.table("ml_detection_events")
-            .select("id", count="exact", head=True)
+            .select("id", count="exact")
             .gte("captured_at", since_24h)
+            .limit(1)
             .execute()
         )
         latest_det_resp = await (
@@ -364,8 +370,8 @@ async def get_ml_diagnostics(*, cfg=None) -> dict[str, Any]:
         )
         active_model = await get_active_model()
 
-        total_rows = int(total_rows_resp.count or 0)
-        rows_24h = int(rows_24h_resp.count or 0)
+        total_rows = int(total_rows_resp.count if total_rows_resp.count is not None else len(total_rows_resp.data or []))
+        rows_24h = int(rows_24h_resp.count if rows_24h_resp.count is not None else len(rows_24h_resp.data or []))
         latest_det = (latest_det_resp.data or [None])[0]
         latest_job = (latest_job_resp.data or [None])[0]
     except Exception as exc:

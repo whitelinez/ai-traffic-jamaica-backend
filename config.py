@@ -25,6 +25,13 @@ class Config:
     DETECT_INFER_SIZE: int
     DETECT_IOU: float
     DETECT_MAX_DET: int
+    NIGHT_PROFILE_ENABLED: int
+    NIGHT_PROFILE_START_HOUR: int
+    NIGHT_PROFILE_END_HOUR: int
+    NIGHT_YOLO_CONF: float
+    NIGHT_DETECT_INFER_SIZE: int
+    NIGHT_DETECT_IOU: float
+    NIGHT_DETECT_MAX_DET: int
     TRACK_ACTIVATION_THRESHOLD: float
     TRACK_LOST_BUFFER: int
     TRACK_MATCH_THRESHOLD: float
@@ -91,6 +98,13 @@ class Config:
         self.DETECT_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "448"))
         self.DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
         self.DETECT_MAX_DET = int(os.getenv("DETECT_MAX_DET", "80"))
+        self.NIGHT_PROFILE_ENABLED = int(os.getenv("NIGHT_PROFILE_ENABLED", "1"))
+        self.NIGHT_PROFILE_START_HOUR = int(os.getenv("NIGHT_PROFILE_START_HOUR", "18"))
+        self.NIGHT_PROFILE_END_HOUR = int(os.getenv("NIGHT_PROFILE_END_HOUR", "6"))
+        self.NIGHT_YOLO_CONF = float(os.getenv("NIGHT_YOLO_CONF", "0.30"))
+        self.NIGHT_DETECT_INFER_SIZE = int(os.getenv("NIGHT_DETECT_INFER_SIZE", "640"))
+        self.NIGHT_DETECT_IOU = float(os.getenv("NIGHT_DETECT_IOU", "0.45"))
+        self.NIGHT_DETECT_MAX_DET = int(os.getenv("NIGHT_DETECT_MAX_DET", "120"))
         self.TRACK_ACTIVATION_THRESHOLD = float(os.getenv("TRACK_ACTIVATION_THRESHOLD", "0.2"))
         self.TRACK_LOST_BUFFER = int(os.getenv("TRACK_LOST_BUFFER", "20"))
         self.TRACK_MATCH_THRESHOLD = float(os.getenv("TRACK_MATCH_THRESHOLD", "0.65"))

@@ -500,3 +500,57 @@ async def admin_ml_one_click(
         "result": result,
         "diagnostics": await get_ml_diagnostics(cfg=cfg),
     }
+
+
+@router.get("/ml/night-profile")
+async def admin_ml_night_profile_get(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    cfg = get_config()
+    return {
+        "enabled": int(getattr(cfg, "NIGHT_PROFILE_ENABLED", 0) or 0) == 1,
+        "start_hour": int(getattr(cfg, "NIGHT_PROFILE_START_HOUR", 18) or 18),
+        "end_hour": int(getattr(cfg, "NIGHT_PROFILE_END_HOUR", 6) or 6),
+        "yolo_conf": float(getattr(cfg, "NIGHT_YOLO_CONF", cfg.YOLO_CONF)),
+        "infer_size": int(getattr(cfg, "NIGHT_DETECT_INFER_SIZE", cfg.DETECT_INFER_SIZE)),
+        "iou": float(getattr(cfg, "NIGHT_DETECT_IOU", cfg.DETECT_IOU)),
+        "max_det": int(getattr(cfg, "NIGHT_DETECT_MAX_DET", cfg.DETECT_MAX_DET)),
+        "note": "Runtime settings only. Persist via environment variables for restart durability.",
+    }
+
+
+@router.patch("/ml/night-profile")
+async def admin_ml_night_profile_patch(
+    body: dict,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    cfg = get_config()
+
+    if "enabled" in body:
+        cfg.NIGHT_PROFILE_ENABLED = 1 if bool(body.get("enabled")) else 0
+    if "start_hour" in body:
+        cfg.NIGHT_PROFILE_START_HOUR = int(body.get("start_hour")) % 24
+    if "end_hour" in body:
+        cfg.NIGHT_PROFILE_END_HOUR = int(body.get("end_hour")) % 24
+    if "yolo_conf" in body:
+        cfg.NIGHT_YOLO_CONF = max(0.01, min(0.99, float(body.get("yolo_conf"))))
+    if "infer_size" in body:
+        cfg.NIGHT_DETECT_INFER_SIZE = max(320, min(1280, int(body.get("infer_size"))))
+    if "iou" in body:
+        cfg.NIGHT_DETECT_IOU = max(0.05, min(0.95, float(body.get("iou"))))
+    if "max_det" in body:
+        cfg.NIGHT_DETECT_MAX_DET = max(10, min(500, int(body.get("max_det"))))
+
+    return {
+        "ok": True,
+        "settings": {
+            "enabled": int(getattr(cfg, "NIGHT_PROFILE_ENABLED", 0) or 0) == 1,
+            "start_hour": int(getattr(cfg, "NIGHT_PROFILE_START_HOUR", 18) or 18),
+            "end_hour": int(getattr(cfg, "NIGHT_PROFILE_END_HOUR", 6) or 6),
+            "yolo_conf": float(getattr(cfg, "NIGHT_YOLO_CONF", cfg.YOLO_CONF)),
+            "infer_size": int(getattr(cfg, "NIGHT_DETECT_INFER_SIZE", cfg.DETECT_INFER_SIZE)),
+            "iou": float(getattr(cfg, "NIGHT_DETECT_IOU", cfg.DETECT_IOU)),
+            "max_det": int(getattr(cfg, "NIGHT_DETECT_MAX_DET", cfg.DETECT_MAX_DET)),
+        },
+        "note": "Applied in-memory immediately. Set env vars to persist across restart/redeploy.",
+    }
