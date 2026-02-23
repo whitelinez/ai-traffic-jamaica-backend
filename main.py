@@ -670,9 +670,41 @@ app.include_router(ws_account_router)
 @app.get("/health")
 async def health():
     next_round_at: str | None = None
+    active_round_id: str | None = _active_round["id"] if _active_round else None
+    active_round_status: str | None = _active_round.get("status") if _active_round else None
     try:
         sb = await get_supabase()
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Prefer DB truth for health checks in case in-memory round cache is stale.
+        if not active_round_id:
+            open_resp = await (
+                sb.table("bet_rounds")
+                .select("id, status, opens_at")
+                .eq("status", "open")
+                .order("opens_at", ascending=False)
+                .limit(1)
+                .maybeSingle()
+                .execute()
+            )
+            active_row = open_resp.data
+
+            if not active_row:
+                locked_resp = await (
+                    sb.table("bet_rounds")
+                    .select("id, status, closes_at")
+                    .eq("status", "locked")
+                    .order("closes_at", ascending=False)
+                    .limit(1)
+                    .maybeSingle()
+                    .execute()
+                )
+                active_row = locked_resp.data
+
+            if active_row:
+                active_round_id = active_row.get("id")
+                active_round_status = active_row.get("status")
+
         up_resp = await (
             sb.table("bet_rounds")
             .select("opens_at")
@@ -699,7 +731,8 @@ async def health():
         "round_task_running": _round_task is not None and not _round_task.done(),
         "resolver_task_running": _resolver_task is not None and not _resolver_task.done(),
         "ml_retrain_task_running": _ml_retrain_task is not None and not _ml_retrain_task.done(),
-        "active_round_id": _active_round["id"] if _active_round else None,
+        "active_round_id": active_round_id,
+        "active_round_status": active_round_status,
         "next_round_at": next_round_at,
     }
 
