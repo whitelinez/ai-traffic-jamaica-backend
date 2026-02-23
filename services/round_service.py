@@ -115,6 +115,28 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
     threshold = int(params.get("threshold", 0) or 0)
     vehicle_class = str(params.get("vehicle_class") or "")
 
+    async def _round_start_baseline() -> int:
+        if not rnd.get("camera_id") or not rnd.get("opens_at"):
+            return 0
+        try:
+            snap_resp = await (
+                sb.table("count_snapshots")
+                .select("total, vehicle_breakdown")
+                .eq("camera_id", rnd["camera_id"])
+                .lte("captured_at", rnd["opens_at"])
+                .order("captured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if not snap_resp.data:
+                return 0
+            snap = snap_resp.data[0]
+            if market_type == "vehicle_count":
+                return int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
+            return int(snap.get("total", 0) or 0)
+        except Exception:
+            return 0
+
     async def _baseline_from_snapshot(placed_at_iso: str | None) -> int:
         if not rnd.get("camera_id") or not placed_at_iso:
             return 0
@@ -140,6 +162,7 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
     # For over/under and vehicle_count, settlement is per-bet from placement baseline.
     if market_type in ("over_under", "vehicle_count"):
         logger.info("Round %s resolved with per-bet settlement (%s)", round_id, market_type)
+        round_baseline = await _round_start_baseline()
         for bet in (bets_resp.data or []):
             market_data = bet.get("markets") or {}
             outcome_key = (market_data.get("outcome_key") or "").lower()
@@ -153,7 +176,7 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
             )
             # Guard against stale/late baseline writes by anchoring to placement snapshot.
             snap_baseline = await _baseline_from_snapshot(bet.get("placed_at"))
-            baseline = max(int(baseline or 0), int(snap_baseline or 0))
+            baseline = max(int(baseline or 0), int(snap_baseline or 0), int(round_baseline or 0))
             current = total if market_type == "over_under" else int(breakdown.get(vehicle_class, 0) or 0)
             actual = max(0, current - baseline)
             if actual > threshold:

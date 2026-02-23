@@ -290,7 +290,7 @@ async def bet_resolver_loop() -> None:
             # Early resolve market bets when "over" is already guaranteed.
             rounds_resp = await (
                 sb.table("bet_rounds")
-                .select("id, camera_id, market_type, params, status")
+                .select("id, camera_id, market_type, params, status, opens_at")
                 .in_("status", ["open", "locked"])
                 .in_("market_type", ["over_under", "vehicle_count"])
                 .execute()
@@ -301,6 +301,28 @@ async def bet_resolver_loop() -> None:
                     params = rnd.get("params") or {}
                     threshold = int(params.get("threshold", 0) or 0)
                     vehicle_class = params.get("vehicle_class") if rnd.get("market_type") == "vehicle_count" else None
+                    round_baseline = 0
+                    if rnd.get("camera_id") and rnd.get("opens_at"):
+                        try:
+                            round_open_snap = await (
+                                sb.table("count_snapshots")
+                                .select("total, vehicle_breakdown")
+                                .eq("camera_id", rnd["camera_id"])
+                                .lte("captured_at", rnd["opens_at"])
+                                .order("captured_at", desc=True)
+                                .limit(1)
+                                .execute()
+                            )
+                            if round_open_snap.data:
+                                open_snap = round_open_snap.data[0]
+                                if vehicle_class is None:
+                                    round_baseline = int(open_snap.get("total", 0) or 0)
+                                else:
+                                    round_baseline = int(
+                                        (open_snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0
+                                    )
+                        except Exception:
+                            round_baseline = 0
 
                     current_count = 0
                     if _counter_ref is not None:
@@ -360,6 +382,7 @@ async def bet_resolver_loop() -> None:
                                         )
                             except Exception:
                                 pass
+                        baseline = max(int(baseline or 0), int(round_baseline or 0))
                         actual = max(0, current_count - baseline)
                         if actual <= threshold:
                             continue

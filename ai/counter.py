@@ -19,11 +19,16 @@ logger = logging.getLogger(__name__)
 LINE_REFRESH_INTERVAL = 30  # seconds
 TRACK_TTL_SEC = 12.0
 DEFAULT_COUNT_SETTINGS = {
-    "min_track_frames": 2,
-    "min_box_area_ratio": 0.0,
-    "min_confidence": 0.0,
-    "allowed_classes": [],
-    "class_min_confidence": {},
+    "min_track_frames": 6,
+    "min_box_area_ratio": 0.004,
+    "min_confidence": 0.30,
+    "allowed_classes": ["car", "truck", "bus", "motorcycle"],
+    "class_min_confidence": {
+        "car": 0.30,
+        "truck": 0.42,
+        "bus": 0.45,
+        "motorcycle": 0.32,
+    },
     # Track-level temporal smoothing + hysteresis for stable counting.
     "track_conf_smoothing_alpha": 0.30,
     "track_conf_enter": 0.30,
@@ -171,7 +176,9 @@ class LineCounter:
 
         merged = dict(DEFAULT_COUNT_SETTINGS)
         merged.update(count_settings)
-        merged["min_track_frames"] = max(1, int(merged.get("min_track_frames", 3) or 3))
+        merged["min_track_frames"] = max(
+            1, int(merged.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"]) or DEFAULT_COUNT_SETTINGS["min_track_frames"])
+        )
         merged["min_box_area_ratio"] = max(
             0.0, min(1.0, float(merged.get("min_box_area_ratio", 0.0) or 0.0))
         )
@@ -317,7 +324,10 @@ class LineCounter:
         class_min_conf = self._count_settings.get("class_min_confidence", {})
         min_conf = float(self._count_settings.get("min_confidence", 0.0) or 0.0)
         min_area_ratio = float(self._count_settings.get("min_box_area_ratio", 0.0) or 0.0)
-        min_track_frames = int(self._count_settings.get("min_track_frames", 3) or 3)
+        min_track_frames = int(
+            self._count_settings.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"])
+            or DEFAULT_COUNT_SETTINGS["min_track_frames"]
+        )
         conf_alpha = float(self._count_settings.get("track_conf_smoothing_alpha", 0.35) or 0.35)
         conf_enter = float(self._count_settings.get("track_conf_enter", 0.42) or 0.42)
         conf_exit = float(self._count_settings.get("track_conf_exit", 0.30) or 0.30)

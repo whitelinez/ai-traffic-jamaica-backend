@@ -164,6 +164,38 @@ async def _get_baseline_count(sb, camera_id: str | None, market_type: str, param
     return int(snap.get("total", 0) or 0)
 
 
+async def _get_round_start_baseline(sb, rnd: dict, market_type: str, params: dict | None) -> int:
+    """
+    Resolve a round-local baseline from the snapshot at/before round open time.
+    This prevents inheriting pre-round cumulative totals when placement snapshots are sparse.
+    """
+    camera_id = rnd.get("camera_id")
+    opens_at = rnd.get("opens_at")
+    if not camera_id or not opens_at:
+        return 0
+    try:
+        snap_resp = await (
+            sb.table("count_snapshots")
+            .select("total, vehicle_breakdown")
+            .eq("camera_id", camera_id)
+            .lte("captured_at", opens_at)
+            .order("captured_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not snap_resp.data:
+            return 0
+        snap = snap_resp.data[0]
+        if market_type == "vehicle_count":
+            cls = (params or {}).get("vehicle_class")
+            if not cls:
+                return 0
+            return int((snap.get("vehicle_breakdown") or {}).get(cls, 0) or 0)
+        return int(snap.get("total", 0) or 0)
+    except Exception:
+        return 0
+
+
 async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
     """
     Atomically place a market bet:
@@ -249,6 +281,13 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
             str(rnd.get("market_type") or ""),
             rnd.get("params") or {},
         )
+        round_start_baseline = await _get_round_start_baseline(
+            sb,
+            rnd,
+            str(rnd.get("market_type") or ""),
+            rnd.get("params") or {},
+        )
+        baseline_count = max(int(baseline_count or 0), int(round_start_baseline or 0))
 
         # Optional enrichment fields for newer schemas; ignore if columns do not exist.
         try:
@@ -343,10 +382,17 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
             if snap_resp.data:
                 snap = snap_resp.data[0]
                 if req.vehicle_class is None:
-                    baseline_count = snap.get("total", 0) or 0
+                    baseline_count = int(snap.get("total", 0) or 0)
                 else:
                     bd = snap.get("vehicle_breakdown") or {}
-                    baseline_count = bd.get(req.vehicle_class, 0)
+                    baseline_count = int(bd.get(req.vehicle_class, 0) or 0)
+        round_start_baseline = await _get_round_start_baseline(
+            sb,
+            rnd,
+            str(rnd.get("market_type") or ""),
+            rnd.get("params") or {},
+        )
+        baseline_count = max(int(baseline_count or 0), int(round_start_baseline or 0))
 
         # 4. Check balance and deduct atomically
         potential_payout = int(req.amount * LIVE_BET_ODDS)

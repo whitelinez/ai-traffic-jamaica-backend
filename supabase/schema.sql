@@ -21,6 +21,54 @@ ALTER TABLE cameras
   ADD COLUMN IF NOT EXISTS count_settings JSONB NOT NULL DEFAULT '{}', -- per-camera thresholds
   ADD COLUMN IF NOT EXISTS feed_appearance JSONB NOT NULL DEFAULT '{}'; -- admin/public video appearance
 
+-- Preset A defaults for new cameras.
+ALTER TABLE cameras
+  ALTER COLUMN count_settings SET DEFAULT
+  '{
+    "min_track_frames": 6,
+    "min_box_area_ratio": 0.004,
+    "min_confidence": 0.30,
+    "allowed_classes": ["car", "truck", "bus", "motorcycle"],
+    "class_min_confidence": {"car": 0.30, "truck": 0.42, "bus": 0.45, "motorcycle": 0.32}
+  }'::jsonb;
+
+ALTER TABLE cameras
+  ALTER COLUMN feed_appearance SET DEFAULT
+  '{
+    "detection_overlay": {
+      "box_style": "solid",
+      "line_width": 2,
+      "fill_alpha": 0.10,
+      "max_boxes": 10,
+      "show_labels": true,
+      "detect_zone_only": true
+    }
+  }'::jsonb;
+
+-- Backfill existing cameras still on empty JSON defaults.
+UPDATE cameras
+SET count_settings = '{
+  "min_track_frames": 6,
+  "min_box_area_ratio": 0.004,
+  "min_confidence": 0.30,
+  "allowed_classes": ["car", "truck", "bus", "motorcycle"],
+  "class_min_confidence": {"car": 0.30, "truck": 0.42, "bus": 0.45, "motorcycle": 0.32}
+}'::jsonb
+WHERE count_settings IS NULL OR count_settings = '{}'::jsonb;
+
+UPDATE cameras
+SET feed_appearance = '{
+  "detection_overlay": {
+    "box_style": "solid",
+    "line_width": 2,
+    "fill_alpha": 0.10,
+    "max_boxes": 10,
+    "show_labels": true,
+    "detect_zone_only": true
+  }
+}'::jsonb
+WHERE feed_appearance IS NULL OR feed_appearance = '{}'::jsonb;
+
 CREATE TABLE IF NOT EXISTS bet_rounds (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   camera_id    UUID REFERENCES cameras ON DELETE SET NULL,
