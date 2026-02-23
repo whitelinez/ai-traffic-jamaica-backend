@@ -4,6 +4,7 @@ POST /admin/rounds     → create a new round + markets
 POST /admin/resolve    → manually resolve a round
 POST /admin/set-role   → grant/revoke admin role on a user
 """
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -29,6 +30,15 @@ async def _require_admin_user(authorization: Annotated[str | None, Header()] = N
     payload = await validate_supabase_jwt(token)
     require_admin(payload)
     return payload
+
+
+def _default_capture_dataset_yaml_url(cfg) -> str:
+    base = str(getattr(cfg, "SUPABASE_URL", "") or "").rstrip("/")
+    bucket = str(getattr(cfg, "AUTO_CAPTURE_UPLOAD_BUCKET", "") or "ml-datasets").strip("/")
+    prefix = str(getattr(cfg, "AUTO_CAPTURE_UPLOAD_PREFIX", "") or "datasets/live-capture").strip("/")
+    if not base:
+        return ""
+    return f"{base}/storage/v1/object/public/{bucket}/{prefix}/data.yaml"
 
 
 @router.post("/rounds", response_model=RoundOut, status_code=201)
@@ -415,6 +425,111 @@ async def admin_ml_retrain(
         },
     )
     return result
+
+
+@router.post("/ml/retrain-async")
+async def admin_ml_retrain_async(
+    body: dict,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Queue retraining in background and return immediately.
+    Prevents frontend/serverless timeout while long training is running.
+    """
+    cfg = get_config()
+    hours = int(body.get("hours", cfg.ML_AUTO_RETRAIN_HOURS))
+    min_rows = int(body.get("min_rows", cfg.ML_AUTO_RETRAIN_MIN_ROWS))
+    min_score_gain = float(body.get("min_score_gain", cfg.ML_AUTO_RETRAIN_MIN_SCORE_GAIN))
+
+    dataset_yaml_url = str(body.get("dataset_yaml_url") or cfg.TRAINER_DATASET_YAML_URL).strip()
+    if not dataset_yaml_url:
+        raise HTTPException(
+            status_code=400,
+            detail="dataset_yaml_url is required. Set TRAINER_DATASET_YAML_URL or pass it in request body.",
+        )
+    epochs = int(body.get("epochs", cfg.TRAINER_EPOCHS))
+    imgsz = int(body.get("imgsz", cfg.TRAINER_IMGSZ))
+    batch = int(body.get("batch", cfg.TRAINER_BATCH))
+
+    async def _run():
+        try:
+            await auto_retrain_cycle(
+                hours=hours,
+                min_rows=min_rows,
+                min_score_gain=min_score_gain,
+                base_model=cfg.YOLO_MODEL,
+                provider="webhook",
+                params={
+                    "trainer_webhook_url": cfg.TRAINER_WEBHOOK_URL,
+                    "trainer_webhook_secret": cfg.TRAINER_WEBHOOK_SECRET,
+                    "dataset_yaml_url": dataset_yaml_url,
+                    "epochs": epochs,
+                    "imgsz": imgsz,
+                    "batch": batch,
+                },
+            )
+        except Exception:
+            # Failure details are captured in ml_training_jobs by pipeline service.
+            return
+
+    asyncio.create_task(_run())
+    return {"message": "Retrain queued. Check Latest Jobs for progress."}
+
+
+@router.post("/ml/train-captures-async")
+async def admin_ml_train_captures_async(
+    body: dict,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Queue training specifically for the live-capture dataset path.
+    Uses AUTO_CAPTURE_UPLOAD_BUCKET/AUTO_CAPTURE_UPLOAD_PREFIX by default.
+    """
+    cfg = get_config()
+    hours = int(body.get("hours", cfg.ML_AUTO_RETRAIN_HOURS))
+    min_rows = int(body.get("min_rows", cfg.ML_AUTO_RETRAIN_MIN_ROWS))
+    min_score_gain = float(body.get("min_score_gain", cfg.ML_AUTO_RETRAIN_MIN_SCORE_GAIN))
+
+    default_capture_yaml = _default_capture_dataset_yaml_url(cfg)
+    dataset_yaml_url = str(
+        body.get("capture_dataset_yaml_url")
+        or body.get("dataset_yaml_url")
+        or default_capture_yaml
+    ).strip()
+    if not dataset_yaml_url:
+        raise HTTPException(
+            status_code=400,
+            detail="capture dataset_yaml_url is required. Configure AUTO_CAPTURE_UPLOAD_* or pass capture_dataset_yaml_url.",
+        )
+    epochs = int(body.get("epochs", cfg.TRAINER_EPOCHS))
+    imgsz = int(body.get("imgsz", cfg.TRAINER_IMGSZ))
+    batch = int(body.get("batch", cfg.TRAINER_BATCH))
+
+    async def _run():
+        try:
+            await auto_retrain_cycle(
+                hours=hours,
+                min_rows=min_rows,
+                min_score_gain=min_score_gain,
+                base_model=cfg.YOLO_MODEL,
+                provider="webhook",
+                params={
+                    "trainer_webhook_url": cfg.TRAINER_WEBHOOK_URL,
+                    "trainer_webhook_secret": cfg.TRAINER_WEBHOOK_SECRET,
+                    "dataset_yaml_url": dataset_yaml_url,
+                    "epochs": epochs,
+                    "imgsz": imgsz,
+                    "batch": batch,
+                },
+            )
+        except Exception:
+            return
+
+    asyncio.create_task(_run())
+    return {
+        "message": "Live-capture training queued. Check Latest Jobs for progress.",
+        "dataset_yaml_url": dataset_yaml_url,
+    }
 
 
 @router.get("/ml/jobs")

@@ -526,7 +526,8 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             logger.info("AI loop started: frame size %dx%d", w, h)
 
         detections = await asyncio.to_thread(detector.detect, frame)
-        detections = counter.zone_filter(detections)
+        # Keep full-frame detections for tracking/overlay visibility.
+        # Count logic still applies detect/count zones inside LineCounter.process().
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
         capture_result = await asyncio.to_thread(
