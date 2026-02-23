@@ -3,6 +3,7 @@ ws_account.py — /ws/account endpoint.
 Supabase JWT required. Pushes per-user balance updates and resolved bet events.
 """
 import logging
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 
@@ -16,6 +17,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _normalize_origin(value: str) -> str:
+    raw = (value or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    return raw.lower()
+
+
+def _origin_allowed(origin: str, allowed: str) -> bool:
+    normalized_origin = _normalize_origin(origin)
+    if not normalized_origin:
+        return True
+    candidates = [p.strip() for p in str(allowed or "").split(",") if p.strip()]
+    if not candidates:
+        return False
+    if any(p == "*" for p in candidates):
+        return True
+    normalized_allowed = {_normalize_origin(p) for p in candidates}
+    return normalized_origin in normalized_allowed
+
+
 @router.websocket("/ws/account")
 async def ws_account(
     websocket: WebSocket,
@@ -25,7 +49,8 @@ async def ws_account(
 
     # Check Origin
     origin = websocket.headers.get("origin", "")
-    if origin and origin != cfg.ALLOWED_ORIGIN:
+    if not _origin_allowed(origin, cfg.ALLOWED_ORIGIN):
+        logger.warning("Account WS rejected due to origin=%s allowed=%s", origin, cfg.ALLOWED_ORIGIN)
         await websocket.close(code=4003)
         return
 
