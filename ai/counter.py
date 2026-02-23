@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 LINE_REFRESH_INTERVAL = 30  # seconds
 TRACK_TTL_SEC = 12.0
+DEFAULT_COUNT_SETTINGS = {
+    "min_track_frames": 3,
+    "min_box_area_ratio": 0.0,
+    "min_confidence": 0.0,
+    "allowed_classes": [],
+    "class_min_confidence": {},
+}
 
 
 class LineCounter:
@@ -37,6 +44,7 @@ class LineCounter:
         self._detect_zone = None
         self._detect_zone_data = None
         self._last_refresh = 0.0
+        self._count_settings = dict(DEFAULT_COUNT_SETTINGS)
 
         self._counts: dict[str, dict[str, int]] = {}
         self._per_class_total: dict[str, int] = {}
@@ -44,6 +52,7 @@ class LineCounter:
         self._prevalidated_track_ids: set[int] = set()
         self._confirmed_track_ids: set[int] = set()
         self._track_last_seen: dict[int, float] = {}
+        self._track_seen_frames: dict[int, int] = {}
         self._track_in_count_zone: set[int] = set()
 
         self._confirmed_in = 0
@@ -103,12 +112,47 @@ class LineCounter:
             logger.warning("Counter bootstrap failed: %s", exc)
 
     async def _refresh_line(self) -> None:
-        """Fetch count_line and detect_zone from Supabase cameras table."""
+        """Fetch count_line, detect_zone, and count_settings from Supabase cameras table."""
         sb = await get_supabase()
-        resp = await sb.table("cameras").select("count_line, detect_zone").eq("id", self.camera_id).single().execute()
+        resp = await (
+            sb.table("cameras")
+            .select("count_line, detect_zone, count_settings")
+            .eq("id", self.camera_id)
+            .single()
+            .execute()
+        )
         data = resp.data or {}
         line_data = data.get("count_line")
         detect_data = data.get("detect_zone")
+        count_settings = data.get("count_settings") or {}
+        if not isinstance(count_settings, dict):
+            count_settings = {}
+
+        merged = dict(DEFAULT_COUNT_SETTINGS)
+        merged.update(count_settings)
+        merged["min_track_frames"] = max(1, int(merged.get("min_track_frames", 3) or 3))
+        merged["min_box_area_ratio"] = max(
+            0.0, min(1.0, float(merged.get("min_box_area_ratio", 0.0) or 0.0))
+        )
+        merged["min_confidence"] = max(
+            0.0, min(1.0, float(merged.get("min_confidence", 0.0) or 0.0))
+        )
+        allowed_classes = merged.get("allowed_classes", [])
+        merged["allowed_classes"] = (
+            [str(x).strip().lower() for x in allowed_classes if str(x).strip()]
+            if isinstance(allowed_classes, list)
+            else []
+        )
+        raw_class_conf = merged.get("class_min_confidence", {})
+        class_conf: dict[str, float] = {}
+        if isinstance(raw_class_conf, dict):
+            for k, v in raw_class_conf.items():
+                try:
+                    class_conf[str(k).strip().lower()] = max(0.0, min(1.0, float(v)))
+                except Exception:
+                    continue
+        merged["class_min_confidence"] = class_conf
+        self._count_settings = merged
 
         w, h = self.frame_width, self.frame_height
 
@@ -174,6 +218,7 @@ class LineCounter:
         stale_set = set(stale)
         for tid in stale:
             self._track_last_seen.pop(tid, None)
+            self._track_seen_frames.pop(tid, None)
         self._prevalidated_track_ids.difference_update(stale_set)
         self._track_in_count_zone.difference_update(stale_set)
 
@@ -206,17 +251,57 @@ class LineCounter:
         tracker_ids = getattr(detections, "tracker_id", None)
         has_tracker_ids = tracker_ids is not None and len(tracker_ids) == len(detections)
 
+        eligible_mask = [True] * len(detections)
+        allowed_classes = set(self._count_settings.get("allowed_classes", []))
+        class_min_conf = self._count_settings.get("class_min_confidence", {})
+        min_conf = float(self._count_settings.get("min_confidence", 0.0) or 0.0)
+        min_area_ratio = float(self._count_settings.get("min_box_area_ratio", 0.0) or 0.0)
+        min_track_frames = int(self._count_settings.get("min_track_frames", 3) or 3)
+        frame_area = float(max(1, self.frame_width * self.frame_height))
+
+        for i in range(len(detections)):
+            if i >= len(detections.class_id):
+                eligible_mask[i] = False
+                continue
+            cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown").lower()
+
+            if allowed_classes and cls_name not in allowed_classes:
+                eligible_mask[i] = False
+                continue
+
+            if detections.confidence is not None and i < len(detections.confidence):
+                conf = float(detections.confidence[i])
+                if conf < min_conf:
+                    eligible_mask[i] = False
+                    continue
+                cls_floor = class_min_conf.get(cls_name)
+                if cls_floor is not None and conf < float(cls_floor):
+                    eligible_mask[i] = False
+                    continue
+
+            if detections.xyxy is not None and i < len(detections.xyxy):
+                x1, y1, x2, y2 = detections.xyxy[i]
+                area_ratio = max(0.0, (float(x2) - float(x1)) * (float(y2) - float(y1)) / frame_area)
+                if area_ratio < min_area_ratio:
+                    eligible_mask[i] = False
+                    continue
+
         if has_tracker_ids:
+            seen_this_frame: set[int] = set()
             for raw_tid in tracker_ids:
                 if raw_tid is None:
                     continue
-                self._touch_track(int(raw_tid), now_mono)
+                tid = int(raw_tid)
+                self._touch_track(tid, now_mono)
+                if tid not in seen_this_frame:
+                    self._track_seen_frames[tid] = self._track_seen_frames.get(tid, 0) + 1
+                    seen_this_frame.add(tid)
             self._cleanup_stale_tracks(now_mono)
 
         if self._detect_zone is not None and len(detections) > 0 and has_tracker_ids:
             detect_mask = self._detect_zone.trigger(detections=detections)
             for i, inside in enumerate(detect_mask):
-                if not inside:
+                if not inside or not eligible_mask[i]:
                     continue
                 raw_tid = tracker_ids[i]
                 if raw_tid is None:
@@ -228,7 +313,7 @@ class LineCounter:
             inside_now: set[int] = set()
 
             for i, is_inside in enumerate(inside_mask):
-                if not is_inside or i >= len(detections.class_id):
+                if not is_inside or i >= len(detections.class_id) or not eligible_mask[i]:
                     continue
 
                 cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
@@ -246,6 +331,8 @@ class LineCounter:
 
                 if self._detect_zone is not None and tid not in self._prevalidated_track_ids:
                     continue
+                if self._track_seen_frames.get(tid, 0) < min_track_frames:
+                    continue
 
                 if tid not in self._track_in_count_zone and tid not in self._confirmed_track_ids:
                     new_crossings += self._confirm_crossing(cls_name, True, False, tid)
@@ -262,6 +349,8 @@ class LineCounter:
             for i, (in_flag, out_flag) in enumerate(zip(crossed_in, crossed_out)):
                 if i >= len(detections.class_id):
                     continue
+                if not eligible_mask[i]:
+                    continue
                 if not in_flag and not out_flag:
                     continue
 
@@ -275,6 +364,8 @@ class LineCounter:
                     continue
 
                 if self._detect_zone is not None and tid not in self._prevalidated_track_ids:
+                    continue
+                if self._track_seen_frames.get(tid, 0) < min_track_frames:
                     continue
 
                 cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
@@ -351,6 +442,7 @@ class LineCounter:
         self._prevalidated_track_ids.clear()
         self._confirmed_track_ids.clear()
         self._track_last_seen.clear()
+        self._track_seen_frames.clear()
         self._track_in_count_zone.clear()
         self._confirmed_in = 0
         self._confirmed_out = 0

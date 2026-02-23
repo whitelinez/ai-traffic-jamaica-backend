@@ -15,6 +15,11 @@ CREATE TABLE IF NOT EXISTS cameras (
   created_at   TIMESTAMPTZ DEFAULT now()
 );
 
+-- Camera AI/counter config (migration-safe additions for older projects).
+ALTER TABLE cameras
+  ADD COLUMN IF NOT EXISTS detect_zone JSONB, -- polygon points used for pre-validation
+  ADD COLUMN IF NOT EXISTS count_settings JSONB NOT NULL DEFAULT '{}'; -- per-camera thresholds
+
 CREATE TABLE IF NOT EXISTS bet_rounds (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   camera_id    UUID REFERENCES cameras ON DELETE SET NULL,
