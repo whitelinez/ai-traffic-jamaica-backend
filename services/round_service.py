@@ -116,6 +116,14 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
     vehicle_class = str(params.get("vehicle_class") or "")
 
     async def _round_start_baseline() -> int:
+        round_baseline_total = int(params.get("round_baseline_total", 0) or 0)
+        round_baseline_by_class = params.get("round_baseline_by_class") or {}
+        if market_type == "vehicle_count":
+            persisted = int(round_baseline_by_class.get(vehicle_class, 0) or 0)
+        else:
+            persisted = round_baseline_total
+        if persisted > 0:
+            return persisted
         if not rnd.get("camera_id") or not rnd.get("opens_at"):
             return 0
         try:
@@ -128,9 +136,21 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
                 .limit(1)
                 .execute()
             )
-            if not snap_resp.data:
-                return 0
-            snap = snap_resp.data[0]
+            if snap_resp.data:
+                snap = snap_resp.data[0]
+            else:
+                snap_after = await (
+                    sb.table("count_snapshots")
+                    .select("total, vehicle_breakdown")
+                    .eq("camera_id", rnd["camera_id"])
+                    .gte("captured_at", rnd["opens_at"])
+                    .order("captured_at", desc=False)
+                    .limit(1)
+                    .execute()
+                )
+                if not snap_after.data:
+                    return 0
+                snap = snap_after.data[0]
             if market_type == "vehicle_count":
                 return int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
             return int(snap.get("total", 0) or 0)

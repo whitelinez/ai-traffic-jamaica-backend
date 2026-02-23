@@ -171,6 +171,18 @@ async def _get_round_start_baseline(sb, rnd: dict, market_type: str, params: dic
     """
     camera_id = rnd.get("camera_id")
     opens_at = rnd.get("opens_at")
+    cls = (params or {}).get("vehicle_class")
+
+    # Prefer persisted round baseline captured when round opened.
+    round_params = rnd.get("params") or {}
+    if market_type == "vehicle_count":
+        by_class = round_params.get("round_baseline_by_class") or {}
+        persisted = int(by_class.get(cls, 0) or 0) if cls else 0
+    else:
+        persisted = int(round_params.get("round_baseline_total", 0) or 0)
+    if persisted > 0:
+        return persisted
+
     if not camera_id or not opens_at:
         return 0
     try:
@@ -183,11 +195,22 @@ async def _get_round_start_baseline(sb, rnd: dict, market_type: str, params: dic
             .limit(1)
             .execute()
         )
-        if not snap_resp.data:
-            return 0
-        snap = snap_resp.data[0]
+        if snap_resp.data:
+            snap = snap_resp.data[0]
+        else:
+            snap_after = await (
+                sb.table("count_snapshots")
+                .select("total, vehicle_breakdown")
+                .eq("camera_id", camera_id)
+                .gte("captured_at", opens_at)
+                .order("captured_at", desc=False)
+                .limit(1)
+                .execute()
+            )
+            if not snap_after.data:
+                return 0
+            snap = snap_after.data[0]
         if market_type == "vehicle_count":
-            cls = (params or {}).get("vehicle_class")
             if not cls:
                 return 0
             return int((snap.get("vehicle_breakdown") or {}).get(cls, 0) or 0)
@@ -386,11 +409,12 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
                 else:
                     bd = snap.get("vehicle_breakdown") or {}
                     baseline_count = int(bd.get(req.vehicle_class, 0) or 0)
+        live_baseline_params = {"vehicle_class": req.vehicle_class} if req.vehicle_class else {}
         round_start_baseline = await _get_round_start_baseline(
             sb,
             rnd,
-            str(rnd.get("market_type") or ""),
-            rnd.get("params") or {},
+            "vehicle_count" if req.vehicle_class else "over_under",
+            live_baseline_params,
         )
         baseline_count = max(int(baseline_count or 0), int(round_start_baseline or 0))
 

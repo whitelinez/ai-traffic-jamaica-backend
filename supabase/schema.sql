@@ -41,7 +41,17 @@ ALTER TABLE cameras
       "fill_alpha": 0.10,
       "max_boxes": 10,
       "show_labels": true,
-      "detect_zone_only": true
+      "detect_zone_only": true,
+      "outside_scan_enabled": true,
+      "outside_scan_min_conf": 0.45,
+      "outside_scan_max_boxes": 25,
+      "outside_scan_hold_ms": 220,
+      "outside_scan_show_labels": true,
+      "ground_overlay_enabled": true,
+      "ground_overlay_alpha": 0.16,
+      "ground_grid_density": 6,
+      "ground_occlusion_cutout": 0.38,
+      "ground_quad": {"x1": 0.34, "y1": 0.58, "x2": 0.78, "y2": 0.58, "x3": 0.98, "y3": 0.98, "x4": 0.08, "y4": 0.98}
     }
   }'::jsonb;
 
@@ -64,10 +74,68 @@ SET feed_appearance = '{
     "fill_alpha": 0.10,
     "max_boxes": 10,
     "show_labels": true,
-    "detect_zone_only": true
+    "detect_zone_only": true,
+    "outside_scan_enabled": true,
+    "outside_scan_min_conf": 0.45,
+    "outside_scan_max_boxes": 25,
+    "outside_scan_hold_ms": 220,
+    "outside_scan_show_labels": true,
+    "ground_overlay_enabled": true,
+    "ground_overlay_alpha": 0.16,
+    "ground_grid_density": 6,
+    "ground_occlusion_cutout": 0.38,
+    "ground_quad": {"x1": 0.34, "y1": 0.58, "x2": 0.78, "y2": 0.58, "x3": 0.98, "y3": 0.98, "x4": 0.08, "y4": 0.98}
   }
 }'::jsonb
 WHERE feed_appearance IS NULL OR feed_appearance = '{}'::jsonb;
+
+-- Re-enable outer scan labels on existing camera appearance configs.
+UPDATE cameras
+SET feed_appearance = jsonb_set(
+  COALESCE(feed_appearance, '{}'::jsonb),
+  '{detection_overlay,outside_scan_show_labels}',
+  'true'::jsonb,
+  true
+)
+WHERE feed_appearance ? 'detection_overlay';
+
+-- Ground projection overlay defaults for existing camera appearance configs.
+UPDATE cameras
+SET feed_appearance = jsonb_set(
+  jsonb_set(
+    jsonb_set(
+      jsonb_set(
+        jsonb_set(
+          jsonb_set(
+            COALESCE(feed_appearance, '{}'::jsonb),
+            '{detection_overlay,ground_overlay_enabled}',
+            COALESCE(feed_appearance #> '{detection_overlay,ground_overlay_enabled}', 'true'::jsonb),
+            true
+          ),
+          '{detection_overlay,ground_overlay_alpha}',
+          COALESCE(feed_appearance #> '{detection_overlay,ground_overlay_alpha}', '0.16'::jsonb),
+          true
+        ),
+        '{detection_overlay,ground_grid_density}',
+        COALESCE(feed_appearance #> '{detection_overlay,ground_grid_density}', '6'::jsonb),
+        true
+      ),
+      '{detection_overlay,ground_occlusion_cutout}',
+      COALESCE(feed_appearance #> '{detection_overlay,ground_occlusion_cutout}', '0.38'::jsonb),
+      true
+    ),
+    '{detection_overlay,ground_quad}',
+    COALESCE(
+      feed_appearance #> '{detection_overlay,ground_quad}',
+      '{"x1": 0.34, "y1": 0.58, "x2": 0.78, "y2": 0.58, "x3": 0.98, "y3": 0.98, "x4": 0.08, "y4": 0.98}'::jsonb
+    ),
+    true
+  ),
+  '{detection_overlay,outside_scan_show_labels}',
+  COALESCE(feed_appearance #> '{detection_overlay,outside_scan_show_labels}', 'true'::jsonb),
+  true
+)
+WHERE feed_appearance ? 'detection_overlay';
 
 CREATE TABLE IF NOT EXISTS bet_rounds (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),

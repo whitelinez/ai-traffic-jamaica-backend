@@ -9,14 +9,20 @@ main.py — FastAPI application entry point.
 import asyncio
 import logging
 import sys
+import time
 from collections import deque
 from contextlib import asynccontextmanager
+from typing import Any
+import urllib.request
+import json
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+import cv2
+import numpy as np
 
 from datetime import datetime, timezone, timedelta
 
@@ -63,6 +69,212 @@ _ml_retrain_task: asyncio.Task | None = None
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
 _counter_ref: LineCounter | None = None
+_weather_cache: dict[str, Any] = {
+    "ts": 0.0,
+    "payload": None,
+    "last_ok": None,
+    "last_error": None,
+}
+
+
+def _map_weather_code_to_label(code: int) -> str:
+    rainy_codes = {
+        51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99
+    }
+    if code in rainy_codes:
+        return "raining"
+    if code in {0, 1}:
+        return "sunny"
+    if code in {2, 3, 45, 48}:
+        return "cloudy"
+    return "scanning"
+
+
+def _fetch_jamaica_weather_cached() -> dict[str, Any]:
+    """
+    Fetches lightweight live weather for Kingston, Jamaica from Open-Meteo.
+    Cached for 10 minutes to avoid per-frame network calls.
+    """
+    now = time.time()
+    cached = _weather_cache.get("payload")
+    if cached and (now - float(_weather_cache.get("ts", 0.0))) < 600.0:
+        return cached
+
+    try:
+        # Kingston, Jamaica
+        lat = 17.9970
+        lon = -76.7936
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            "&current=is_day,weather_code&timezone=America%2FJamaica"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "whitelinez/1.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        current = data.get("current") or {}
+        is_day = int(current.get("is_day", 0) or 0) == 1
+        code = int(current.get("weather_code", -1) or -1)
+        payload = {
+            "lighting": "day" if is_day else "night",
+            "weather": _map_weather_code_to_label(code),
+            "confidence": 0.9 if code >= 0 else 0.0,
+            "source": "open-meteo",
+        }
+        _weather_cache["ts"] = now
+        _weather_cache["payload"] = payload
+        _weather_cache["last_ok"] = True
+        _weather_cache["last_error"] = None
+        return payload
+    except Exception as exc:
+        _weather_cache["ts"] = now
+        _weather_cache["last_ok"] = False
+        _weather_cache["last_error"] = str(exc)
+        raise
+
+
+def _infer_scene_status(frame: np.ndarray) -> dict[str, Any]:
+    """
+    Lightweight vision-based scene classification.
+    Uses per-frame image statistics, not time-of-day scripting.
+    """
+    try:
+        if frame is None or frame.size == 0:
+            return {
+                "scene_lighting": "unknown",
+                "scene_weather": "unknown",
+                "scene_confidence": 0.0,
+            }
+
+        h, w = frame.shape[:2]
+        scale = max(1.0, max(h, w) / 360.0)
+        sw = max(96, int(w / scale))
+        sh = max(64, int(h / scale))
+        small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        s = hsv[:, :, 1].astype(np.float32)
+        v = hsv[:, :, 2].astype(np.float32)
+
+        brightness = float(np.mean(v))
+        contrast = float(np.std(gray))
+        saturation = float(np.mean(s))
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        highlight_ratio = float(np.mean(v >= 235.0))
+
+        edges = cv2.Canny(gray, 60, 150)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=16,
+            minLineLength=8,
+            maxLineGap=3,
+        )
+        total_lines = 0
+        streak_lines = 0
+        if lines is not None:
+            for raw in lines:
+                ln = raw[0]
+                x1, y1, x2, y2 = int(ln[0]), int(ln[1]), int(ln[2]), int(ln[3])
+                dx = x2 - x1
+                dy = y2 - y1
+                length = float(np.hypot(dx, dy))
+                if length < 6.0:
+                    continue
+                total_lines += 1
+                angle = abs(float(np.degrees(np.arctan2(dy, dx))))
+                # Rain streaks tend to be short/vertical-ish line segments.
+                if 65.0 <= angle <= 115.0 and length <= 42.0:
+                    streak_lines += 1
+
+        rain_ratio = (float(streak_lines) / float(total_lines)) if total_lines > 0 else 0.0
+
+        low_light = brightness < 70.0
+        twilight = 70.0 <= brightness < 95.0
+        glare = (highlight_ratio > 0.06 and brightness > 125.0) or (brightness > 150.0 and saturation < 55.0)
+        hazy = brightness >= 95.0 and contrast < 38.0 and saturation < 60.0
+        rainy = rain_ratio > 0.42 and contrast < 58.0
+
+        if low_light:
+            lighting = "night"
+        elif twilight:
+            lighting = "day"
+        elif glare:
+            lighting = "day"
+        else:
+            lighting = "day"
+
+        if rainy:
+            weather = "raining"
+            conf = min(0.95, 0.55 + rain_ratio * 0.6)
+        elif hazy:
+            weather = "cloudy"
+            conf = 0.70
+        elif glare:
+            weather = "sunny"
+            conf = 0.76
+        elif low_light:
+            weather = "clear"
+            conf = 0.82
+        else:
+            weather = "sunny"
+            conf = 0.8
+
+        return {
+            "scene_lighting": lighting,
+            "scene_weather": weather,
+            "scene_confidence": round(float(max(0.0, min(1.0, conf))), 3),
+            "scene_source": "vision",
+            "scene_metrics": {
+                "brightness": round(brightness, 1),
+                "contrast": round(contrast, 1),
+                "saturation": round(saturation, 1),
+                "sharpness": round(sharpness, 1),
+                "rain_ratio": round(rain_ratio, 3),
+            },
+        }
+    except Exception:
+        return {
+            "scene_lighting": "unknown",
+            "scene_weather": "unknown",
+            "scene_confidence": 0.0,
+            "scene_source": "vision",
+        }
+
+
+def _merge_scene_and_weather(
+    vision_status: dict[str, Any],
+    weather_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not weather_status:
+        return vision_status
+
+    merged = dict(vision_status or {})
+    vision_weather = str((vision_status or {}).get("scene_weather") or "").strip().lower()
+    vision_conf = float((vision_status or {}).get("scene_confidence") or 0.0)
+    api_lighting = str(weather_status.get("lighting") or "").strip().lower()
+    api_weather = str(weather_status.get("weather") or "").strip().lower()
+    api_conf = float(weather_status.get("confidence") or 0.0)
+
+    if api_lighting in {"day", "night"}:
+        merged["scene_lighting"] = api_lighting
+
+    # Keep strong visual rain detection when present, otherwise prefer API weather.
+    if vision_weather == "raining" and vision_conf >= 0.7:
+        merged["scene_weather"] = "raining"
+        merged["scene_confidence"] = max(vision_conf, api_conf)
+        merged["scene_source"] = "vision+weather"
+    elif api_weather:
+        merged["scene_weather"] = api_weather
+        merged["scene_confidence"] = max(vision_conf, api_conf)
+        merged["scene_source"] = "weather"
+    else:
+        merged["scene_source"] = "vision"
+
+    return merged
 
 
 async def round_monitor_loop() -> None:
@@ -86,12 +298,57 @@ async def round_monitor_loop() -> None:
 
             # Auto-open: upcoming rounds whose opens_at has passed
             up_resp = await sb.table("bet_rounds") \
-                .select("id") \
+                .select("id, camera_id, opens_at, params") \
                 .eq("status", "upcoming") \
                 .lte("opens_at", now_iso) \
                 .execute()
             for row in up_resp.data or []:
-                await sb.table("bet_rounds").update({"status": "open"}).eq("id", row["id"]).execute()
+                params = row.get("params") or {}
+                baseline_total = 0
+                baseline_by_class = {}
+                baseline_captured_at = None
+                camera_id = row.get("camera_id")
+                opens_at = row.get("opens_at")
+                if camera_id and opens_at:
+                    snap = None
+                    try:
+                        snap_before = await sb.table("count_snapshots") \
+                            .select("captured_at, total, vehicle_breakdown") \
+                            .eq("camera_id", camera_id) \
+                            .lte("captured_at", opens_at) \
+                            .order("captured_at", desc=True) \
+                            .limit(1) \
+                            .execute()
+                        if snap_before.data:
+                            snap = snap_before.data[0]
+                        else:
+                            snap_after = await sb.table("count_snapshots") \
+                                .select("captured_at, total, vehicle_breakdown") \
+                                .eq("camera_id", camera_id) \
+                                .gte("captured_at", opens_at) \
+                                .order("captured_at", desc=False) \
+                                .limit(1) \
+                                .execute()
+                            if snap_after.data:
+                                snap = snap_after.data[0]
+                    except Exception:
+                        snap = None
+
+                    if snap:
+                        baseline_total = int(snap.get("total", 0) or 0)
+                        baseline_by_class = snap.get("vehicle_breakdown") or {}
+                        baseline_captured_at = snap.get("captured_at")
+
+                next_params = {
+                    **params,
+                    "round_baseline_total": baseline_total,
+                    "round_baseline_by_class": baseline_by_class,
+                    "round_baseline_captured_at": baseline_captured_at,
+                }
+                await sb.table("bet_rounds").update({
+                    "status": "open",
+                    "params": next_params,
+                }).eq("id", row["id"]).execute()
                 logger.info("Auto-opened round: %s", row["id"])
 
             # Auto-resolve: open/locked rounds whose ends_at has passed.
@@ -302,7 +559,13 @@ async def bet_resolver_loop() -> None:
                     threshold = int(params.get("threshold", 0) or 0)
                     vehicle_class = params.get("vehicle_class") if rnd.get("market_type") == "vehicle_count" else None
                     round_baseline = 0
-                    if rnd.get("camera_id") and rnd.get("opens_at"):
+                    params_baseline_total = int((params or {}).get("round_baseline_total", 0) or 0)
+                    params_baseline_by_class = (params or {}).get("round_baseline_by_class") or {}
+                    if vehicle_class is None:
+                        round_baseline = params_baseline_total
+                    else:
+                        round_baseline = int(params_baseline_by_class.get(vehicle_class, 0) or 0)
+                    if round_baseline <= 0 and rnd.get("camera_id") and rnd.get("opens_at"):
                         try:
                             round_open_snap = await (
                                 sb.table("count_snapshots")
@@ -321,6 +584,24 @@ async def bet_resolver_loop() -> None:
                                     round_baseline = int(
                                         (open_snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0
                                     )
+                            else:
+                                round_open_snap_after = await (
+                                    sb.table("count_snapshots")
+                                    .select("total, vehicle_breakdown")
+                                    .eq("camera_id", rnd["camera_id"])
+                                    .gte("captured_at", rnd["opens_at"])
+                                    .order("captured_at", desc=False)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                if round_open_snap_after.data:
+                                    open_snap = round_open_snap_after.data[0]
+                                    if vehicle_class is None:
+                                        round_baseline = int(open_snap.get("total", 0) or 0)
+                                    else:
+                                        round_baseline = int(
+                                            (open_snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0
+                                        )
                         except Exception:
                             round_baseline = 0
 
@@ -517,6 +798,15 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     last_runtime_eval = 0.0
     last_runtime_switch = 0.0
     runtime_events: deque[tuple[float, int, int, float]] = deque()
+    scene_status: dict[str, Any] = {
+        "scene_lighting": "unknown",
+        "scene_weather": "unknown",
+        "scene_confidence": 0.0,
+        "scene_source": "vision",
+    }
+    last_scene_eval = 0.0
+    weather_status: dict[str, Any] | None = None
+    last_weather_eval = 0.0
     capture = LiveDatasetCapture(
         enabled=(cfg.AUTO_CAPTURE_ENABLED == 1),
         dataset_root=cfg.AUTO_CAPTURE_DATASET_ROOT,
@@ -706,6 +996,16 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             int(snapshot.get("new_crossings", 0) or 0),
             (sum(conf_vals) / len(conf_vals)) if conf_vals else 0.0,
         ))
+        if (loop_now - last_scene_eval) >= 2.0:
+            vision_scene = await asyncio.to_thread(_infer_scene_status, frame)
+            if (loop_now - last_weather_eval) >= 300.0 or weather_status is None:
+                try:
+                    weather_status = await asyncio.to_thread(_fetch_jamaica_weather_cached)
+                except Exception:
+                    weather_status = None
+                last_weather_eval = loop_now
+            scene_status = _merge_scene_and_weather(vision_scene, weather_status)
+            last_scene_eval = loop_now
         capture_result = None
         capture_is_paused = is_capture_paused()
         if capture_is_paused:
@@ -754,6 +1054,10 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             payload: dict = {"type": "count", **snapshot}
             payload["runtime_profile"] = runtime_profile_name or None
             payload["runtime_profile_reason"] = runtime_profile_reason or None
+            payload["scene_lighting"] = scene_status.get("scene_lighting")
+            payload["scene_weather"] = scene_status.get("scene_weather")
+            payload["scene_confidence"] = scene_status.get("scene_confidence")
+            payload["scene_source"] = scene_status.get("scene_source") or "vision"
             if _active_round:
                 payload["round"] = _active_round
             await manager.broadcast_public(payload)
@@ -863,6 +1167,7 @@ async def health():
     active_round_status: str | None = _active_round.get("status") if _active_round else None
     latest_snapshot: dict | None = None
     latest_ml_detection: dict | None = None
+    weather_api: dict[str, Any] | None = None
     try:
         sb = await get_supabase()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -945,6 +1250,25 @@ async def health():
     except Exception:
         next_round_at = None
 
+    now_ts = time.time()
+    weather_ts = float(_weather_cache.get("ts", 0.0) or 0.0)
+    weather_age = (now_ts - weather_ts) if weather_ts > 0 else None
+    weather_last_ok = _weather_cache.get("last_ok")
+    weather_payload = _weather_cache.get("payload")
+    weather_status = "not_checked"
+    if weather_last_ok is True:
+        weather_status = "ok" if (weather_age is not None and weather_age <= 900) else "stale"
+    elif weather_last_ok is False:
+        weather_status = "error"
+    weather_api = {
+        "provider": "open-meteo",
+        "status": weather_status,
+        "last_ok": weather_last_ok,
+        "cache_age_sec": int(weather_age) if weather_age is not None else None,
+        "last_error": _weather_cache.get("last_error"),
+        "latest": weather_payload,
+    }
+
     return {
         "status": "ok",
         "stream_configured": bool(get_current_url()),
@@ -960,6 +1284,7 @@ async def health():
         "next_round_at": next_round_at,
         "latest_snapshot": latest_snapshot,
         "latest_ml_detection": latest_ml_detection,
+        "weather_api": weather_api,
     }
 
 
