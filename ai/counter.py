@@ -19,17 +19,17 @@ logger = logging.getLogger(__name__)
 LINE_REFRESH_INTERVAL = 30  # seconds
 TRACK_TTL_SEC = 12.0
 DEFAULT_COUNT_SETTINGS = {
-    "min_track_frames": 3,
+    "min_track_frames": 2,
     "min_box_area_ratio": 0.0,
     "min_confidence": 0.0,
     "allowed_classes": [],
     "class_min_confidence": {},
     # Track-level temporal smoothing + hysteresis for stable counting.
-    "track_conf_smoothing_alpha": 0.35,
-    "track_conf_enter": 0.42,
-    "track_conf_exit": 0.30,
+    "track_conf_smoothing_alpha": 0.30,
+    "track_conf_enter": 0.30,
+    "track_conf_exit": 0.18,
     # Polygon count confirmation: require N consecutive inside frames.
-    "count_zone_confirm_frames": 2,
+    "count_zone_confirm_frames": 1,
 }
 
 
