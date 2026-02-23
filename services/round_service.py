@@ -151,6 +151,9 @@ async def resolve_round(round_id: str, result: dict[str, Any]) -> None:
                 if bet.get("baseline_count") is not None
                 else await _baseline_from_snapshot(bet.get("placed_at"))
             )
+            # Guard against stale/late baseline writes by anchoring to placement snapshot.
+            snap_baseline = await _baseline_from_snapshot(bet.get("placed_at"))
+            baseline = max(int(baseline or 0), int(snap_baseline or 0))
             current = total if market_type == "over_under" else int(breakdown.get(vehicle_class, 0) or 0)
             actual = max(0, current - baseline)
             if actual > threshold:

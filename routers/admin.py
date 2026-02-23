@@ -17,6 +17,7 @@ from services.round_session_service import create_round_session, list_round_sess
 from services.ml_pipeline_service import auto_retrain_cycle, list_jobs, list_models, get_ml_diagnostics
 from services.ml_capture_monitor import get_capture_status, set_capture_paused, is_capture_paused, record_capture_event
 from services.runtime_tuner import RUNTIME_PROFILES
+from services.bet_service import get_bet_validation_status
 from config import get_config
 from supabase_client import get_supabase
 from middleware.rate_limiter import limiter
@@ -120,7 +121,7 @@ async def admin_list_bets(
         sb.table("bets")
         .select(
             "id,user_id,round_id,market_id,amount,potential_payout,status,bet_type,"
-            "vehicle_class,exact_count,actual_count,window_duration_sec,placed_at,resolved_at,"
+            "vehicle_class,exact_count,actual_count,baseline_count,window_start,window_duration_sec,placed_at,resolved_at,"
             "markets(label,odds),bet_rounds(market_type,status)"
         )
         .order("placed_at", desc=True)
@@ -155,6 +156,16 @@ async def admin_list_bets(
         enriched.append(b)
 
     return {"bets": enriched}
+
+
+@router.get("/bets/validation-status")
+async def admin_bet_validation_status(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Runtime validation metrics for bet placement outcomes.
+    """
+    return get_bet_validation_status()
 
 
 @router.post("/set-role")
@@ -808,4 +819,3 @@ async def _resolve_runtime_camera_id(sb, cfg, camera_id: str | None) -> str:
     if active_resp.data:
         return str(active_resp.data[0]["id"])
     raise HTTPException(status_code=404, detail="No camera found for runtime profile controls")
-

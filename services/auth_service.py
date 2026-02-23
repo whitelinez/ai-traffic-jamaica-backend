@@ -39,12 +39,16 @@ async def validate_supabase_jwt(token: str) -> dict[str, Any]:
     """
     try:
         jwks = await _get_jwks()
+        cfg = get_config()
+        issuer = f"{cfg.SUPABASE_URL.rstrip('/')}/auth/v1"
+        audience = str(getattr(cfg, "SUPABASE_JWT_AUDIENCE", "authenticated") or "authenticated").strip()
         # jose can verify against a JWKS dict directly
         payload = jwt.decode(
             token,
             jwks,
-            algorithms=["RS256", "HS256", "ES256"],
-            options={"verify_aud": False},
+            algorithms=["RS256"],
+            issuer=issuer,
+            audience=audience,
         )
         return payload
     except ExpiredSignatureError:

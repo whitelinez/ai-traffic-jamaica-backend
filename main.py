@@ -163,6 +163,8 @@ async def bet_resolver_loop() -> None:
                 .lte("window_start", now_iso) \
                 .execute()
 
+            round_camera_cache: dict[str, str | None] = {}
+
             for bet in (resp.data or []):
                 try:
                     # Check if window has actually expired
@@ -181,33 +183,69 @@ async def bet_resolver_loop() -> None:
                     exact_count = bet.get("exact_count", 0)
                     baseline = bet.get("baseline_count", 0) or 0
                     vehicle_class = bet.get("vehicle_class")
+                    round_id = str(bet.get("round_id") or "")
 
-                    # Get current count from in-memory counter if available
-                    end_count = 0
-                    if _counter_ref is not None:
-                        end_count = _counter_ref.get_class_total(vehicle_class)
-                    else:
-                        # Fall back to latest DB snapshot
-                        rnd_resp = await sb.table("bet_rounds") \
-                            .select("camera_id") \
-                            .eq("id", bet["round_id"]) \
-                            .single() \
-                            .execute()
-                        camera_id = rnd_resp.data.get("camera_id") if rnd_resp.data else None
-                        if camera_id:
-                            snap_resp = await sb.table("count_snapshots") \
+                    camera_id = None
+                    if round_id:
+                        if round_id not in round_camera_cache:
+                            try:
+                                rnd_resp = await sb.table("bet_rounds") \
+                                    .select("camera_id") \
+                                    .eq("id", round_id) \
+                                    .single() \
+                                    .execute()
+                                round_camera_cache[round_id] = (rnd_resp.data or {}).get("camera_id")
+                            except Exception:
+                                round_camera_cache[round_id] = None
+                        camera_id = round_camera_cache.get(round_id)
+
+                    # Re-anchor baseline to the snapshot at/before bet window start when available.
+                    if camera_id and ws_str:
+                        try:
+                            start_snap_resp = await sb.table("count_snapshots") \
                                 .select("total, vehicle_breakdown") \
                                 .eq("camera_id", camera_id) \
+                                .lte("captured_at", window_start.isoformat()) \
                                 .order("captured_at", desc=True) \
                                 .limit(1) \
                                 .execute()
-                            if snap_resp.data:
-                                snap = snap_resp.data[0]
+                            if start_snap_resp.data:
+                                snap = start_snap_resp.data[0]
                                 if vehicle_class is None:
-                                    end_count = snap.get("total", 0) or 0
+                                    baseline = max(int(baseline or 0), int(snap.get("total", 0) or 0))
                                 else:
                                     bd = snap.get("vehicle_breakdown") or {}
-                                    end_count = bd.get(vehicle_class, 0)
+                                    baseline = max(int(baseline or 0), int(bd.get(vehicle_class, 0) or 0))
+                        except Exception:
+                            pass
+
+                    # Resolve end count at/before window_end from DB first to keep window-bounded fairness.
+                    end_count: int | None = None
+                    if camera_id:
+                        try:
+                            end_snap_resp = await sb.table("count_snapshots") \
+                                .select("total, vehicle_breakdown") \
+                                .eq("camera_id", camera_id) \
+                                .lte("captured_at", window_end.isoformat()) \
+                                .order("captured_at", desc=True) \
+                                .limit(1) \
+                                .execute()
+                            if end_snap_resp.data:
+                                snap = end_snap_resp.data[0]
+                                if vehicle_class is None:
+                                    end_count = int(snap.get("total", 0) or 0)
+                                else:
+                                    bd = snap.get("vehicle_breakdown") or {}
+                                    end_count = int(bd.get(vehicle_class, 0) or 0)
+                        except Exception:
+                            end_count = None
+
+                    # Fallback to in-memory/live state if no bounded DB snapshot is available yet.
+                    if end_count is None:
+                        if _counter_ref is not None:
+                            end_count = int(_counter_ref.get_class_total(vehicle_class))
+                        else:
+                            end_count = 0
 
                     actual = max(0, end_count - baseline)
                     won = (actual == exact_count)
@@ -298,29 +336,29 @@ async def bet_resolver_loop() -> None:
                         if outcome not in {"over", "under", "exact"}:
                             continue
 
-                        if bet.get("baseline_count") is not None:
-                            baseline = int(bet.get("baseline_count") or 0)
-                        else:
-                            baseline = 0
-                            if rnd.get("camera_id") and bet.get("placed_at"):
-                                try:
-                                    snap_before_bet = await (
-                                        sb.table("count_snapshots")
-                                        .select("total, vehicle_breakdown")
-                                        .eq("camera_id", rnd["camera_id"])
-                                        .lte("captured_at", bet.get("placed_at"))
-                                        .order("captured_at", desc=True)
-                                        .limit(1)
-                                        .execute()
-                                    )
-                                    if snap_before_bet.data:
-                                        snap = snap_before_bet.data[0]
-                                        if vehicle_class is None:
-                                            baseline = int(snap.get("total", 0) or 0)
-                                        else:
-                                            baseline = int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
-                                except Exception:
-                                    baseline = 0
+                        baseline = int(bet.get("baseline_count") or 0)
+                        if rnd.get("camera_id") and bet.get("placed_at"):
+                            try:
+                                snap_before_bet = await (
+                                    sb.table("count_snapshots")
+                                    .select("total, vehicle_breakdown")
+                                    .eq("camera_id", rnd["camera_id"])
+                                    .lte("captured_at", bet.get("placed_at"))
+                                    .order("captured_at", desc=True)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                if snap_before_bet.data:
+                                    snap = snap_before_bet.data[0]
+                                    if vehicle_class is None:
+                                        baseline = max(baseline, int(snap.get("total", 0) or 0))
+                                    else:
+                                        baseline = max(
+                                            baseline,
+                                            int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0),
+                                        )
+                            except Exception:
+                                pass
                         actual = max(0, current_count - baseline)
                         if actual <= threshold:
                             continue
@@ -885,7 +923,7 @@ async def health():
 
     return {
         "status": "ok",
-        "stream_url": get_current_url(),
+        "stream_configured": bool(get_current_url()),
         "public_ws_connections": manager.public_count,
         "user_ws_connections": manager.user_count,
         "ai_task_running": _ai_task is not None and not _ai_task.done(),

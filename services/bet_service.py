@@ -2,6 +2,7 @@
 bet_service.py — Atomic bet placement (market bets + exact-count live bets).
 """
 import logging
+import threading
 from uuid import UUID
 from datetime import datetime, timezone, timedelta
 
@@ -14,6 +15,42 @@ logger = logging.getLogger(__name__)
 INITIAL_BALANCE = 1000
 LIVE_BET_ODDS = 8.0  # fixed 8x for exact-count micro-bets
 MAX_PENDING_BETS_PER_ROUND = 2
+_validation_metrics_lock = threading.Lock()
+_validation_metrics = {
+    "accepted_total": 0,
+    "rejected_total": 0,
+    "reasons": {},
+    "last_event_at": None,
+}
+
+
+def _record_validation_event(accepted: bool, reason: str | None = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _validation_metrics_lock:
+        if accepted:
+            _validation_metrics["accepted_total"] += 1
+        else:
+            _validation_metrics["rejected_total"] += 1
+            key = str(reason or "validation_rejected").strip()[:160]
+            reasons = _validation_metrics["reasons"]
+            reasons[key] = int(reasons.get(key, 0)) + 1
+        _validation_metrics["last_event_at"] = now
+
+
+def get_bet_validation_status() -> dict:
+    with _validation_metrics_lock:
+        accepted = int(_validation_metrics["accepted_total"])
+        rejected = int(_validation_metrics["rejected_total"])
+        total = accepted + rejected
+        reasons = dict(_validation_metrics["reasons"])
+        return {
+            "accepted_total": accepted,
+            "rejected_total": rejected,
+            "total_evaluated": total,
+            "reject_rate": (rejected / total) if total else 0.0,
+            "reasons": dict(sorted(reasons.items(), key=lambda item: item[1], reverse=True)),
+            "last_event_at": _validation_metrics["last_event_at"],
+        }
 
 
 def _as_actionable_db_error(exc: Exception) -> HTTPException:
@@ -38,6 +75,16 @@ def _parse_round_closes_at(rnd: dict) -> datetime:
         return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except Exception:
         raise HTTPException(status_code=400, detail="Round timing is invalid (bad closes_at format)")
+
+
+def _parse_round_ends_at(rnd: dict) -> datetime:
+    raw = rnd.get("ends_at")
+    if not raw:
+        raise HTTPException(status_code=400, detail="Round timing is misconfigured (missing ends_at)")
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Round timing is invalid (bad ends_at format)")
 
 
 def _extract_bet_id_from_rpc_data(data) -> str:
@@ -82,6 +129,17 @@ async def _pending_bets_for_round(sb, user_id: str, round_id: str) -> int:
         .execute()
     )
     return len(resp.data or [])
+
+
+async def _assert_user_can_stake(sb, user_id: str, amount: int) -> None:
+    try:
+        bal_resp = await sb.rpc("get_user_balance", {"p_user_id": user_id}).execute()
+        balance = int(bal_resp.data if bal_resp.data is not None else INITIAL_BALANCE)
+    except Exception:
+        # If balance precheck fails, keep existing atomic guard in place.
+        return
+    if balance < amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
 
 
 async def _get_baseline_count(sb, camera_id: str | None, market_type: str, params: dict | None) -> int:
@@ -142,6 +200,7 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
                 status_code=429,
                 detail=f"Maximum {MAX_PENDING_BETS_PER_ROUND} active bets per round reached",
             )
+        await _assert_user_can_stake(sb, user_id, req.amount)
 
         try:
             mkt_resp = await (
@@ -202,6 +261,7 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
         except Exception as exc:
             logger.warning("Skipping optional bet enrichment columns for bet %s: %s", bet_id, exc)
 
+        _record_validation_event(True)
         return PlaceBetResponse(
             bet_id=bet_id,
             status="pending",
@@ -209,7 +269,9 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
             potential_payout=potential_payout,
             placed_at=datetime.now(timezone.utc),
         )
-    except HTTPException:
+    except HTTPException as exc:
+        if 400 <= int(exc.status_code) < 500:
+            _record_validation_event(False, str(exc.detail))
         raise
     except Exception as exc:
         logger.exception("Unhandled place_bet crash user_id=%s round_id=%s market_id=%s", user_id, req.round_id, req.market_id)
@@ -227,109 +289,121 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
     """
     sb = await get_supabase()
 
-    # 1. Validate round
     try:
-        round_resp = await sb.table("bet_rounds").select("*").eq("id", str(req.round_id)).single().execute()
-        if not round_resp.data:
+        # 1. Validate round
+        try:
+            round_resp = await sb.table("bet_rounds").select("*").eq("id", str(req.round_id)).single().execute()
+            if not round_resp.data:
+                raise HTTPException(status_code=404, detail="Round not found")
+        except HTTPException:
+            raise
+        except Exception:
             raise HTTPException(status_code=404, detail="Round not found")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=404, detail="Round not found")
 
-    rnd = round_resp.data
-    now = datetime.now(timezone.utc)
+        rnd = round_resp.data
+        now = datetime.now(timezone.utc)
 
-    if rnd["status"] != "open":
-        raise HTTPException(status_code=400, detail=f"Round is {rnd['status']}, bets not accepted")
+        if rnd["status"] != "open":
+            raise HTTPException(status_code=400, detail=f"Round is {rnd['status']}, bets not accepted")
 
-    closes_at = _parse_round_closes_at(rnd)
-    if now >= closes_at:
-        raise HTTPException(status_code=403, detail="Betting window has closed")
+        closes_at = _parse_round_closes_at(rnd)
+        if now >= closes_at:
+            raise HTTPException(status_code=403, detail="Betting window has closed")
 
-    pending = await _pending_bets_for_round(sb, user_id, str(req.round_id))
-    if pending >= MAX_PENDING_BETS_PER_ROUND:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Maximum {MAX_PENDING_BETS_PER_ROUND} active bets per round reached",
+        pending = await _pending_bets_for_round(sb, user_id, str(req.round_id))
+        if pending >= MAX_PENDING_BETS_PER_ROUND:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Maximum {MAX_PENDING_BETS_PER_ROUND} active bets per round reached",
+            )
+        await _assert_user_can_stake(sb, user_id, req.amount)
+
+        # Live bet window must fit in current round window.
+        ends_at = _parse_round_ends_at(rnd)
+        if now + timedelta(seconds=req.window_duration_sec) > ends_at:
+            raise HTTPException(status_code=400, detail="Live bet window extends past round end")
+
+        # 2. Validate vehicle_class
+        valid_classes = {"car", "truck", "bus", "motorcycle"}
+        if req.vehicle_class is not None and req.vehicle_class not in valid_classes:
+            raise HTTPException(status_code=400, detail=f"Invalid vehicle_class: {req.vehicle_class}")
+
+        # 3. Fetch baseline from latest count_snapshot for this camera
+        cam_resp = await sb.table("bet_rounds").select("camera_id").eq("id", str(req.round_id)).single().execute()
+        camera_id = cam_resp.data.get("camera_id") if cam_resp.data else None
+
+        baseline_count = 0
+        if camera_id:
+            snap_resp = await sb.table("count_snapshots") \
+                .select("total, vehicle_breakdown") \
+                .eq("camera_id", camera_id) \
+                .order("captured_at", desc=True) \
+                .limit(1) \
+                .execute()
+            if snap_resp.data:
+                snap = snap_resp.data[0]
+                if req.vehicle_class is None:
+                    baseline_count = snap.get("total", 0) or 0
+                else:
+                    bd = snap.get("vehicle_breakdown") or {}
+                    baseline_count = bd.get(req.vehicle_class, 0)
+
+        # 4. Check balance and deduct atomically
+        potential_payout = int(req.amount * LIVE_BET_ODDS)
+
+        # Route through existing DB atomic function so balance + insert stay in one transaction.
+        try:
+            rpc_resp = await sb.rpc("place_bet_atomic", {
+                "p_user_id": user_id,
+                "p_round_id": str(req.round_id),
+                "p_market_id": None,
+                "p_amount": req.amount,
+                "p_potential_payout": potential_payout,
+            }).execute()
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "insufficient balance" in msg:
+                raise HTTPException(status_code=400, detail="Insufficient balance")
+            raise _as_actionable_db_error(exc)
+
+        if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
+            raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
+
+        bet_id = _extract_bet_id_from_rpc_data(rpc_resp.data)
+
+        # 5. Update inserted bet with live-bet specific metadata
+        window_start = now
+        window_end = now + timedelta(seconds=req.window_duration_sec)
+
+        live_update = {
+            "bet_type": "exact_count",
+            "window_start": window_start.isoformat(),
+            "window_duration_sec": req.window_duration_sec,
+            "vehicle_class": req.vehicle_class,
+            "exact_count": req.exact_count,
+            "baseline_count": baseline_count,
+        }
+
+        try:
+            await sb.table("bets").update(live_update).eq("id", str(bet_id)).execute()
+        except Exception as exc:
+            raise _as_actionable_db_error(exc)
+
+        _record_validation_event(True)
+        return PlaceLiveBetResponse(
+            bet_id=bet_id,
+            status="pending",
+            amount=req.amount,
+            potential_payout=potential_payout,
+            window_end=window_end,
+            exact_count=req.exact_count,
+            vehicle_class=req.vehicle_class,
+            placed_at=window_start,
         )
-
-    # 2. Validate vehicle_class
-    valid_classes = {"car", "truck", "bus", "motorcycle"}
-    if req.vehicle_class is not None and req.vehicle_class not in valid_classes:
-        raise HTTPException(status_code=400, detail=f"Invalid vehicle_class: {req.vehicle_class}")
-
-    # 3. Fetch baseline from latest count_snapshot for this camera
-    cam_resp = await sb.table("bet_rounds").select("camera_id").eq("id", str(req.round_id)).single().execute()
-    camera_id = cam_resp.data.get("camera_id") if cam_resp.data else None
-
-    baseline_count = 0
-    if camera_id:
-        snap_resp = await sb.table("count_snapshots") \
-            .select("total, vehicle_breakdown") \
-            .eq("camera_id", camera_id) \
-            .order("captured_at", desc=True) \
-            .limit(1) \
-            .execute()
-        if snap_resp.data:
-            snap = snap_resp.data[0]
-            if req.vehicle_class is None:
-                baseline_count = snap.get("total", 0) or 0
-            else:
-                bd = snap.get("vehicle_breakdown") or {}
-                baseline_count = bd.get(req.vehicle_class, 0)
-
-    # 4. Check balance and deduct atomically
-    potential_payout = int(req.amount * LIVE_BET_ODDS)
-
-    # Route through existing DB atomic function so balance + insert stay in one transaction.
-    try:
-        rpc_resp = await sb.rpc("place_bet_atomic", {
-            "p_user_id": user_id,
-            "p_round_id": str(req.round_id),
-            "p_market_id": None,
-            "p_amount": req.amount,
-            "p_potential_payout": potential_payout,
-        }).execute()
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "insufficient balance" in msg:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-        raise _as_actionable_db_error(exc)
-
-    if rpc_resp.data and isinstance(rpc_resp.data, dict) and rpc_resp.data.get("error"):
-        raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
-
-    bet_id = _extract_bet_id_from_rpc_data(rpc_resp.data)
-
-    # 5. Update inserted bet with live-bet specific metadata
-    window_start = now
-    window_end = now + timedelta(seconds=req.window_duration_sec)
-
-    live_update = {
-        "bet_type": "exact_count",
-        "window_start": window_start.isoformat(),
-        "window_duration_sec": req.window_duration_sec,
-        "vehicle_class": req.vehicle_class,
-        "exact_count": req.exact_count,
-        "baseline_count": baseline_count,
-    }
-
-    try:
-        await sb.table("bets").update(live_update).eq("id", str(bet_id)).execute()
-    except Exception as exc:
-        raise _as_actionable_db_error(exc)
-
-    return PlaceLiveBetResponse(
-        bet_id=bet_id,
-        status="pending",
-        amount=req.amount,
-        potential_payout=potential_payout,
-        window_end=window_end,
-        exact_count=req.exact_count,
-        vehicle_class=req.vehicle_class,
-        placed_at=window_start,
-    )
+    except HTTPException as exc:
+        if 400 <= int(exc.status_code) < 500:
+            _record_validation_event(False, str(exc.detail))
+        raise
 
 
 async def get_user_balance(user_id: str) -> int:

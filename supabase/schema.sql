@@ -198,6 +198,10 @@ CREATE POLICY "admin_write_cameras" ON cameras
     (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
   );
 
+-- Keep stream origin private from anon/authenticated roles.
+-- Backend jobs and service role continue to read this column.
+REVOKE SELECT (stream_url) ON TABLE cameras FROM anon, authenticated;
+
 -- Bet rounds: public read, service role write (backend only)
 DROP POLICY IF EXISTS "public_read_rounds" ON bet_rounds;
 CREATE POLICY "public_read_rounds" ON bet_rounds
@@ -271,7 +275,9 @@ CREATE OR REPLACE FUNCTION place_bet_atomic(
   p_amount         INT,
   p_potential_payout INT
 ) RETURNS JSON
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
   v_balance INT;
   v_bet_id  UUID;
@@ -313,7 +319,9 @@ $$;
 -- Return a user's current balance. Auto-initialises to 1000 for new users.
 CREATE OR REPLACE FUNCTION get_user_balance(p_user_id UUID)
 RETURNS INT
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 BEGIN
   INSERT INTO user_balances (user_id, balance)
   VALUES (p_user_id, 1000)
@@ -326,7 +334,9 @@ $$;
 -- Add credits to a user's balance (called on bet resolution/payout).
 CREATE OR REPLACE FUNCTION credit_user_balance(p_user_id UUID, p_amount INT)
 RETURNS VOID
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 BEGIN
   INSERT INTO user_balances (user_id, balance)
   VALUES (p_user_id, p_amount)

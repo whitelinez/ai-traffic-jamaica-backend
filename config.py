@@ -18,6 +18,7 @@ class Config:
     # WebSocket auth (HMAC)
     WS_AUTH_SECRET: str
     ALLOWED_ORIGIN: str
+    SUPABASE_JWT_AUDIENCE: str
 
     # AI config
     YOLO_MODEL: str
@@ -98,6 +99,7 @@ class Config:
         self.CAMERA_ALIAS = os.environ["CAMERA_ALIAS"]
         self.WS_AUTH_SECRET = os.environ["WS_AUTH_SECRET"]
         self.ALLOWED_ORIGIN = os.environ["ALLOWED_ORIGIN"]
+        self.SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
 
         self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
         self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
