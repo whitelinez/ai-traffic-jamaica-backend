@@ -107,6 +107,7 @@ async def session_scheduler_tick() -> None:
     sb = await get_supabase()
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
+    locked_grace_iso = (now - timedelta(minutes=2)).isoformat()
 
     # Mark expired sessions complete.
     await (
@@ -136,15 +137,24 @@ async def session_scheduler_tick() -> None:
             continue
 
         # Keep one active timeline per camera for predictable UX.
-        busy_resp = await (
+        active_open_upcoming_resp = await (
             sb.table("bet_rounds")
             .select("id")
             .eq("camera_id", s["camera_id"])
-            .in_("status", ["upcoming", "open", "locked"])
+            .in_("status", ["upcoming", "open"])
             .limit(1)
             .execute()
         )
-        if busy_resp.data:
+        recent_locked_resp = await (
+            sb.table("bet_rounds")
+            .select("id")
+            .eq("camera_id", s["camera_id"])
+            .eq("status", "locked")
+            .gte("ends_at", locked_grace_iso)
+            .limit(1)
+            .execute()
+        )
+        if active_open_upcoming_resp.data or recent_locked_resp.data:
             continue
 
         opens = now
@@ -179,4 +189,3 @@ async def session_scheduler_tick() -> None:
         if max_rounds is not None and (created_rounds + 1) >= int(max_rounds):
             patch["status"] = "completed"
         await sb.table("round_sessions").update(patch).eq("id", sid).execute()
-

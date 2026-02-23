@@ -94,10 +94,11 @@ async def round_monitor_loop() -> None:
                 await sb.table("bet_rounds").update({"status": "open"}).eq("id", row["id"]).execute()
                 logger.info("Auto-opened round: %s", row["id"])
 
-            # Auto-resolve: open rounds whose ends_at has passed
+            # Auto-resolve: open/locked rounds whose ends_at has passed.
+            # Locked rounds can exist briefly after cutoff; if they linger, resolve them.
             ended_resp = await sb.table("bet_rounds") \
                 .select("id") \
-                .eq("status", "open") \
+                .in_("status", ["open", "locked"]) \
                 .lte("ends_at", now_iso) \
                 .execute()
             for row in ended_resp.data or []:
