@@ -212,16 +212,10 @@ class LineCounter:
             sb.table("cameras")
             .select("count_line, detect_zone, count_settings")
             .eq("id", self.camera_id)
-            .maybe_single()
+            .single()
             .execute()
         )
-        if resp.data is None:
-            logger.warning(
-                "_refresh_line: camera_id=%s not found in DB — skipping refresh",
-                self.camera_id,
-            )
-            return
-        data = resp.data
+        data = resp.data or {}
         line_data = data.get("count_line")
         detect_data = data.get("detect_zone")
         count_settings = data.get("count_settings") or {}
@@ -398,35 +392,7 @@ class LineCounter:
     async def process(self, frame: np.ndarray, detections: sv.Detections) -> dict[str, Any]:
         now_mono = time.monotonic()
         if self._zone is None or (now_mono - self._last_refresh) > LINE_REFRESH_INTERVAL:
-            try:
-                await self._refresh_line()
-            except Exception as exc:
-                logger.warning("_refresh_line failed (camera_id=%s): %s", self.camera_id, exc)
-                if self._zone is None:
-                    # No zone configured yet and DB is unreachable — return empty snapshot.
-                    _empty_breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
-                    return {
-                        "camera_id": self.camera_id,
-                        "captured_at": datetime.now(timezone.utc).isoformat(),
-                        "count_in": self._confirmed_in,
-                        "count_out": self._confirmed_out,
-                        "total": self._confirmed_total,
-                        "vehicle_breakdown": _empty_breakdown,
-                        "round_count_in": max(0, self._confirmed_in - self._round_baseline_in),
-                        "round_count_out": max(0, self._confirmed_out - self._round_baseline_out),
-                        "round_total": max(0, self._confirmed_total - self._round_baseline_total),
-                        "round_vehicle_breakdown": {
-                            cls: max(0, int(v["in"] + v["out"]) - int(self._round_baseline_per_class.get(cls, 0)))
-                            for cls, v in self._counts.items()
-                        },
-                        "detections": [],
-                        "new_crossings": 0,
-                        "per_class_total": dict(self._per_class_total),
-                        "pre_count_total": 0,
-                        "confirmed_crossings_total": self._confirmed_total,
-                        "burst_mode_active": False,
-                    }
-                # Zone exists from previous refresh — continue with stale config.
+            await self._refresh_line()
 
         new_crossings = 0
         tracker_ids = getattr(detections, "tracker_id", None)
@@ -619,16 +585,6 @@ class LineCounter:
                 conf = None
                 if detections.confidence is not None and i < len(detections.confidence):
                     conf = round(float(detections.confidence[i]), 4)
-                tracker_id = None
-                try:
-                    if (
-                        getattr(detections, "tracker_id", None) is not None
-                        and i < len(detections.tracker_id)
-                    ):
-                        raw_tid = int(detections.tracker_id[i])
-                        tracker_id = raw_tid if raw_tid >= 0 else None
-                except Exception:
-                    tracker_id = None
                 boxes.append({
                     "x1": round(float(x1) / self.frame_width, 4),
                     "y1": round(float(y1) / self.frame_height, 4),
@@ -636,7 +592,6 @@ class LineCounter:
                     "y2": round(float(y2) / self.frame_height, 4),
                     "cls": CLASS_NAMES[cls_id],
                     "conf": conf,
-                    "tracker_id": tracker_id,
                     "in_detect_zone": bool(detect_inside_mask[i]) if i < len(detect_inside_mask) else True,
                 })
 

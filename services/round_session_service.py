@@ -179,11 +179,7 @@ async def session_scheduler_tick() -> None:
             ends_at=ends,
             markets=_session_markets(s["market_type"], s.get("threshold"), s.get("vehicle_class")),
         )
-        try:
-            await create_round(req)
-        except Exception as exc:
-            logger.warning("session_scheduler: create_round failed for session %s: %s", sid, exc)
-            continue
+        await create_round(req)
 
         next_round_at = ends + timedelta(minutes=int(s["interval_min"]))
         patch = {
