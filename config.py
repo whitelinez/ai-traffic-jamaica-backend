@@ -13,6 +13,7 @@ class Config:
 
     # Stream — permanent ipcamlive camera alias (never changes, no session expiry)
     CAMERA_ALIAS: str
+    CAMERA_ALIASES: list[str]
     URL_REFRESH_INTERVAL: int  # seconds between proactive URL refreshes (default 240)
 
     # WebSocket auth (HMAC)
@@ -97,6 +98,9 @@ class Config:
         self.SUPABASE_URL = os.environ["SUPABASE_URL"]
         self.SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
         self.CAMERA_ALIAS = os.environ["CAMERA_ALIAS"]
+        raw_aliases = os.getenv("CAMERA_ALIASES", "")
+        parsed_aliases = [a.strip() for a in raw_aliases.split(",") if a.strip()]
+        self.CAMERA_ALIASES = parsed_aliases
         self.WS_AUTH_SECRET = os.environ["WS_AUTH_SECRET"]
         self.ALLOWED_ORIGIN = os.environ["ALLOWED_ORIGIN"]
         self.SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")

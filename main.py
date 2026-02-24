@@ -39,7 +39,7 @@ from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot
 from ai.dataset_capture import LiveDatasetCapture
 from ai.dataset_upload import SupabaseDatasetUploader
-from ai.url_refresher import url_refresh_loop, get_current_url
+from ai.url_refresher import url_refresh_loop, get_current_url, get_current_alias
 from services.round_service import resolve_round_from_latest_snapshot
 from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
@@ -1019,20 +1019,16 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
 
-    logger.info("AI loop inner: querying camera_id")
-    sb = await get_supabase()
-    cam_resp = await (
-        sb.table("cameras")
-        .select("id")
-        .eq("ipcam_alias", cfg.CAMERA_ALIAS)
-        .limit(1)
-        .execute()
-    )
-    if cam_resp.data:
-        camera_id = cam_resp.data[0]["id"]
-    else:
-        # Alias may be unset/mismatched during deploys; fall back to an active camera
-        # so persisted global counts can still be restored from snapshots.
+    async def _resolve_camera_id_for_alias(alias: str) -> str:
+        resp = await (
+            sb.table("cameras")
+            .select("id")
+            .eq("ipcam_alias", alias)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return resp.data[0]["id"]
         fallback_resp = await (
             sb.table("cameras")
             .select("id")
@@ -1041,8 +1037,13 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             .limit(1)
             .execute()
         )
-        camera_id = fallback_resp.data[0]["id"] if fallback_resp.data else "default"
-    logger.info("AI loop using camera_id: %s", camera_id)
+        return fallback_resp.data[0]["id"] if fallback_resp.data else "default"
+
+    logger.info("AI loop inner: querying camera_id")
+    sb = await get_supabase()
+    camera_alias = get_current_alias() or cfg.CAMERA_ALIAS
+    camera_id = await _resolve_camera_id_for_alias(camera_alias)
+    logger.info("AI loop using camera alias=%s camera_id=%s", camera_alias, camera_id)
 
     logger.info("AI loop inner: opening HLS stream")
     frame_buf = None
@@ -1116,6 +1117,22 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     async for frame in hls_stream.frames():
         frame_index += 1
         _mark_ai_frame_processed()
+
+        latest_alias = get_current_alias() or cfg.CAMERA_ALIAS
+        if latest_alias != camera_alias:
+            old_alias = camera_alias
+            camera_alias = latest_alias
+            camera_id = await _resolve_camera_id_for_alias(camera_alias)
+            logger.info("AI camera switched alias %s -> %s (camera_id=%s)", old_alias, camera_alias, camera_id)
+            counter = None
+            _counter_ref = None
+            try:
+                runtime_profile_name = ""
+                last_runtime_eval = 0.0
+                runtime_events.clear()
+            except Exception:
+                pass
+
         now_is_night = _is_night_hour()
         if profile_is_night is None or now_is_night != profile_is_night:
             detector.set_night_mode(now_is_night)
@@ -1472,7 +1489,7 @@ async def health():
         cam_resp = await (
             sb.table("cameras")
             .select("id")
-            .eq("ipcam_alias", get_config().CAMERA_ALIAS)
+            .eq("ipcam_alias", get_current_alias() or get_config().CAMERA_ALIAS)
             .limit(1)
             .execute()
         )

@@ -12,6 +12,7 @@ from config import get_config
 from middleware.hmac_auth import validate_ws_token
 from supabase_client import get_supabase
 from websocket.ws_manager import manager
+from ai.url_refresher import get_current_alias
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ async def ws_live(
             "user_agent": websocket.headers.get("user-agent"),
         },
     )
-    await _send_bootstrap_count(websocket, cfg.CAMERA_ALIAS)
+    await _send_bootstrap_count(websocket, get_current_alias() or cfg.CAMERA_ALIAS)
     try:
         while True:
             # Keep alive — client doesn't send data, just listens

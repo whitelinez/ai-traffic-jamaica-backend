@@ -12,7 +12,12 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
-from ai.url_refresher import _supabase_update_stream_url, fetch_fresh_stream_url
+from ai.url_refresher import (
+    _supabase_update_stream_url,
+    fetch_fresh_stream_url,
+    get_candidate_aliases,
+    get_current_url,
+)
 from config import get_config
 from middleware.hmac_auth import validate_ws_token
 from supabase_client import get_supabase
@@ -38,27 +43,37 @@ _manifest_cache: dict[str, object] = {"body": "", "fetched_at": 0.0}
 _stream_url_cache: dict[str, object] = {"url": "", "fetched_at": 0.0}
 
 
-async def _get_stream_url(cfg) -> str:
+async def _get_stream_url(cfg, preferred_alias: str | None = None) -> str:
     now = time.monotonic()
     cached_url = str(_stream_url_cache.get("url") or "")
     cached_at = float(_stream_url_cache.get("fetched_at") or 0.0)
     if cached_url and (now - cached_at) < _STREAM_URL_CACHE_TTL_SEC:
         return cached_url
 
+    # Prefer the refresher's live-selected URL first.
+    live_url = str(get_current_url() or "").strip()
+    if live_url:
+        _stream_url_cache["url"] = live_url
+        _stream_url_cache["fetched_at"] = now
+        return live_url
+
     supabase = await get_supabase()
-    cam = await (
-        supabase.table("cameras")
-        .select("stream_url")
-        .eq("ipcam_alias", cfg.CAMERA_ALIAS)
-        .limit(1)
-        .execute()
-    )
-    stream_url = str((cam.data or [{}])[0].get("stream_url") or "").strip()
-    if not stream_url:
-        raise HTTPException(
-            status_code=503,
-            detail="Stream URL not yet available - refresher may still be starting",
+    aliases = await get_candidate_aliases(preferred_alias or cfg.CAMERA_ALIAS)
+    stream_url = ""
+    for alias in aliases:
+        cam = await (
+            supabase.table("cameras")
+            .select("stream_url")
+            .eq("ipcam_alias", alias)
+            .limit(1)
+            .execute()
         )
+        candidate = str((cam.data or [{}])[0].get("stream_url") or "").strip()
+        if candidate:
+            stream_url = candidate
+            break
+    if not stream_url:
+        raise HTTPException(status_code=503, detail="Stream URL not yet available")
 
     _stream_url_cache["url"] = stream_url
     _stream_url_cache["fetched_at"] = now
@@ -76,7 +91,10 @@ def _rewrite_manifest(manifest_body: str, base_url: str) -> str:
 
 
 @router.get("/live.m3u8")
-async def stream_manifest(token: str = Query(...)):
+async def stream_manifest(
+    token: str = Query(...),
+    alias: str | None = Query(default=None),
+):
     cfg = get_config()
     if not validate_ws_token(token, cfg.WS_AUTH_SECRET):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -102,7 +120,8 @@ async def stream_manifest(token: str = Query(...)):
                 headers={"Cache-Control": "no-cache, no-store"},
             )
 
-        stream_url = await _get_stream_url(cfg)
+        preferred_alias = str(alias or "").strip() or None
+        stream_url = await _get_stream_url(cfg, preferred_alias=preferred_alias)
         base_url = stream_url.rsplit("/", 1)[0] + "/"
 
         try:
@@ -115,18 +134,23 @@ async def stream_manifest(token: str = Query(...)):
                 # If the persisted URL is stale, force one refresh and retry.
                 if resp.status_code == 404:
                     logger.warning("Stored HLS URL returned 404, attempting one forced refresh")
-                    fresh = await fetch_fresh_stream_url(cfg.CAMERA_ALIAS)
-                    if fresh:
+                    aliases = await get_candidate_aliases(preferred_alias or cfg.CAMERA_ALIAS)
+                    for alias in aliases:
+                        fresh = await fetch_fresh_stream_url(alias)
+                        if not fresh:
+                            continue
                         stream_url = fresh
                         base_url = stream_url.rsplit("/", 1)[0] + "/"
                         _stream_url_cache["url"] = stream_url
                         _stream_url_cache["fetched_at"] = time.monotonic()
-                        await _supabase_update_stream_url(cfg.CAMERA_ALIAS, fresh)
+                        await _supabase_update_stream_url(alias, fresh)
                         resp = await client.get(
                             stream_url,
                             headers=_PROXY_HEADERS,
                             follow_redirects=True,
                         )
+                        if resp.status_code == 200:
+                            break
         except Exception as exc:
             logger.error("Failed to fetch HLS manifest: %s", exc)
             raise HTTPException(status_code=502, detail="Stream unavailable")
