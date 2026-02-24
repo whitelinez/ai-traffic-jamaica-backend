@@ -1,5 +1,5 @@
 """
-ai/detector.py — YOLOv8n vehicle detector using Ultralytics + Supervision.
+ai/detector.py - YOLOv8 vehicle detector using Ultralytics + Supervision.
 COCO classes used: 2=car, 3=motorcycle, 5=bus, 7=truck
 """
 import logging
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 VEHICLE_CLASSES = [2, 3, 5, 7]
 CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
+
 class VehicleDetector:
     def __init__(
         self,
@@ -25,9 +26,47 @@ class VehicleDetector:
         infer_size: int | None = None,
         iou_threshold: float | None = None,
         max_det: int | None = None,
+        device: str | None = None,
     ):
-        logger.info("Loading YOLO model: %s (conf=%.2f)", model_path, conf_threshold)
+        requested_device = str(device or os.getenv("YOLO_DEVICE", "auto")).strip().lower()
+        cuda_available = bool(torch.cuda.is_available())
+        selected_device = "cpu"
+        if requested_device in {"auto", "cuda", "gpu", "0", "cuda:0"}:
+            selected_device = "cuda:0" if cuda_available else "cpu"
+        elif requested_device == "cpu":
+            selected_device = "cpu"
+        elif requested_device.startswith("cuda"):
+            selected_device = requested_device if cuda_available else "cpu"
+        else:
+            selected_device = requested_device or "cpu"
+
+        if requested_device.startswith("cuda") and not cuda_available:
+            logger.warning(
+                "YOLO device requested as '%s' but CUDA is unavailable; falling back to CPU",
+                requested_device,
+            )
+
+        self.device = selected_device
+        self.cuda_available = cuda_available
+        self.device_name = None
+        if self.device.startswith("cuda") and cuda_available:
+            try:
+                self.device_name = torch.cuda.get_device_name(0)
+            except Exception:
+                self.device_name = "cuda"
+
+        logger.info(
+            "Loading YOLO model: %s (conf=%.2f, requested_device=%s, selected_device=%s, cuda_available=%s, cuda_name=%s)",
+            model_path,
+            conf_threshold,
+            requested_device,
+            self.device,
+            self.cuda_available,
+            self.device_name or "n/a",
+        )
+
         self.model = YOLO(model_path)
+        self.model.to(self.device)
         self.conf = conf_threshold
         self.infer_size = int(infer_size or int(os.getenv("DETECT_INFER_SIZE", "448")))
         self.iou = float(iou_threshold if iou_threshold is not None else float(os.getenv("DETECT_IOU", "0.50")))
@@ -42,36 +81,15 @@ class VehicleDetector:
         self._night_mode = bool(enabled)
 
     def detect(self, frame) -> sv.Detections:
-        """
-        Run inference on a BGR frame (from cv2.VideoCapture). Thread-safe.
-
-        Root cause: OpenCV 4.11 in this env has two incompatible numpy ABIs.
-          - cv2-internal arrays (VideoCapture, cv2.resize output) pass cv2's
-            PyArray_Check but fail Python isinstance(x, np.ndarray).
-          - System numpy arrays (np.zeros etc.) pass isinstance but fail
-            cv2's PyArray_Check, crashing cv2.resize / cv2.copyMakeBorder.
-
-        Fix:
-          1. np.array(frame) uses __array_interface__ to copy the cv2 array
-             into system numpy — works across ABI versions.
-          2. PIL letterboxes the frame with zero cv2 calls.
-          3. A float torch.Tensor is passed as source.
-          4. ultralytics detects torch.Tensor → LoadTensor path → skips
-             pre_transform / LetterBox / all cv2 entirely.
-          5. Predictions are in 640×640 padded space; we un-letterbox manually.
-        """
         h, w = frame.shape[:2]
         scale = min(self.infer_size / h, self.infer_size / w)
         new_w, new_h = int(w * scale), int(h * scale)
         pad_top = (self.infer_size - new_h) // 2
         pad_left = (self.infer_size - new_w) // 2
 
-        # Bridge cv2 array → system numpy via __array_interface__
-        frame_np = np.array(frame, dtype=np.uint8)                   # BGR, system numpy
-        frame_rgb = np.ascontiguousarray(frame_np[:, :, ::-1])       # BGR → RGB
+        frame_np = np.array(frame, dtype=np.uint8)
+        frame_rgb = np.ascontiguousarray(frame_np[:, :, ::-1])
 
-        # Letterbox entirely in PIL — no cv2 calls.
-        # At night, boost bright points/edges to help headlight/taillight tracking.
         pil = Image.fromarray(frame_rgb)
         if self._night_mode and self.night_light_track_enabled:
             pil = ImageEnhance.Brightness(pil).enhance(self.night_light_brightness)
@@ -81,11 +99,7 @@ class VehicleDetector:
         padded = Image.new("RGB", (self.infer_size, self.infer_size), (114, 114, 114))
         padded.paste(pil, (pad_left, pad_top))
 
-        # PIL → tensor via raw bytes — avoids torch.from_numpy() which requires
-        # identical numpy ABIs between torch's C extension and the system numpy.
-        # tobytes() returns a plain Python bytes object; frombuffer() on a
-        # bytearray uses Python's buffer protocol (no numpy involved at all).
-        raw = padded.tobytes()  # RGB bytes
+        raw = padded.tobytes()
         tensor = (
             torch.frombuffer(bytearray(raw), dtype=torch.uint8)
             .reshape(self.infer_size, self.infer_size, 3)
@@ -94,8 +108,8 @@ class VehicleDetector:
             .permute(2, 0, 1)
             .unsqueeze(0)
         )
+        tensor = tensor.to(self.device, non_blocking=self.device.startswith("cuda"))
 
-        # Tensor source → ultralytics uses LoadTensor, skips LetterBox/cv2 entirely
         results = self.model.predict(
             source=tensor,
             conf=self.conf,
@@ -103,20 +117,18 @@ class VehicleDetector:
             max_det=self.max_det,
             classes=VEHICLE_CLASSES,
             verbose=False,
+            device=self.device,
         )[0]
 
-        # from_ultralytics() passes torch-internal numpy arrays which fail
-        # supervision's isinstance(xyxy, np.ndarray) check (ABI mismatch).
-        # Bridge each array through np.array() to re-allocate in system numpy.
         boxes = results.boxes
         if boxes is not None and len(boxes):
-            xyxy      = np.array(boxes.xyxy.cpu().numpy(),      dtype=np.float32)
-            confidence = np.array(boxes.conf.cpu().numpy(),     dtype=np.float32)
-            class_id  = np.array(boxes.cls.cpu().numpy(),       dtype=np.int32)
+            xyxy = np.array(boxes.xyxy.cpu().numpy(), dtype=np.float32)
+            confidence = np.array(boxes.conf.cpu().numpy(), dtype=np.float32)
+            class_id = np.array(boxes.cls.cpu().numpy(), dtype=np.int32)
         else:
-            xyxy       = np.empty((0, 4), dtype=np.float32)
-            confidence = np.empty((0,),   dtype=np.float32)
-            class_id   = np.empty((0,),   dtype=np.int32)
+            xyxy = np.empty((0, 4), dtype=np.float32)
+            confidence = np.empty((0,), dtype=np.float32)
+            class_id = np.empty((0,), dtype=np.int32)
 
         detections = sv.Detections(
             xyxy=xyxy,
@@ -124,7 +136,6 @@ class VehicleDetector:
             class_id=class_id,
         )
 
-        # Un-letterbox: predictions are in 640×640 padded tensor space
         if len(detections) > 0:
             detections.xyxy[:, [0, 2]] -= pad_left
             detections.xyxy[:, [1, 3]] -= pad_top
@@ -137,3 +148,10 @@ class VehicleDetector:
     @staticmethod
     def class_name(class_id: int) -> str:
         return CLASS_NAMES.get(class_id, "unknown")
+
+    def runtime_info(self) -> dict:
+        return {
+            "device": self.device,
+            "cuda_available": self.cuda_available,
+            "device_name": self.device_name,
+        }

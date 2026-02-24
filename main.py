@@ -71,6 +71,7 @@ _WATCHDOG_INTERVAL_SEC = 8.0
 _WATCHDOG_RESTART_COOLDOWN_SEC = 12.0
 _WATCHDOG_STARTUP_WAIT_SEC = 30
 _AI_HEARTBEAT_STALE_SEC = 35.0
+_MARKET_EARLY_RESOLVE_GRACE_SEC = 6
 _watchdog_restart_counts: dict[str, int] = {
     "refresh": 0,
     "ai": 0,
@@ -104,6 +105,11 @@ _ai_runtime_state: dict[str, Any] = {
     "fps_window_start_monotonic": 0.0,
     "fps_window_frames": 0,
     "fps_estimate": 0.0,
+}
+_ai_inference_runtime: dict[str, Any] = {
+    "device": "unknown",
+    "cuda_available": None,
+    "device_name": None,
 }
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
@@ -569,7 +575,7 @@ async def round_monitor_loop() -> None:
             resp = await sb.table("bet_rounds") \
                 .select("id, status, market_type, opens_at, closes_at, ends_at") \
                 .eq("status", "open") \
-                .order("opens_at", ascending=False) \
+                .order("opens_at", desc=True) \
                 .limit(1) \
                 .execute()
 
@@ -728,6 +734,7 @@ async def bet_resolver_loop() -> None:
                     # Broadcast resolution to user
                     await manager.send_to_user(user_id, {
                         "type": "bet_resolved",
+                        "user_id": str(user_id),
                         "bet_id": str(bet_id),
                         "won": won,
                         "payout": bet["potential_payout"] if won else 0,
@@ -841,6 +848,15 @@ async def bet_resolver_loop() -> None:
                             continue
 
                         baseline = int(bet.get("baseline_count") or 0)
+                        if bet.get("placed_at"):
+                            try:
+                                placed_at = datetime.fromisoformat(str(bet.get("placed_at")).replace("Z", "+00:00"))
+                                if (datetime.now(timezone.utc) - placed_at).total_seconds() < _MARKET_EARLY_RESOLVE_GRACE_SEC:
+                                    # Guard against instant settlement right after placement when snapshots lag.
+                                    continue
+                            except Exception:
+                                pass
+
                         if rnd.get("camera_id") and bet.get("placed_at"):
                             try:
                                 snap_before_bet = await (
@@ -852,8 +868,26 @@ async def bet_resolver_loop() -> None:
                                     .limit(1)
                                     .execute()
                                 )
+                                snap_after_bet = await (
+                                    sb.table("count_snapshots")
+                                    .select("total, vehicle_breakdown")
+                                    .eq("camera_id", rnd["camera_id"])
+                                    .gte("captured_at", bet.get("placed_at"))
+                                    .order("captured_at", desc=False)
+                                    .limit(1)
+                                    .execute()
+                                )
                                 if snap_before_bet.data:
                                     snap = snap_before_bet.data[0]
+                                    if vehicle_class is None:
+                                        baseline = max(baseline, int(snap.get("total", 0) or 0))
+                                    else:
+                                        baseline = max(
+                                            baseline,
+                                            int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0),
+                                        )
+                                if snap_after_bet.data:
+                                    snap = snap_after_bet.data[0]
                                     if vehicle_class is None:
                                         baseline = max(baseline, int(snap.get("total", 0) or 0))
                                     else:
@@ -887,6 +921,7 @@ async def bet_resolver_loop() -> None:
 
                         await manager.send_to_user(bet["user_id"], {
                             "type": "bet_resolved",
+                            "user_id": str(bet["user_id"]),
                             "bet_id": str(bet["id"]),
                             "won": won,
                             "payout": bet["potential_payout"] if won else 0,
@@ -978,14 +1013,35 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         iou_threshold=cfg.DETECT_IOU,
         max_det=cfg.DETECT_MAX_DET,
     )
+    _ai_inference_runtime.update(detector.runtime_info())
+    logger.info("AI inference runtime: %s", _ai_inference_runtime)
     profile_is_night: bool | None = None
     logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
 
     logger.info("AI loop inner: querying camera_id")
     sb = await get_supabase()
-    cam_resp = await sb.table("cameras").select("id").eq("ipcam_alias", cfg.CAMERA_ALIAS).limit(1).execute()
-    camera_id = cam_resp.data[0]["id"] if cam_resp.data else "default"
+    cam_resp = await (
+        sb.table("cameras")
+        .select("id")
+        .eq("ipcam_alias", cfg.CAMERA_ALIAS)
+        .limit(1)
+        .execute()
+    )
+    if cam_resp.data:
+        camera_id = cam_resp.data[0]["id"]
+    else:
+        # Alias may be unset/mismatched during deploys; fall back to an active camera
+        # so persisted global counts can still be restored from snapshots.
+        fallback_resp = await (
+            sb.table("cameras")
+            .select("id")
+            .eq("is_active", True)
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        camera_id = fallback_resp.data[0]["id"] if fallback_resp.data else "default"
     logger.info("AI loop using camera_id: %s", camera_id)
 
     logger.info("AI loop inner: opening HLS stream")
@@ -1376,7 +1432,7 @@ async def health():
                 sb.table("bet_rounds")
                 .select("id, status, opens_at")
                 .eq("status", "open")
-                .order("opens_at", ascending=False)
+                .order("opens_at", desc=True)
                 .limit(1)
                 .maybeSingle()
                 .execute()
@@ -1388,7 +1444,7 @@ async def health():
                     sb.table("bet_rounds")
                     .select("id, status, closes_at")
                     .eq("status", "locked")
-                    .order("closes_at", ascending=False)
+                    .order("closes_at", desc=True)
                     .limit(1)
                     .maybeSingle()
                     .execute()
@@ -1404,7 +1460,7 @@ async def health():
             .select("opens_at")
             .eq("status", "upcoming")
             .gte("opens_at", now_iso)
-            .order("opens_at", ascending=True)
+            .order("opens_at", desc=False)
             .limit(1)
             .maybeSingle()
             .execute()
@@ -1420,7 +1476,18 @@ async def health():
             .limit(1)
             .execute()
         )
-        camera_id = cam_resp.data[0]["id"] if cam_resp.data else None
+        if cam_resp.data:
+            camera_id = cam_resp.data[0]["id"]
+        else:
+            fallback_resp = await (
+                sb.table("cameras")
+                .select("id")
+                .eq("is_active", True)
+                .order("created_at", desc=False)
+                .limit(1)
+                .execute()
+            )
+            camera_id = fallback_resp.data[0]["id"] if fallback_resp.data else None
         if camera_id:
             snap_resp = await (
                 sb.table("count_snapshots")
@@ -1501,6 +1568,7 @@ async def health():
         "ai_fps_estimate": float(_ai_runtime_state.get("fps_estimate", 0.0) or 0.0),
         "ai_heartbeat_stale": ai_heartbeat_stale,
         "ai_last_error": _ai_runtime_state.get("last_error"),
+        "ai_inference": _ai_inference_runtime,
         "active_round_id": active_round_id,
         "active_round_status": active_round_status,
         "next_round_at": next_round_at,

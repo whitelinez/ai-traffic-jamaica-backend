@@ -68,6 +68,26 @@ def _build_stream_url(details: dict) -> str | None:
     return f"{address}/streams/{streamid}/stream.m3u8"
 
 
+async def _validate_manifest(client: httpx.AsyncClient, url: str) -> bool:
+    """
+    Validate manifest is actually reachable before persisting to DB.
+    This avoids storing short-lived/bad stream IDs that return 404 immediately.
+    """
+    try:
+        resp = await client.get(url, headers=_REQUEST_HEADERS, follow_redirects=True)
+    except Exception as exc:
+        logger.warning("Manifest validation failed (network): %s", exc)
+        return False
+    if resp.status_code != 200:
+        logger.warning("Manifest validation failed status=%s url=%s", resp.status_code, url)
+        return False
+    text = (resp.text or "").strip()
+    if "#EXTM3U" not in text:
+        logger.warning("Manifest validation failed: missing #EXTM3U header")
+        return False
+    return True
+
+
 async def fetch_fresh_stream_url(alias: str) -> str | None:
     """
     Execute the two-step ipcamlive API flow and return a fresh HLS URL.
@@ -120,9 +140,11 @@ async def fetch_fresh_stream_url(alias: str) -> str | None:
         details = state_data.get("details", {})
         url = _build_stream_url(details)
 
-        if url:
+        if url and await _validate_manifest(client, url):
             logger.info("Fresh stream URL: %s", url)
-        return url
+            return url
+        logger.warning("Discarding invalid fresh stream URL for alias=%s", alias)
+        return None
 
 
 async def _supabase_update_stream_url(alias: str, url: str) -> bool:

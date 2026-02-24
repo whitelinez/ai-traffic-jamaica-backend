@@ -69,15 +69,23 @@ class ConnectionManager:
 
     async def broadcast_public(self, data: dict[str, Any]) -> None:
         """Send JSON data to all public subscribers."""
-        dead: list[WebSocket] = []
         payload = json.dumps(data)
-        for ws in list(self._public):
+        targets = list(self._public)
+        if not targets:
+            return
+
+        async def _safe_send(ws: WebSocket) -> tuple[WebSocket, bool]:
             try:
-                await ws.send_text(payload)
+                # Prevent one slow socket from stalling the whole broadcast.
+                await asyncio.wait_for(ws.send_text(payload), timeout=0.75)
+                return ws, True
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._public.discard(ws)
+                return ws, False
+
+        results = await asyncio.gather(*(_safe_send(ws) for ws in targets), return_exceptions=False)
+        for ws, ok in results:
+            if not ok:
+                self._public.discard(ws)
 
     # ── User channel ───────────────────────────────────────────────────────
 
@@ -109,15 +117,22 @@ class ConnectionManager:
     async def send_to_user(self, user_id: str, data: dict[str, Any]) -> None:
         """Send JSON data to a specific user's connections."""
         sockets = self._user_connections.get(user_id, set())
-        dead: list[WebSocket] = []
         payload = json.dumps(data)
-        for ws in list(sockets):
+        targets = list(sockets)
+        if not targets:
+            return
+
+        async def _safe_send(ws: WebSocket) -> tuple[WebSocket, bool]:
             try:
-                await ws.send_text(payload)
+                await asyncio.wait_for(ws.send_text(payload), timeout=0.75)
+                return ws, True
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._user_connections[user_id].discard(ws)
+                return ws, False
+
+        results = await asyncio.gather(*(_safe_send(ws) for ws in targets), return_exceptions=False)
+        for ws, ok in results:
+            if not ok:
+                self._user_connections[user_id].discard(ws)
 
     @property
     def public_count(self) -> int:

@@ -56,7 +56,18 @@ async def _send_bootstrap_count(websocket: WebSocket, camera_alias: str) -> None
             .limit(1)
             .execute()
         )
-        camera_id = cam_resp.data[0]["id"] if cam_resp.data else None
+        if cam_resp.data:
+            camera_id = cam_resp.data[0]["id"]
+        else:
+            fallback_resp = await (
+                sb.table("cameras")
+                .select("id")
+                .eq("is_active", True)
+                .order("created_at", desc=False)
+                .limit(1)
+                .execute()
+            )
+            camera_id = fallback_resp.data[0]["id"] if fallback_resp.data else None
         if not camera_id:
             return
 
