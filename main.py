@@ -70,6 +70,7 @@ _watchdog_task: asyncio.Task | None = None
 _WATCHDOG_INTERVAL_SEC = 8.0
 _WATCHDOG_RESTART_COOLDOWN_SEC = 12.0
 _WATCHDOG_STARTUP_WAIT_SEC = 30
+_AI_HEARTBEAT_STALE_SEC = 35.0
 _watchdog_restart_counts: dict[str, int] = {
     "refresh": 0,
     "ai": 0,
@@ -90,6 +91,19 @@ _watchdog_last_restart_monotonic: dict[str, float] = {
     "round": 0.0,
     "resolver": 0.0,
     "ml_retrain": 0.0,
+}
+_ai_runtime_state: dict[str, Any] = {
+    "started_at": None,
+    "started_monotonic": 0.0,
+    "last_frame_at": None,
+    "last_frame_monotonic": 0.0,
+    "frames_total": 0,
+    "last_db_write_at": None,
+    "last_db_write_monotonic": 0.0,
+    "last_error": None,
+    "fps_window_start_monotonic": 0.0,
+    "fps_window_frames": 0,
+    "fps_estimate": 0.0,
 }
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
@@ -331,6 +345,48 @@ def _mark_restart(task_name: str, reason: str) -> None:
     logger.warning("Watchdog restarted %s task (reason=%s)", task_name, reason)
 
 
+def _reset_ai_runtime_state(reason: str | None = None) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    now_mono = asyncio.get_running_loop().time()
+    _ai_runtime_state["started_at"] = now_iso
+    _ai_runtime_state["started_monotonic"] = now_mono
+    _ai_runtime_state["last_frame_at"] = None
+    _ai_runtime_state["last_frame_monotonic"] = 0.0
+    _ai_runtime_state["frames_total"] = 0
+    _ai_runtime_state["last_db_write_at"] = None
+    _ai_runtime_state["last_db_write_monotonic"] = 0.0
+    _ai_runtime_state["last_error"] = reason
+    _ai_runtime_state["fps_window_start_monotonic"] = now_mono
+    _ai_runtime_state["fps_window_frames"] = 0
+    _ai_runtime_state["fps_estimate"] = 0.0
+
+
+def _mark_ai_frame_processed() -> None:
+    now_mono = asyncio.get_running_loop().time()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _ai_runtime_state["last_frame_monotonic"] = now_mono
+    _ai_runtime_state["last_frame_at"] = now_iso
+    _ai_runtime_state["frames_total"] = int(_ai_runtime_state.get("frames_total", 0) or 0) + 1
+
+    win_start = float(_ai_runtime_state.get("fps_window_start_monotonic", 0.0) or 0.0)
+    if win_start <= 0.0:
+        _ai_runtime_state["fps_window_start_monotonic"] = now_mono
+        _ai_runtime_state["fps_window_frames"] = 1
+        return
+    win_frames = int(_ai_runtime_state.get("fps_window_frames", 0) or 0) + 1
+    _ai_runtime_state["fps_window_frames"] = win_frames
+    elapsed = now_mono - win_start
+    if elapsed >= 4.0:
+        _ai_runtime_state["fps_estimate"] = round(win_frames / max(elapsed, 0.001), 2)
+        _ai_runtime_state["fps_window_start_monotonic"] = now_mono
+        _ai_runtime_state["fps_window_frames"] = 0
+
+
+def _mark_ai_db_write() -> None:
+    _ai_runtime_state["last_db_write_monotonic"] = asyncio.get_running_loop().time()
+    _ai_runtime_state["last_db_write_at"] = datetime.now(timezone.utc).isoformat()
+
+
 async def _wait_for_stream_url(timeout_sec: int) -> str | None:
     for _ in range(max(1, int(timeout_sec))):
         stream_url = get_current_url()
@@ -347,8 +403,10 @@ async def _ensure_ai_task(cfg, timeout_sec: int = 6, reason: str = "watchdog") -
     stream_url = await _wait_for_stream_url(timeout_sec)
     if not stream_url:
         logger.error("AI loop restart skipped (%s): stream URL unavailable", reason)
+        _ai_runtime_state["last_error"] = f"stream_unavailable:{reason}"
         return False
     hls_stream = HLSStream(stream_url)
+    _reset_ai_runtime_state(reason=f"start:{reason}")
     _ai_task = asyncio.create_task(ai_loop(cfg, hls_stream), name="ai_loop")
     logger.info("AI loop started (%s) with URL: %s", reason, stream_url)
     return True
@@ -367,8 +425,30 @@ async def health_watchdog_loop(cfg) -> None:
                 )
                 _mark_restart("refresh", reason)
 
-            if not _task_running(_ai_task) and _can_restart("ai", loop_now):
-                reason = _task_failure(_ai_task) or "not_running"
+            ai_running = _task_running(_ai_task)
+            ai_restart_reason: str | None = None
+            if ai_running:
+                last_frame_mono = float(_ai_runtime_state.get("last_frame_monotonic", 0.0) or 0.0)
+                started_mono = float(_ai_runtime_state.get("started_monotonic", 0.0) or 0.0)
+                since_start = loop_now - started_mono if started_mono > 0 else 0.0
+                since_frame = loop_now - last_frame_mono if last_frame_mono > 0 else None
+                if (
+                    since_start > _AI_HEARTBEAT_STALE_SEC
+                    and (since_frame is None or since_frame > _AI_HEARTBEAT_STALE_SEC)
+                    and _can_restart("ai", loop_now)
+                ):
+                    ai_restart_reason = f"stale_heartbeat:{round(since_start, 1)}s"
+                    _ai_runtime_state["last_error"] = ai_restart_reason
+                    if _ai_task and not _ai_task.done():
+                        _ai_task.cancel()
+                        try:
+                            await _ai_task
+                        except asyncio.CancelledError:
+                            pass
+                    ai_running = False
+
+            if not ai_running and _can_restart("ai", loop_now):
+                reason = ai_restart_reason or _task_failure(_ai_task) or "not_running"
                 started = await _ensure_ai_task(cfg, timeout_sec=6, reason="watchdog")
                 if started:
                     _mark_restart("ai", reason)
@@ -831,6 +911,7 @@ async def ai_loop(cfg, hls_stream: HLSStream) -> None:
     try:
         await _ai_loop_inner(cfg, hls_stream)
     except Exception as exc:
+        _ai_runtime_state["last_error"] = str(exc)
         logger.error("AI loop crashed: %s", exc, exc_info=True)
         raise
 
@@ -978,6 +1059,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
     async for frame in hls_stream.frames():
         frame_index += 1
+        _mark_ai_frame_processed()
         now_is_night = _is_night_hour()
         if profile_is_night is None or now_is_night != profile_is_night:
             detector.set_night_mode(now_is_night)
@@ -1169,6 +1251,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             asyncio.create_task(write_snapshot(db_snapshot))
             asyncio.create_task(write_ml_detection_event(camera_id, snapshot, cfg.YOLO_MODEL, detector.conf))
             last_db_write = loop_now
+            _mark_ai_db_write()
 
         if manager.public_count > 0:
             payload: dict = {"type": "count", **snapshot}
@@ -1384,6 +1467,15 @@ async def health():
         "latest": weather_payload,
     }
 
+    now_mono = asyncio.get_running_loop().time()
+    ai_last_frame_mono = float(_ai_runtime_state.get("last_frame_monotonic", 0.0) or 0.0)
+    ai_last_db_mono = float(_ai_runtime_state.get("last_db_write_monotonic", 0.0) or 0.0)
+    ai_last_frame_age = (now_mono - ai_last_frame_mono) if ai_last_frame_mono > 0 else None
+    ai_last_db_age = (now_mono - ai_last_db_mono) if ai_last_db_mono > 0 else None
+    ai_heartbeat_stale = bool(
+        ai_last_frame_age is not None and ai_last_frame_age > _AI_HEARTBEAT_STALE_SEC
+    )
+
     return {
         "status": "ok",
         "stream_configured": bool(get_current_url()),
@@ -1401,6 +1493,14 @@ async def health():
         "watchdog_task_running": _watchdog_task is not None and not _watchdog_task.done(),
         "watchdog_restart_counts": _watchdog_restart_counts,
         "watchdog_last_restart_at": _watchdog_last_restart_iso,
+        "ai_last_frame_at": _ai_runtime_state.get("last_frame_at"),
+        "ai_last_frame_age_sec": round(ai_last_frame_age, 2) if ai_last_frame_age is not None else None,
+        "ai_last_db_write_at": _ai_runtime_state.get("last_db_write_at"),
+        "ai_last_db_write_age_sec": round(ai_last_db_age, 2) if ai_last_db_age is not None else None,
+        "ai_frames_total": int(_ai_runtime_state.get("frames_total", 0) or 0),
+        "ai_fps_estimate": float(_ai_runtime_state.get("fps_estimate", 0.0) or 0.0),
+        "ai_heartbeat_stale": ai_heartbeat_stale,
+        "ai_last_error": _ai_runtime_state.get("last_error"),
         "active_round_id": active_round_id,
         "active_round_status": active_round_status,
         "next_round_at": next_round_at,
