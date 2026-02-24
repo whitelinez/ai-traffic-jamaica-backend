@@ -585,6 +585,16 @@ class LineCounter:
                 conf = None
                 if detections.confidence is not None and i < len(detections.confidence):
                     conf = round(float(detections.confidence[i]), 4)
+                tracker_id = None
+                try:
+                    if (
+                        getattr(detections, "tracker_id", None) is not None
+                        and i < len(detections.tracker_id)
+                    ):
+                        raw_tid = int(detections.tracker_id[i])
+                        tracker_id = raw_tid if raw_tid >= 0 else None
+                except Exception:
+                    tracker_id = None
                 boxes.append({
                     "x1": round(float(x1) / self.frame_width, 4),
                     "y1": round(float(y1) / self.frame_height, 4),
@@ -592,6 +602,7 @@ class LineCounter:
                     "y2": round(float(y2) / self.frame_height, 4),
                     "cls": CLASS_NAMES[cls_id],
                     "conf": conf,
+                    "tracker_id": tracker_id,
                     "in_detect_zone": bool(detect_inside_mask[i]) if i < len(detect_inside_mask) else True,
                 })
 
