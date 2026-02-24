@@ -29,6 +29,9 @@ class VehicleDetector:
         device: str | None = None,
     ):
         requested_device = str(device or os.getenv("YOLO_DEVICE", "auto")).strip().lower()
+        requested_device = requested_device.replace(" ", "")
+        if requested_device in {"cuda(line0)", "cuda(line0).", "cudaline0", "cuda0"}:
+            requested_device = "cuda:0"
         cuda_available = bool(torch.cuda.is_available())
         selected_device = "cpu"
         if requested_device in {"auto", "cuda", "gpu", "0", "cuda:0"}:
@@ -66,7 +69,17 @@ class VehicleDetector:
         )
 
         self.model = YOLO(model_path)
-        self.model.to(self.device)
+        try:
+            self.model.to(self.device)
+        except Exception as exc:
+            logger.warning(
+                "Failed to move YOLO model to '%s' (%s). Falling back to CPU.",
+                self.device,
+                exc,
+            )
+            self.device = "cpu"
+            self.device_name = None
+            self.model.to("cpu")
         self.conf = conf_threshold
         self.infer_size = int(infer_size or int(os.getenv("DETECT_INFER_SIZE", "448")))
         self.iou = float(iou_threshold if iou_threshold is not None else float(os.getenv("DETECT_IOU", "0.50")))
@@ -110,15 +123,38 @@ class VehicleDetector:
         )
         tensor = tensor.to(self.device, non_blocking=self.device.startswith("cuda"))
 
-        results = self.model.predict(
-            source=tensor,
-            conf=self.conf,
-            iou=self.iou,
-            max_det=self.max_det,
-            classes=VEHICLE_CLASSES,
-            verbose=False,
-            device=self.device,
-        )[0]
+        try:
+            results = self.model.predict(
+                source=tensor,
+                conf=self.conf,
+                iou=self.iou,
+                max_det=self.max_det,
+                classes=VEHICLE_CLASSES,
+                verbose=False,
+                device=self.device,
+            )[0]
+        except Exception as exc:
+            if self.device != "cpu":
+                logger.warning(
+                    "YOLO predict failed on device '%s' (%s). Retrying on CPU.",
+                    self.device,
+                    exc,
+                )
+                self.device = "cpu"
+                self.device_name = None
+                tensor = tensor.to("cpu")
+                self.model.to("cpu")
+                results = self.model.predict(
+                    source=tensor,
+                    conf=self.conf,
+                    iou=self.iou,
+                    max_det=self.max_det,
+                    classes=VEHICLE_CLASSES,
+                    verbose=False,
+                    device="cpu",
+                )[0]
+            else:
+                raise
 
         boxes = results.boxes
         if boxes is not None and len(boxes):
