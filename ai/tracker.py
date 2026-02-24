@@ -1,6 +1,6 @@
 """
-ai/tracker.py - Supervision ByteTrack wrapper.
-Assigns persistent track IDs to detections across frames.
+ai/tracker.py - Vehicle tracker wrapper.
+Default backend is BoT-SORT IDs from detector.track(); ByteTrack remains fallback.
 """
 import time
 
@@ -13,16 +13,19 @@ from config import get_config
 class VehicleTracker:
     def __init__(self):
         cfg = get_config()
+        self.backend = str(getattr(cfg, "TRACKER_BACKEND", "botsort") or "botsort").strip().lower()
         self._track_activation_threshold = cfg.TRACK_ACTIVATION_THRESHOLD
         self._track_match_threshold = cfg.TRACK_MATCH_THRESHOLD
         self._track_frame_rate = cfg.TRACK_FRAME_RATE
         self._lost_track_buffer = int(cfg.TRACK_LOST_BUFFER)
-        self.tracker = sv.ByteTrack(
-            track_activation_threshold=self._track_activation_threshold,
-            lost_track_buffer=self._lost_track_buffer,   # keep IDs stable through brief occlusions/frame drops
-            minimum_matching_threshold=self._track_match_threshold,
-            frame_rate=self._track_frame_rate,
-        )
+        self.tracker = None
+        if self.backend != "botsort":
+            self.tracker = sv.ByteTrack(
+                track_activation_threshold=self._track_activation_threshold,
+                lost_track_buffer=self._lost_track_buffer,   # keep IDs stable through brief occlusions/frame drops
+                minimum_matching_threshold=self._track_match_threshold,
+                frame_rate=self._track_frame_rate,
+            )
         self.fallback_enabled = int(getattr(cfg, "TRACK_FALLBACK_ENABLED", 1) or 0) == 1
         self.fallback_dist_ratio_day = float(
             getattr(cfg, "TRACK_FALLBACK_MAX_CENTER_DIST_RATIO", 0.08) or 0.08
@@ -34,6 +37,8 @@ class VehicleTracker:
         self._tracks: dict[int, tuple[float, float, float]] = {}
 
     def _rebuild_tracker(self, lost_buffer: int) -> None:
+        if self.backend == "botsort":
+            return
         self._lost_track_buffer = int(max(1, lost_buffer))
         self.tracker = sv.ByteTrack(
             track_activation_threshold=self._track_activation_threshold,
@@ -156,7 +161,10 @@ class VehicleTracker:
 
     def update(self, detections: sv.Detections) -> sv.Detections:
         """Update tracker and return detections with track IDs."""
-        tracked = self.tracker.update_with_detections(detections)
+        if self.backend == "botsort":
+            tracked = detections
+        else:
+            tracked = self.tracker.update_with_detections(detections)
         if not self.fallback_enabled:
             return tracked
         return self._assign_fallback_ids(tracked)

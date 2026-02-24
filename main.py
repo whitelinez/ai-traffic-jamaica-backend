@@ -40,6 +40,7 @@ from ai.counter import LineCounter, write_snapshot
 from ai.dataset_capture import LiveDatasetCapture
 from ai.dataset_upload import SupabaseDatasetUploader
 from ai.url_refresher import url_refresh_loop, get_current_url, get_current_alias
+from ai.box_smoother import BoxSmoother
 from services.round_service import resolve_round_from_latest_snapshot
 from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
@@ -105,6 +106,16 @@ _ai_runtime_state: dict[str, Any] = {
     "fps_window_start_monotonic": 0.0,
     "fps_window_frames": 0,
     "fps_estimate": 0.0,
+    "inference_fps_estimate": 0.0,
+    "inference_window_start_monotonic": 0.0,
+    "inference_window_frames": 0,
+    "queue_depth_estimate": 0,
+    "dropped_frames_total": 0,
+    "last_inference_ms": 0.0,
+    "avg_inference_ms": 0.0,
+    "stream_diagnostics": {},
+    "tracker_active_tracks": 0,
+    "id_switch_estimate": 0,
 }
 _ai_inference_runtime: dict[str, Any] = {
     "device": "unknown",
@@ -365,6 +376,16 @@ def _reset_ai_runtime_state(reason: str | None = None) -> None:
     _ai_runtime_state["fps_window_start_monotonic"] = now_mono
     _ai_runtime_state["fps_window_frames"] = 0
     _ai_runtime_state["fps_estimate"] = 0.0
+    _ai_runtime_state["inference_fps_estimate"] = 0.0
+    _ai_runtime_state["inference_window_start_monotonic"] = now_mono
+    _ai_runtime_state["inference_window_frames"] = 0
+    _ai_runtime_state["queue_depth_estimate"] = 0
+    _ai_runtime_state["dropped_frames_total"] = 0
+    _ai_runtime_state["last_inference_ms"] = 0.0
+    _ai_runtime_state["avg_inference_ms"] = 0.0
+    _ai_runtime_state["stream_diagnostics"] = {}
+    _ai_runtime_state["tracker_active_tracks"] = 0
+    _ai_runtime_state["id_switch_estimate"] = 0
 
 
 def _mark_ai_frame_processed() -> None:
@@ -391,6 +412,30 @@ def _mark_ai_frame_processed() -> None:
 def _mark_ai_db_write() -> None:
     _ai_runtime_state["last_db_write_monotonic"] = asyncio.get_running_loop().time()
     _ai_runtime_state["last_db_write_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _mark_ai_inference(infer_ms: float) -> None:
+    now_mono = asyncio.get_running_loop().time()
+    ms = max(0.0, float(infer_ms or 0.0))
+    _ai_runtime_state["last_inference_ms"] = round(ms, 2)
+    prev = float(_ai_runtime_state.get("avg_inference_ms", 0.0) or 0.0)
+    if prev <= 0:
+        _ai_runtime_state["avg_inference_ms"] = round(ms, 2)
+    else:
+        _ai_runtime_state["avg_inference_ms"] = round((prev * 0.85) + (ms * 0.15), 2)
+
+    win_start = float(_ai_runtime_state.get("inference_window_start_monotonic", 0.0) or 0.0)
+    if win_start <= 0.0:
+        _ai_runtime_state["inference_window_start_monotonic"] = now_mono
+        _ai_runtime_state["inference_window_frames"] = 1
+        return
+    win_frames = int(_ai_runtime_state.get("inference_window_frames", 0) or 0) + 1
+    _ai_runtime_state["inference_window_frames"] = win_frames
+    elapsed = now_mono - win_start
+    if elapsed >= 4.0:
+        _ai_runtime_state["inference_fps_estimate"] = round(win_frames / max(elapsed, 0.001), 2)
+        _ai_runtime_state["inference_window_start_monotonic"] = now_mono
+        _ai_runtime_state["inference_window_frames"] = 0
 
 
 async def _wait_for_stream_url(timeout_sec: int) -> str | None:
@@ -901,6 +946,12 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     last_scene_eval = 0.0
     weather_status: dict[str, Any] | None = None
     last_weather_eval = 0.0
+    next_infer_due_mono = 0.0
+    perf_last_eval = 0.0
+    perf_warn_last = 0.0
+    prev_tracks_for_switch: list[dict[str, Any]] = []
+    id_switch_estimate = 0
+    box_smoother = BoxSmoother(alpha=0.70, max_jump_ratio=0.20, ttl_sec=3.0)
     capture = LiveDatasetCapture(
         enabled=(cfg.AUTO_CAPTURE_ENABLED == 1),
         dataset_root=cfg.AUTO_CAPTURE_DATASET_ROOT,
@@ -953,6 +1004,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     async for frame in hls_stream.frames():
         frame_index += 1
         _mark_ai_frame_processed()
+        _ai_runtime_state["stream_diagnostics"] = hls_stream.diagnostics_report()
 
         latest_alias = get_current_alias() or cfg.CAMERA_ALIAS
         if latest_alias != camera_alias:
@@ -962,6 +1014,9 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             logger.info("AI camera switched alias %s -> %s (camera_id=%s)", old_alias, camera_alias, camera_id)
             counter = None
             _counter_ref = None
+            frame_buf = None      # BUGFIX: must reset so counter reinitialises on next frame
+            box_smoother.reset()  # clear stale smoothing state for previous camera
+            process_every_n = 1   # BUGFIX: reset frame-skip so old camera's perf state doesn't carry over
             try:
                 runtime_profile_name = ""
                 last_runtime_eval = 0.0
@@ -990,6 +1045,27 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             logger.info("AI loop started: frame size %dx%d", w, h)
 
         loop_now = asyncio.get_running_loop().time()
+        frame_interval_sec = hls_stream.get_frame_interval_sec(default_fps=15.0)
+        if next_infer_due_mono <= 0.0:
+            next_infer_due_mono = loop_now
+
+        # Keep real-time sync: if we're significantly behind, drop frame work and re-align.
+        lag_sec = loop_now - next_infer_due_mono
+        queue_depth_est = int(max(0.0, lag_sec) / max(frame_interval_sec, 0.0001))
+        _ai_runtime_state["queue_depth_estimate"] = max(0, queue_depth_est)
+        if lag_sec > (frame_interval_sec * 2.0):
+            _ai_runtime_state["dropped_frames_total"] = int(_ai_runtime_state.get("dropped_frames_total", 0) or 0) + 1
+            next_infer_due_mono = loop_now
+            if (loop_now - perf_warn_last) >= 5.0:
+                perf_warn_last = loop_now
+                logger.warning(
+                    "Latency rising, dropping frames to stay real-time (lag_ms=%.1f, queue_depth=%s)",
+                    lag_sec * 1000.0,
+                    queue_depth_est,
+                )
+            await asyncio.sleep(0)
+            continue
+
         runtime_interval_sec = 20.0
         runtime_cooldown_sec = 600.0
         controls: dict[str, object] = {}
@@ -1094,10 +1170,97 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             await asyncio.sleep(0)
             continue
 
-        detections = await asyncio.to_thread(detector.detect, frame)
-        # Keep full-frame detections for tracking/overlay visibility.
-        # Count logic still applies detect/count zones inside LineCounter.process().
-        tracked = tracker.update(detections)
+        infer_started = loop_now
+        if detector.tracker_backend == "botsort":
+            tracked = await asyncio.to_thread(detector.detect_track, frame)
+            tracked = tracker.update(tracked)
+        else:
+            detections = await asyncio.to_thread(detector.detect, frame)
+            # Keep full-frame detections for tracking/overlay visibility.
+            # Count logic still applies detect/count zones inside LineCounter.process().
+            tracked = tracker.update(detections)
+        infer_ms = (asyncio.get_running_loop().time() - infer_started) * 1000.0
+        _mark_ai_inference(infer_ms)
+
+        # Adaptive safety: if inference drifts above frame interval, lower load.
+        if (loop_now - perf_last_eval) >= 5.0:
+            perf_last_eval = loop_now
+            avg_infer_ms = float(_ai_runtime_state.get("avg_inference_ms", 0.0) or 0.0)
+            frame_ms = frame_interval_sec * 1000.0
+            if avg_infer_ms > (frame_ms * 0.95):
+                detector.infer_size = _bounded_int(int(detector.infer_size * 0.9), 320, 1280)
+                detector.max_det = _bounded_int(int(detector.max_det * 0.9), 20, 600)
+                process_every_n = _bounded_int(process_every_n + 1, 1, 4)
+                logger.warning(
+                    "Latency rising, dropping frames to stay real-time. avg_infer_ms=%.1f frame_ms=%.1f infer_size=%s max_det=%s process_every_n=%s",
+                    avg_infer_ms,
+                    frame_ms,
+                    detector.infer_size,
+                    detector.max_det,
+                    process_every_n,
+                )
+            elif avg_infer_ms > 0 and avg_infer_ms < (frame_ms * 0.55):
+                process_every_n = _bounded_int(process_every_n - 1, 1, 4)
+
+        # Schedule next inference target from feed cadence.
+        next_infer_due_mono = max(next_infer_due_mono + (frame_interval_sec * process_every_n), loop_now)
+
+        # Estimate active tracks + ID switch pressure for telemetry.
+        current_tracks: list[dict[str, Any]] = []
+        try:
+            tr_ids = getattr(tracked, "tracker_id", None)
+            xyxy = np.array(getattr(tracked, "xyxy", []) or [], dtype=np.float32)
+            cls_id = np.array(getattr(tracked, "class_id", []) or [], dtype=np.int32)
+            if tr_ids is not None and len(tr_ids) == len(xyxy):
+                active_ids = set()
+                for i in range(len(xyxy)):
+                    tid = int(tr_ids[i])
+                    if tid < 0:
+                        continue
+                    active_ids.add(tid)
+                    current_tracks.append({
+                        "id": tid,
+                        "cls": int(cls_id[i]) if i < len(cls_id) else -1,
+                        "xyxy": xyxy[i].tolist(),
+                    })
+                _ai_runtime_state["tracker_active_tracks"] = len(active_ids)
+            else:
+                _ai_runtime_state["tracker_active_tracks"] = 0
+        except Exception:
+            _ai_runtime_state["tracker_active_tracks"] = 0
+
+        try:
+            # Heuristic: IoU-overlapping boxes with changed IDs imply likely switch.
+            switches = 0
+            for cur in current_tracks:
+                cx1, cy1, cx2, cy2 = cur["xyxy"]
+                best_iou = 0.0
+                best_prev = None
+                for prev in prev_tracks_for_switch:
+                    if prev["cls"] != cur["cls"]:
+                        continue
+                    px1, py1, px2, py2 = prev["xyxy"]
+                    ix1, iy1 = max(cx1, px1), max(cy1, py1)
+                    ix2, iy2 = min(cx2, px2), min(cy2, py2)
+                    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+                    inter = iw * ih
+                    if inter <= 0:
+                        continue
+                    ca = max(0.0, (cx2 - cx1) * (cy2 - cy1))
+                    pa = max(0.0, (px2 - px1) * (py2 - py1))
+                    union = max(1e-6, ca + pa - inter)
+                    iou = inter / union
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_prev = prev
+                if best_prev and best_iou >= 0.45 and int(best_prev["id"]) != int(cur["id"]):
+                    switches += 1
+            id_switch_estimate += switches
+            _ai_runtime_state["id_switch_estimate"] = int(id_switch_estimate)
+            prev_tracks_for_switch = current_tracks[:80]
+        except Exception:
+            pass
+
         snapshot = await counter.process(frame, tracked)
         det_boxes = snapshot.get("detections") or []
         conf_vals = [float(d.get("conf")) for d in det_boxes if d.get("conf") is not None]
@@ -1164,12 +1327,32 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
         if manager.public_count > 0:
             payload: dict = {"type": "count", **snapshot}
+            # Apply EMA box smoothing to visual output only (DB snapshot is unaffected).
+            _ws_fps = float(
+                (_ai_runtime_state.get("stream_diagnostics") or {}).get("measured_fps") or 15.0
+            )
+            payload["detections"] = box_smoother.smooth_detections(
+                list(payload.get("detections") or []),
+                fps=max(1.0, _ws_fps),
+            )
             payload["runtime_profile"] = runtime_profile_name or None
             payload["runtime_profile_reason"] = runtime_profile_reason or None
             payload["scene_lighting"] = scene_status.get("scene_lighting")
             payload["scene_weather"] = scene_status.get("scene_weather")
             payload["scene_confidence"] = scene_status.get("scene_confidence")
             payload["scene_source"] = scene_status.get("scene_source") or "vision"
+            payload["ai_metrics"] = {
+                "measured_fps": float((_ai_runtime_state.get("stream_diagnostics") or {}).get("measured_fps") or 0.0),
+                "inference_fps": float(_ai_runtime_state.get("inference_fps_estimate", 0.0) or 0.0),
+                "queue_depth": int(_ai_runtime_state.get("queue_depth_estimate", 0) or 0),
+                "tracker_active_tracks": int(_ai_runtime_state.get("tracker_active_tracks", 0) or 0),
+                "avg_conf": (
+                    round(sum(conf_vals) / max(1, len(conf_vals)), 4) if conf_vals else 0.0
+                ),
+                "id_switch_count_est": int(_ai_runtime_state.get("id_switch_estimate", 0) or 0),
+                "latency_ms": float((_ai_runtime_state.get("stream_diagnostics") or {}).get("end_to_end_latency_estimate_ms") or 0.0),
+                "dropped_frames_total": int(_ai_runtime_state.get("dropped_frames_total", 0) or 0),
+            }
             if _active_round:
                 payload["round"] = _active_round
             await manager.broadcast_public(payload)
@@ -1395,6 +1578,20 @@ async def health():
     ai_heartbeat_stale = bool(
         ai_last_frame_age is not None and ai_last_frame_age > _AI_HEARTBEAT_STALE_SEC
     )
+    stream_diag = dict(_ai_runtime_state.get("stream_diagnostics") or {})
+    measured_fps = float(stream_diag.get("measured_fps") or 0.0)
+    e2e_latency = float(stream_diag.get("end_to_end_latency_estimate_ms") or 0.0)
+    trailing_root_cause_hint = None
+    if measured_fps > 0 and measured_fps < 12.0:
+        trailing_root_cause_hint = (
+            "Trailing may be feed latency, not tracker. "
+            "Low measured FPS detected; prefer RTSP/WebRTC/LL-HLS and lower player buffer."
+        )
+    elif e2e_latency > 1400:
+        trailing_root_cause_hint = (
+            "Trailing may be feed latency, not tracker. "
+            "High end-to-end latency estimated; prefer RTSP/WebRTC/LL-HLS and lower player buffer."
+        )
 
     return {
         "status": "ok",
@@ -1419,6 +1616,20 @@ async def health():
         "ai_last_db_write_age_sec": round(ai_last_db_age, 2) if ai_last_db_age is not None else None,
         "ai_frames_total": int(_ai_runtime_state.get("frames_total", 0) or 0),
         "ai_fps_estimate": float(_ai_runtime_state.get("fps_estimate", 0.0) or 0.0),
+        "ai_inference_fps_estimate": float(_ai_runtime_state.get("inference_fps_estimate", 0.0) or 0.0),
+        "ai_queue_depth_estimate": int(_ai_runtime_state.get("queue_depth_estimate", 0) or 0),
+        "ai_dropped_frames_total": int(_ai_runtime_state.get("dropped_frames_total", 0) or 0),
+        "ai_last_inference_ms": float(_ai_runtime_state.get("last_inference_ms", 0.0) or 0.0),
+        "ai_avg_inference_ms": float(_ai_runtime_state.get("avg_inference_ms", 0.0) or 0.0),
+        "ai_tracker_active_tracks": int(_ai_runtime_state.get("tracker_active_tracks", 0) or 0),
+        "ai_id_switch_count_estimate": int(_ai_runtime_state.get("id_switch_estimate", 0) or 0),
+        "stream_diagnostics": stream_diag,
+        "reported_fps": float(stream_diag.get("reported_fps") or 0.0),
+        "measured_fps": float(stream_diag.get("measured_fps") or 0.0),
+        "frame_interval_ms": float(stream_diag.get("frame_interval_ms") or 0.0),
+        "decode_latency_ms": float(stream_diag.get("decode_latency_ms") or 0.0),
+        "end_to_end_latency_estimate_ms": float(stream_diag.get("end_to_end_latency_estimate_ms") or 0.0),
+        "trailing_root_cause_hint": trailing_root_cause_hint,
         "ai_heartbeat_stale": ai_heartbeat_stale,
         "ai_last_error": _ai_runtime_state.get("last_error"),
         "ai_inference": _ai_inference_runtime,
