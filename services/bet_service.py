@@ -201,6 +201,18 @@ async def _get_snapshot_baseline_at_or_before(
         )
         if latest.data:
             return await _extract(latest.data[0])
+
+        # Final fallback when camera mapping is stale/missing snapshots.
+        # Prefer a non-zero anchor over inheriting a zero baseline.
+        any_latest = await (
+            sb.table("count_snapshots")
+            .select("total, vehicle_breakdown")
+            .order("captured_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if any_latest.data:
+            return await _extract(any_latest.data[0])
     except Exception:
         return 0
     return 0
