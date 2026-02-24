@@ -84,18 +84,16 @@ class VehicleDetector:
         self.infer_size = int(infer_size or int(os.getenv("DETECT_INFER_SIZE", "448")))
         self.iou = float(iou_threshold if iou_threshold is not None else float(os.getenv("DETECT_IOU", "0.50")))
         self.max_det = int(max_det or int(os.getenv("DETECT_MAX_DET", "80")))
-        self.tracker_backend = str(os.getenv("TRACKER_BACKEND", "botsort") or "botsort").strip().lower()
-        self.tracker_yaml = str(
-            os.getenv("YOLO_TRACKER_YAML", "trackers/botsort_traffic.yaml") or "trackers/botsort_traffic.yaml"
-        ).strip()
-        self._track_persist = True
         self.night_light_track_enabled = int(os.getenv("NIGHT_LIGHT_TRACK_ENABLED", "1")) == 1
         self.night_light_brightness = float(os.getenv("NIGHT_LIGHT_BRIGHTNESS", "1.18"))
         self.night_light_contrast = float(os.getenv("NIGHT_LIGHT_CONTRAST", "1.22"))
         self.night_light_sharpness = float(os.getenv("NIGHT_LIGHT_SHARPNESS", "1.10"))
         self._night_mode = False
 
-    def _preprocess_tensor(self, frame):
+    def set_night_mode(self, enabled: bool) -> None:
+        self._night_mode = bool(enabled)
+
+    def detect(self, frame) -> sv.Detections:
         h, w = frame.shape[:2]
         scale = min(self.infer_size / h, self.infer_size / w)
         new_w, new_h = int(w * scale), int(h * scale)
@@ -124,64 +122,6 @@ class VehicleDetector:
             .unsqueeze(0)
         )
         tensor = tensor.to(self.device, non_blocking=self.device.startswith("cuda"))
-        meta = {
-            "h": h,
-            "w": w,
-            "scale": scale,
-            "pad_top": pad_top,
-            "pad_left": pad_left,
-        }
-        return tensor, meta
-
-    @staticmethod
-    def _empty_detections() -> sv.Detections:
-        return sv.Detections(
-            xyxy=np.empty((0, 4), dtype=np.float32),
-            confidence=np.empty((0,), dtype=np.float32),
-            class_id=np.empty((0,), dtype=np.int32),
-        )
-
-    def _postprocess(self, results, meta, with_tracker_ids: bool = False) -> sv.Detections:
-        h = meta["h"]
-        w = meta["w"]
-        scale = meta["scale"]
-        pad_top = meta["pad_top"]
-        pad_left = meta["pad_left"]
-        boxes = results.boxes
-        if boxes is not None and len(boxes):
-            xyxy = np.array(boxes.xyxy.cpu().numpy(), dtype=np.float32)
-            confidence = np.array(boxes.conf.cpu().numpy(), dtype=np.float32)
-            class_id = np.array(boxes.cls.cpu().numpy(), dtype=np.int32)
-            detections = sv.Detections(
-                xyxy=xyxy,
-                confidence=confidence,
-                class_id=class_id,
-            )
-            if with_tracker_ids:
-                raw_ids = None
-                try:
-                    raw_ids = boxes.id
-                except Exception:
-                    raw_ids = None
-                if raw_ids is not None:
-                    ids = np.array(raw_ids.cpu().numpy(), dtype=np.int32)
-                    detections.tracker_id = ids
-        else:
-            detections = self._empty_detections()
-
-        if len(detections) > 0:
-            detections.xyxy[:, [0, 2]] -= pad_left
-            detections.xyxy[:, [1, 3]] -= pad_top
-            detections.xyxy /= scale
-            detections.xyxy[:, [0, 2]] = detections.xyxy[:, [0, 2]].clip(0, w)
-            detections.xyxy[:, [1, 3]] = detections.xyxy[:, [1, 3]].clip(0, h)
-        return detections
-
-    def set_night_mode(self, enabled: bool) -> None:
-        self._night_mode = bool(enabled)
-
-    def detect(self, frame) -> sv.Detections:
-        tensor, meta = self._preprocess_tensor(frame)
 
         try:
             results = self.model.predict(
@@ -215,30 +155,31 @@ class VehicleDetector:
                 )[0]
             else:
                 raise
-        return self._postprocess(results, meta, with_tracker_ids=False)
 
-    def detect_track(self, frame) -> sv.Detections:
-        """
-        Run detection + BoT-SORT tracking in one pass.
-        Falls back to plain detection if track call fails.
-        """
-        tensor, meta = self._preprocess_tensor(frame)
-        try:
-            tracked = self.model.track(
-                source=tensor,
-                conf=self.conf,
-                iou=self.iou,
-                max_det=self.max_det,
-                classes=VEHICLE_CLASSES,
-                verbose=False,
-                device=self.device,
-                tracker=self.tracker_yaml,
-                persist=self._track_persist,
-            )[0]
-            return self._postprocess(tracked, meta, with_tracker_ids=True)
-        except Exception as exc:
-            logger.warning("BoT-SORT track failed (%s). Falling back to detect().", exc)
-            return self.detect(frame)
+        boxes = results.boxes
+        if boxes is not None and len(boxes):
+            xyxy = np.array(boxes.xyxy.cpu().numpy(), dtype=np.float32)
+            confidence = np.array(boxes.conf.cpu().numpy(), dtype=np.float32)
+            class_id = np.array(boxes.cls.cpu().numpy(), dtype=np.int32)
+        else:
+            xyxy = np.empty((0, 4), dtype=np.float32)
+            confidence = np.empty((0,), dtype=np.float32)
+            class_id = np.empty((0,), dtype=np.int32)
+
+        detections = sv.Detections(
+            xyxy=xyxy,
+            confidence=confidence,
+            class_id=class_id,
+        )
+
+        if len(detections) > 0:
+            detections.xyxy[:, [0, 2]] -= pad_left
+            detections.xyxy[:, [1, 3]] -= pad_top
+            detections.xyxy /= scale
+            detections.xyxy[:, [0, 2]] = detections.xyxy[:, [0, 2]].clip(0, w)
+            detections.xyxy[:, [1, 3]] = detections.xyxy[:, [1, 3]].clip(0, h)
+
+        return detections
 
     @staticmethod
     def class_name(class_id: int) -> str:
@@ -249,6 +190,4 @@ class VehicleDetector:
             "device": self.device,
             "cuda_available": self.cuda_available,
             "device_name": self.device_name,
-            "tracker_backend": self.tracker_backend,
-            "tracker_yaml": self.tracker_yaml,
         }

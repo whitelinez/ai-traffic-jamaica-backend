@@ -42,8 +42,6 @@ class Config:
     TRACK_LOST_BUFFER: int
     TRACK_MATCH_THRESHOLD: float
     TRACK_FRAME_RATE: int
-    TRACKER_BACKEND: str
-    YOLO_TRACKER_YAML: str
     TRACK_FALLBACK_ENABLED: int
     TRACK_FALLBACK_MAX_CENTER_DIST_RATIO: float
     TRACK_FALLBACK_TTL_SEC: float
@@ -128,8 +126,6 @@ class Config:
         self.TRACK_LOST_BUFFER = int(os.getenv("TRACK_LOST_BUFFER", "20"))
         self.TRACK_MATCH_THRESHOLD = float(os.getenv("TRACK_MATCH_THRESHOLD", "0.65"))
         self.TRACK_FRAME_RATE = int(os.getenv("TRACK_FRAME_RATE", "25"))
-        self.TRACKER_BACKEND = os.getenv("TRACKER_BACKEND", "botsort").strip().lower()
-        self.YOLO_TRACKER_YAML = os.getenv("YOLO_TRACKER_YAML", "trackers/botsort_traffic.yaml")
         self.TRACK_FALLBACK_ENABLED = int(os.getenv("TRACK_FALLBACK_ENABLED", "1"))
         self.TRACK_FALLBACK_MAX_CENTER_DIST_RATIO = float(
             os.getenv("TRACK_FALLBACK_MAX_CENTER_DIST_RATIO", "0.08")
