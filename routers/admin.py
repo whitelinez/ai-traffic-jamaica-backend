@@ -20,6 +20,7 @@ from services.runtime_tuner import RUNTIME_PROFILES
 from services.bet_service import get_bet_validation_status
 from config import get_config
 from supabase_client import get_supabase
+from websocket.ws_manager import manager
 from middleware.rate_limiter import limiter
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -166,6 +167,16 @@ async def admin_bet_validation_status(
     Runtime validation metrics for bet placement outcomes.
     """
     return get_bet_validation_status()
+
+
+@router.get("/active-users")
+async def admin_active_users(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Live websocket presence + visit counters for admin dashboard.
+    """
+    return manager.connection_snapshot()
 
 
 @router.post("/set-role")
@@ -627,25 +638,32 @@ async def admin_ml_one_click(
     batch = int(body.get("batch", cfg.TRAINER_BATCH))
     dataset_yaml_url = str(body.get("dataset_yaml_url") or cfg.TRAINER_DATASET_YAML_URL).strip()
 
-    result = await auto_retrain_cycle(
-        hours=hours,
-        min_rows=min_rows,
-        min_score_gain=min_score_gain,
-        base_model=cfg.YOLO_MODEL,
-        provider="webhook",
-        params={
-            "trainer_webhook_url": cfg.TRAINER_WEBHOOK_URL,
-            "trainer_webhook_secret": cfg.TRAINER_WEBHOOK_SECRET,
-            "dataset_yaml_url": dataset_yaml_url,
-            "epochs": epochs,
-            "imgsz": imgsz,
-            "batch": batch,
-        },
-    )
+    async def _run():
+        try:
+            await auto_retrain_cycle(
+                hours=hours,
+                min_rows=min_rows,
+                min_score_gain=min_score_gain,
+                base_model=cfg.YOLO_MODEL,
+                provider="webhook",
+                params={
+                    "trainer_webhook_url": cfg.TRAINER_WEBHOOK_URL,
+                    "trainer_webhook_secret": cfg.TRAINER_WEBHOOK_SECRET,
+                    "dataset_yaml_url": dataset_yaml_url,
+                    "epochs": epochs,
+                    "imgsz": imgsz,
+                    "batch": batch,
+                },
+            )
+        except Exception:
+            # Failure details are captured in ml_training_jobs by pipeline service.
+            return
+
+    asyncio.create_task(_run())
     return {
-        "message": "One-click model pipeline completed",
-        "result": result,
-        "diagnostics": await get_ml_diagnostics(cfg=cfg),
+        "message": "One-click model pipeline queued",
+        "result": {"status": "queued"},
+        "diagnostics": diagnostics,
     }
 
 

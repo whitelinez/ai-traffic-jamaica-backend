@@ -379,9 +379,9 @@ async def round_monitor_loop() -> None:
             if round_data:
                 round_id = round_data["id"]
                 if round_id != last_round_id:
-                    logger.info("New active round: %s — resetting counter", round_id)
+                    logger.info("New active round: %s — setting round baseline", round_id)
                     if _counter_ref:
-                        _counter_ref.reset()
+                        _counter_ref.reset_round()
                     last_round_id = round_id
                     if manager.public_count > 0:
                         await manager.broadcast_public({"type": "round", "round": round_data})
@@ -1274,6 +1274,10 @@ async def health():
         "stream_configured": bool(get_current_url()),
         "public_ws_connections": manager.public_count,
         "user_ws_connections": manager.user_count,
+        "user_ws_sockets": manager.user_socket_count,
+        "total_ws_connections": manager.public_count + manager.user_socket_count,
+        "public_ws_total_visits": manager.public_connection_events,
+        "user_ws_total_visits": manager.user_connection_events,
         "ai_task_running": _ai_task is not None and not _ai_task.done(),
         "refresh_task_running": _refresh_task is not None and not _refresh_task.done(),
         "round_task_running": _round_task is not None and not _round_task.done(),

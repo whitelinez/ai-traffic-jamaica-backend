@@ -65,7 +65,15 @@ async def ws_account(
         await websocket.close(code=4001)
         return
 
-    await manager.connect_user(websocket, user_id)
+    await manager.connect_user(
+        websocket,
+        user_id,
+        meta={
+            "origin": origin,
+            "ip": websocket.client.host if websocket.client else None,
+            "user_agent": websocket.headers.get("user-agent"),
+        },
+    )
 
     # Send initial balance on connect
     try:

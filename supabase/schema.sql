@@ -25,11 +25,12 @@ ALTER TABLE cameras
 ALTER TABLE cameras
   ALTER COLUMN count_settings SET DEFAULT
   '{
-    "min_track_frames": 6,
-    "min_box_area_ratio": 0.004,
-    "min_confidence": 0.30,
+    "min_track_frames": 3,
+    "min_box_area_ratio": 0.0015,
+    "min_confidence": 0.22,
     "allowed_classes": ["car", "truck", "bus", "motorcycle"],
-    "class_min_confidence": {"car": 0.30, "truck": 0.42, "bus": 0.45, "motorcycle": 0.32}
+    "class_min_confidence": {"car": 0.20, "truck": 0.28, "bus": 0.30, "motorcycle": 0.22},
+    "count_unknown_as_car": true
   }'::jsonb;
 
 ALTER TABLE cameras
@@ -58,11 +59,12 @@ ALTER TABLE cameras
 -- Backfill existing cameras still on empty JSON defaults.
 UPDATE cameras
 SET count_settings = '{
-  "min_track_frames": 6,
-  "min_box_area_ratio": 0.004,
-  "min_confidence": 0.30,
+  "min_track_frames": 3,
+  "min_box_area_ratio": 0.0015,
+  "min_confidence": 0.22,
   "allowed_classes": ["car", "truck", "bus", "motorcycle"],
-  "class_min_confidence": {"car": 0.30, "truck": 0.42, "bus": 0.45, "motorcycle": 0.32}
+  "class_min_confidence": {"car": 0.20, "truck": 0.28, "bus": 0.30, "motorcycle": 0.22},
+  "count_unknown_as_car": true
 }'::jsonb
 WHERE count_settings IS NULL OR count_settings = '{}'::jsonb;
 
@@ -197,6 +199,25 @@ CREATE TABLE IF NOT EXISTS count_snapshots (
   vehicle_breakdown JSONB
 );
 
+-- Public chat messages (guest + authenticated users).
+CREATE TABLE IF NOT EXISTS messages (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID REFERENCES auth.users ON DELETE SET NULL,
+  guest_id   TEXT,
+  username   TEXT NOT NULL CHECK (length(username) BETWEEN 1 AND 32),
+  content    TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 280),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE messages
+  ADD COLUMN IF NOT EXISTS guest_id TEXT;
+
+ALTER TABLE messages
+  ALTER COLUMN user_id DROP NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_messages_created_at
+  ON messages(created_at DESC);
+
 -- Automated round sessions (admin schedules looping rounds)
 CREATE TABLE IF NOT EXISTS round_sessions (
   id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -299,6 +320,7 @@ ALTER TABLE bet_rounds       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE markets          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bets             ENABLE ROW LEVEL SECURITY;
 ALTER TABLE count_snapshots  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE messages         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE round_sessions   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ml_detection_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ml_training_jobs    ENABLE ROW LEVEL SECURITY;
@@ -340,6 +362,22 @@ CREATE POLICY "own_bets_insert" ON bets
 DROP POLICY IF EXISTS "public_read_snapshots" ON count_snapshots;
 CREATE POLICY "public_read_snapshots" ON count_snapshots
   FOR SELECT USING (true);
+
+-- Messages: public read + guest/auth inserts.
+DROP POLICY IF EXISTS "public_read_messages" ON messages;
+CREATE POLICY "public_read_messages" ON messages
+  FOR SELECT USING (true);
+
+DROP POLICY IF EXISTS "public_insert_messages" ON messages;
+CREATE POLICY "public_insert_messages" ON messages
+  FOR INSERT WITH CHECK (
+    length(trim(username)) BETWEEN 1 AND 32
+    AND length(trim(content)) BETWEEN 1 AND 280
+    AND (
+      user_id IS NULL
+      OR auth.uid() = user_id
+    )
+  );
 
 -- Round sessions: public read (for next round timer), admin writes
 DROP POLICY IF EXISTS "public_read_round_sessions" ON round_sessions;

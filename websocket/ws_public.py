@@ -109,7 +109,14 @@ async def ws_live(
         await websocket.close(code=4001)
         return
 
-    await manager.connect_public(websocket)
+    await manager.connect_public(
+        websocket,
+        meta={
+            "origin": origin,
+            "ip": websocket.client.host if websocket.client else None,
+            "user_agent": websocket.headers.get("user-agent"),
+        },
+    )
     await _send_bootstrap_count(websocket, cfg.CAMERA_ALIAS)
     try:
         while True:

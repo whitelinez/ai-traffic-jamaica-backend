@@ -19,16 +19,18 @@ logger = logging.getLogger(__name__)
 LINE_REFRESH_INTERVAL = 30  # seconds
 TRACK_TTL_SEC = 12.0
 DEFAULT_COUNT_SETTINGS = {
-    "min_track_frames": 6,
-    "min_box_area_ratio": 0.004,
-    "min_confidence": 0.30,
+    "min_track_frames": 3,
+    "min_box_area_ratio": 0.0015,
+    "min_confidence": 0.22,
     "allowed_classes": ["car", "truck", "bus", "motorcycle"],
     "class_min_confidence": {
-        "car": 0.30,
-        "truck": 0.42,
-        "bus": 0.45,
-        "motorcycle": 0.32,
+        "car": 0.20,
+        "truck": 0.28,
+        "bus": 0.30,
+        "motorcycle": 0.22,
     },
+    # If detector cannot classify a moving vehicle, count it as car.
+    "count_unknown_as_car": True,
     # Track-level temporal smoothing + hysteresis for stable counting.
     "track_conf_smoothing_alpha": 0.30,
     "track_conf_enter": 0.30,
@@ -73,6 +75,10 @@ class LineCounter:
         self._confirmed_in = 0
         self._confirmed_out = 0
         self._confirmed_total = 0
+        self._round_baseline_in = 0
+        self._round_baseline_out = 0
+        self._round_baseline_total = 0
+        self._round_baseline_per_class: dict[str, int] = {}
 
     @staticmethod
     def _normalize_polygon(points: list[tuple[int, int]]) -> np.ndarray:
@@ -103,6 +109,27 @@ class LineCounter:
         if tid < 0:
             return None
         return tid
+
+    @staticmethod
+    def _to_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    def _count_class_name(self, cls_id: int, count_unknown_as_car: bool) -> str:
+        cls_name = CLASS_NAMES.get(int(cls_id), "unknown").lower()
+        if cls_name == "unknown" and count_unknown_as_car:
+            return "car"
+        return cls_name
 
     async def bootstrap_from_latest_snapshot(self) -> None:
         """
@@ -141,6 +168,10 @@ class LineCounter:
             )
             self._confirmed_in = int(latest.get("count_in", 0) or 0)
             self._confirmed_out = int(latest.get("count_out", 0) or 0)
+            self._round_baseline_in = self._confirmed_in
+            self._round_baseline_out = self._confirmed_out
+            self._round_baseline_total = self._confirmed_total
+            self._round_baseline_per_class = dict(self._per_class_total)
 
             # Preserve per-class totals while rebuilding display buckets.
             self._counts = {
@@ -176,14 +207,17 @@ class LineCounter:
 
         merged = dict(DEFAULT_COUNT_SETTINGS)
         merged.update(count_settings)
-        merged["min_track_frames"] = max(
-            1, int(merged.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"]) or DEFAULT_COUNT_SETTINGS["min_track_frames"])
+        merged["min_track_frames"] = min(
+            3,
+            max(1, int(merged.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"]) or DEFAULT_COUNT_SETTINGS["min_track_frames"]))
         )
-        merged["min_box_area_ratio"] = max(
-            0.0, min(1.0, float(merged.get("min_box_area_ratio", 0.0) or 0.0))
+        merged["min_box_area_ratio"] = min(
+            0.0015,
+            max(0.0, min(1.0, float(merged.get("min_box_area_ratio", 0.0) or 0.0)))
         )
-        merged["min_confidence"] = max(
-            0.0, min(1.0, float(merged.get("min_confidence", 0.0) or 0.0))
+        merged["min_confidence"] = min(
+            0.22,
+            max(0.0, min(1.0, float(merged.get("min_confidence", 0.0) or 0.0)))
         )
         allowed_classes = merged.get("allowed_classes", [])
         merged["allowed_classes"] = (
@@ -199,6 +233,17 @@ class LineCounter:
                     class_conf[str(k).strip().lower()] = max(0.0, min(1.0, float(v)))
                 except Exception:
                     continue
+        class_conf_caps = {
+            "car": 0.20,
+            "truck": 0.28,
+            "bus": 0.30,
+            "motorcycle": 0.22,
+        }
+        for cls_name, cap in class_conf_caps.items():
+            if cls_name in class_conf:
+                class_conf[cls_name] = min(class_conf[cls_name], cap)
+            else:
+                class_conf[cls_name] = cap
         merged["class_min_confidence"] = class_conf
         merged["track_conf_smoothing_alpha"] = max(
             0.05, min(1.0, float(merged.get("track_conf_smoothing_alpha", 0.35) or 0.35))
@@ -213,6 +258,10 @@ class LineCounter:
             merged["track_conf_exit"] = merged["track_conf_enter"]
         merged["count_zone_confirm_frames"] = max(
             1, int(merged.get("count_zone_confirm_frames", 2) or 2)
+        )
+        merged["count_unknown_as_car"] = self._to_bool(
+            merged.get("count_unknown_as_car", True),
+            True,
         )
         self._count_settings = merged
 
@@ -322,6 +371,7 @@ class LineCounter:
         eligible_mask = [True] * len(detections)
         allowed_classes = set(self._count_settings.get("allowed_classes", []))
         class_min_conf = self._count_settings.get("class_min_confidence", {})
+        count_unknown_as_car = self._to_bool(self._count_settings.get("count_unknown_as_car", True), True)
         min_conf = float(self._count_settings.get("min_confidence", 0.0) or 0.0)
         min_area_ratio = float(self._count_settings.get("min_box_area_ratio", 0.0) or 0.0)
         min_track_frames = int(
@@ -338,7 +388,7 @@ class LineCounter:
             if i >= len(detections.class_id):
                 eligible_mask[i] = False
                 continue
-            cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown").lower()
+            cls_name = self._count_class_name(int(detections.class_id[i]), count_unknown_as_car)
 
             if allowed_classes and cls_name not in allowed_classes:
                 eligible_mask[i] = False
@@ -414,7 +464,7 @@ class LineCounter:
                 if not is_inside or i >= len(detections.class_id) or not eligible_mask[i]:
                     continue
 
-                cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
+                cls_name = self._count_class_name(int(detections.class_id[i]), count_unknown_as_car)
 
                 tid = None
                 if has_tracker_ids:
@@ -469,7 +519,7 @@ class LineCounter:
                 if self._track_seen_frames.get(tid, 0) < min_track_frames:
                     continue
 
-                cls_name = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
+                cls_name = self._count_class_name(int(detections.class_id[i]), count_unknown_as_car)
                 new_crossings += self._confirm_crossing(cls_name, bool(in_flag), bool(out_flag), tid)
 
             total_in = self._confirmed_in
@@ -509,6 +559,13 @@ class LineCounter:
             "count_out": total_out,
             "total": total,
             "vehicle_breakdown": breakdown,
+            "round_count_in": max(0, total_in - self._round_baseline_in),
+            "round_count_out": max(0, total_out - self._round_baseline_out),
+            "round_total": max(0, total - self._round_baseline_total),
+            "round_vehicle_breakdown": {
+                cls: max(0, int(val) - int(self._round_baseline_per_class.get(cls, 0)))
+                for cls, val in breakdown.items()
+            },
             "detections": boxes,
             "new_crossings": new_crossings,
             "per_class_total": dict(self._per_class_total),
@@ -559,10 +616,23 @@ class LineCounter:
         self._confirmed_in = 0
         self._confirmed_out = 0
         self._confirmed_total = 0
+        self._round_baseline_in = 0
+        self._round_baseline_out = 0
+        self._round_baseline_total = 0
+        self._round_baseline_per_class = {}
 
         if self._zone and self._zone_type == "line":
             self._zone.in_count = 0
             self._zone.out_count = 0
+
+    def reset_round(self) -> None:
+        """
+        Start a new round baseline without resetting lifetime counters.
+        """
+        self._round_baseline_in = self._confirmed_in
+        self._round_baseline_out = self._confirmed_out
+        self._round_baseline_total = self._confirmed_total
+        self._round_baseline_per_class = dict(self._per_class_total)
 
 
 async def write_snapshot(snapshot: dict[str, Any]) -> None:
