@@ -5,6 +5,7 @@ POST /admin/resolve    → manually resolve a round
 POST /admin/set-role   → grant/revoke admin role on a user
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -174,9 +175,130 @@ async def admin_active_users(
     admin: Annotated[dict, Depends(_require_admin_user)],
 ):
     """
-    Live websocket presence + visit counters for admin dashboard.
+    Live websocket presence + DB-backed audience telemetry for admin dashboard.
     """
-    return manager.connection_snapshot()
+    snapshot = manager.connection_snapshot()
+    snapshot["db"] = await _load_db_audience_snapshot()
+    return snapshot
+
+
+async def _load_db_audience_snapshot() -> dict:
+    sb = await get_supabase()
+    now = datetime.now(timezone.utc)
+    since_24h = (now - timedelta(hours=24)).isoformat()
+
+    result: dict = {
+        "registered_users_total": 0,
+        "registered_users_recent": [],
+        "guests_total": 0,
+        "guests_24h": 0,
+        "guest_recent": [],
+        "site_views_total": 0,
+        "site_views_24h": 0,
+        "site_views_recent": [],
+        "site_views_top_pages_24h": [],
+    }
+
+    # Registered users from profiles table (DB truth).
+    try:
+        prof_count = await (
+            sb.table("profiles")
+            .select("user_id", count="exact", head=True)
+            .execute()
+        )
+        result["registered_users_total"] = int(prof_count.count or 0)
+    except Exception:
+        pass
+
+    try:
+        prof_recent = await (
+            sb.table("profiles")
+            .select("user_id,username,created_at,updated_at")
+            .order("updated_at", desc=True)
+            .limit(30)
+            .execute()
+        )
+        result["registered_users_recent"] = prof_recent.data or []
+    except Exception:
+        pass
+
+    # Guest activity from chat messages (DB).
+    try:
+        msg_rows = await (
+            sb.table("messages")
+            .select("guest_id,username,created_at,content")
+            .order("created_at", desc=True)
+            .limit(1200)
+            .execute()
+        )
+        guest_rows = [m for m in (msg_rows.data or []) if m.get("guest_id")]
+        guest_map: dict[str, dict] = {}
+        guests_24h: set[str] = set()
+        for row in guest_rows:
+            gid = str(row.get("guest_id") or "").strip()
+            if not gid:
+                continue
+            created_at = str(row.get("created_at") or "")
+            if gid not in guest_map:
+                guest_map[gid] = {
+                    "guest_id": gid,
+                    "username": row.get("username") or gid,
+                    "last_seen": created_at,
+                    "messages": 0,
+                    "last_message": row.get("content") or "",
+                }
+            guest_map[gid]["messages"] += 1
+            if created_at and created_at >= since_24h:
+                guests_24h.add(gid)
+
+        guests_sorted = sorted(
+            guest_map.values(),
+            key=lambda g: str(g.get("last_seen") or ""),
+            reverse=True,
+        )
+        result["guests_total"] = len(guest_map)
+        result["guests_24h"] = len(guests_24h)
+        result["guest_recent"] = guests_sorted[:30]
+    except Exception:
+        pass
+
+    # Site views history (DB).
+    try:
+        sv_count = await (
+            sb.table("site_views")
+            .select("id", count="exact", head=True)
+            .execute()
+        )
+        result["site_views_total"] = int(sv_count.count or 0)
+    except Exception:
+        pass
+
+    try:
+        sv_rows_resp = await (
+            sb.table("site_views")
+            .select("user_id,guest_id,page_path,referrer,viewed_at,source")
+            .order("viewed_at", desc=True)
+            .limit(1200)
+            .execute()
+        )
+        sv_rows = sv_rows_resp.data or []
+        result["site_views_recent"] = sv_rows[:40]
+
+        recent_24h = [r for r in sv_rows if str(r.get("viewed_at") or "") >= since_24h]
+        result["site_views_24h"] = len(recent_24h)
+
+        page_counts: dict[str, int] = {}
+        for row in recent_24h:
+            page = str(row.get("page_path") or "/").strip() or "/"
+            page_counts[page] = page_counts.get(page, 0) + 1
+        result["site_views_top_pages_24h"] = [
+            {"page_path": page, "views": count}
+            for page, count in sorted(page_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]
+        ]
+    except Exception:
+        pass
+
+    return result
 
 
 @router.post("/set-role")

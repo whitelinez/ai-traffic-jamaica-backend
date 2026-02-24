@@ -65,6 +65,32 @@ _ai_task: asyncio.Task | None = None
 _round_task: asyncio.Task | None = None
 _resolver_task: asyncio.Task | None = None
 _ml_retrain_task: asyncio.Task | None = None
+_watchdog_task: asyncio.Task | None = None
+
+_WATCHDOG_INTERVAL_SEC = 8.0
+_WATCHDOG_RESTART_COOLDOWN_SEC = 12.0
+_WATCHDOG_STARTUP_WAIT_SEC = 30
+_watchdog_restart_counts: dict[str, int] = {
+    "refresh": 0,
+    "ai": 0,
+    "round": 0,
+    "resolver": 0,
+    "ml_retrain": 0,
+}
+_watchdog_last_restart_iso: dict[str, str | None] = {
+    "refresh": None,
+    "ai": None,
+    "round": None,
+    "resolver": None,
+    "ml_retrain": None,
+}
+_watchdog_last_restart_monotonic: dict[str, float] = {
+    "refresh": 0.0,
+    "ai": 0.0,
+    "round": 0.0,
+    "resolver": 0.0,
+    "ml_retrain": 0.0,
+}
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
@@ -275,6 +301,100 @@ def _merge_scene_and_weather(
         merged["scene_source"] = "vision"
 
     return merged
+
+
+def _task_running(task: asyncio.Task | None) -> bool:
+    return task is not None and not task.done()
+
+
+def _task_failure(task: asyncio.Task | None) -> str | None:
+    if task is None or not task.done():
+        return None
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return "cancelled"
+    except Exception as exc:  # pragma: no cover
+        return f"exception_lookup_failed: {exc}"
+    return str(exc) if exc else "completed"
+
+
+def _can_restart(task_name: str, now_mono: float) -> bool:
+    last = float(_watchdog_last_restart_monotonic.get(task_name, 0.0) or 0.0)
+    return (now_mono - last) >= _WATCHDOG_RESTART_COOLDOWN_SEC
+
+
+def _mark_restart(task_name: str, reason: str) -> None:
+    _watchdog_restart_counts[task_name] = int(_watchdog_restart_counts.get(task_name, 0)) + 1
+    _watchdog_last_restart_monotonic[task_name] = asyncio.get_running_loop().time()
+    _watchdog_last_restart_iso[task_name] = datetime.now(timezone.utc).isoformat()
+    logger.warning("Watchdog restarted %s task (reason=%s)", task_name, reason)
+
+
+async def _wait_for_stream_url(timeout_sec: int) -> str | None:
+    for _ in range(max(1, int(timeout_sec))):
+        stream_url = get_current_url()
+        if stream_url:
+            return stream_url
+        await asyncio.sleep(1)
+    return None
+
+
+async def _ensure_ai_task(cfg, timeout_sec: int = 6, reason: str = "watchdog") -> bool:
+    global _ai_task
+    if _task_running(_ai_task):
+        return True
+    stream_url = await _wait_for_stream_url(timeout_sec)
+    if not stream_url:
+        logger.error("AI loop restart skipped (%s): stream URL unavailable", reason)
+        return False
+    hls_stream = HLSStream(stream_url)
+    _ai_task = asyncio.create_task(ai_loop(cfg, hls_stream), name="ai_loop")
+    logger.info("AI loop started (%s) with URL: %s", reason, stream_url)
+    return True
+
+
+async def health_watchdog_loop(cfg) -> None:
+    global _refresh_task, _round_task, _resolver_task, _ml_retrain_task
+    while True:
+        loop_now = asyncio.get_running_loop().time()
+        try:
+            if not _task_running(_refresh_task) and _can_restart("refresh", loop_now):
+                reason = _task_failure(_refresh_task) or "not_running"
+                _refresh_task = asyncio.create_task(
+                    url_refresh_loop(cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL),
+                    name="url_refresh_loop",
+                )
+                _mark_restart("refresh", reason)
+
+            if not _task_running(_ai_task) and _can_restart("ai", loop_now):
+                reason = _task_failure(_ai_task) or "not_running"
+                started = await _ensure_ai_task(cfg, timeout_sec=6, reason="watchdog")
+                if started:
+                    _mark_restart("ai", reason)
+
+            if not _task_running(_round_task) and _can_restart("round", loop_now):
+                reason = _task_failure(_round_task) or "not_running"
+                _round_task = asyncio.create_task(round_monitor_loop(), name="round_monitor")
+                _mark_restart("round", reason)
+
+            if not _task_running(_resolver_task) and _can_restart("resolver", loop_now):
+                reason = _task_failure(_resolver_task) or "not_running"
+                _resolver_task = asyncio.create_task(bet_resolver_loop(), name="bet_resolver")
+                _mark_restart("resolver", reason)
+
+            if cfg.ML_AUTO_RETRAIN_ENABLED == 1:
+                if not _task_running(_ml_retrain_task) and _can_restart("ml_retrain", loop_now):
+                    reason = _task_failure(_ml_retrain_task) or "not_running"
+                    _ml_retrain_task = asyncio.create_task(
+                        ml_auto_retrain_loop(cfg),
+                        name="ml_auto_retrain",
+                    )
+                    _mark_restart("ml_retrain", reason)
+        except Exception as exc:
+            logger.exception("Watchdog loop error: %s", exc)
+
+        await asyncio.sleep(_WATCHDOG_INTERVAL_SEC)
 
 
 async def round_monitor_loop() -> None:
@@ -1067,7 +1187,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task
+    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task
 
     cfg = get_config()
     logger.info("Config validated — starting WHITELINEZ backend")
@@ -1082,19 +1202,11 @@ async def lifespan(app: FastAPI):
     logger.info("URL refresh task started (alias=%s, interval=%ds)", cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL)
 
     # 2. Wait up to 30s for first URL before starting AI loop
-    stream_url = None
-    for _ in range(30):
-        stream_url = get_current_url()
-        if stream_url:
-            break
-        await asyncio.sleep(1)
-
+    stream_url = await _wait_for_stream_url(_WATCHDOG_STARTUP_WAIT_SEC)
     if not stream_url:
         logger.error("No stream URL after 30s — AI loop will not start.")
     else:
-        hls_stream = HLSStream(stream_url)
-        _ai_task = asyncio.create_task(ai_loop(cfg, hls_stream), name="ai_loop")
-        logger.info("AI loop started with URL: %s", stream_url)
+        await _ensure_ai_task(cfg, timeout_sec=1, reason="startup")
 
     _round_task = asyncio.create_task(round_monitor_loop(), name="round_monitor")
     logger.info("Round monitor started")
@@ -1108,10 +1220,13 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("ML auto-retrain loop disabled")
 
+    _watchdog_task = asyncio.create_task(health_watchdog_loop(cfg), name="health_watchdog")
+    logger.info("Health watchdog started")
+
     yield
 
     # Shutdown
-    for task in (_ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
+    for task in (_watchdog_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
         if task and not task.done():
             task.cancel()
             try:
@@ -1283,6 +1398,9 @@ async def health():
         "round_task_running": _round_task is not None and not _round_task.done(),
         "resolver_task_running": _resolver_task is not None and not _resolver_task.done(),
         "ml_retrain_task_running": _ml_retrain_task is not None and not _ml_retrain_task.done(),
+        "watchdog_task_running": _watchdog_task is not None and not _watchdog_task.done(),
+        "watchdog_restart_counts": _watchdog_restart_counts,
+        "watchdog_last_restart_at": _watchdog_last_restart_iso,
         "active_round_id": active_round_id,
         "active_round_status": active_round_status,
         "next_round_at": next_round_at,
