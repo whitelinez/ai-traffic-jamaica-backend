@@ -537,6 +537,15 @@ async def round_monitor_loop() -> None:
                                 .execute()
                             if snap_after.data:
                                 snap = snap_after.data[0]
+                            else:
+                                latest_cam = await sb.table("count_snapshots") \
+                                    .select("captured_at, total, vehicle_breakdown") \
+                                    .eq("camera_id", camera_id) \
+                                    .order("captured_at", desc=True) \
+                                    .limit(1) \
+                                    .execute()
+                                if latest_cam.data:
+                                    snap = latest_cam.data[0]
                     except Exception:
                         snap = None
 
@@ -544,6 +553,11 @@ async def round_monitor_loop() -> None:
                         baseline_total = int(snap.get("total", 0) or 0)
                         baseline_by_class = snap.get("vehicle_breakdown") or {}
                         baseline_captured_at = snap.get("captured_at")
+                    elif _counter_ref:
+                        live = _counter_ref.get_snapshot(None)
+                        baseline_total = int(live.get("total", 0) or 0)
+                        baseline_by_class = live.get("vehicle_breakdown") or {}
+                        baseline_captured_at = datetime.now(timezone.utc).isoformat()
 
                 next_params = {
                     **params,
@@ -751,186 +765,8 @@ async def bet_resolver_loop() -> None:
                 except Exception as bet_exc:
                     logger.warning("Error resolving bet %s: %s", bet.get("id"), bet_exc)
 
-            # Early resolve market bets when "over" is already guaranteed.
-            rounds_resp = await (
-                sb.table("bet_rounds")
-                .select("id, camera_id, market_type, params, status, opens_at")
-                .in_("status", ["open", "locked"])
-                .in_("market_type", ["over_under", "vehicle_count"])
-                .execute()
-            )
-            for rnd in (rounds_resp.data or []):
-                try:
-                    round_id = rnd.get("id")
-                    params = rnd.get("params") or {}
-                    threshold = int(params.get("threshold", 0) or 0)
-                    vehicle_class = params.get("vehicle_class") if rnd.get("market_type") == "vehicle_count" else None
-                    round_baseline = 0
-                    params_baseline_total = int((params or {}).get("round_baseline_total", 0) or 0)
-                    params_baseline_by_class = (params or {}).get("round_baseline_by_class") or {}
-                    if vehicle_class is None:
-                        round_baseline = params_baseline_total
-                    else:
-                        round_baseline = int(params_baseline_by_class.get(vehicle_class, 0) or 0)
-                    if round_baseline <= 0 and rnd.get("camera_id") and rnd.get("opens_at"):
-                        try:
-                            round_open_snap = await (
-                                sb.table("count_snapshots")
-                                .select("total, vehicle_breakdown")
-                                .eq("camera_id", rnd["camera_id"])
-                                .lte("captured_at", rnd["opens_at"])
-                                .order("captured_at", desc=True)
-                                .limit(1)
-                                .execute()
-                            )
-                            if round_open_snap.data:
-                                open_snap = round_open_snap.data[0]
-                                if vehicle_class is None:
-                                    round_baseline = int(open_snap.get("total", 0) or 0)
-                                else:
-                                    round_baseline = int(
-                                        (open_snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0
-                                    )
-                            else:
-                                round_open_snap_after = await (
-                                    sb.table("count_snapshots")
-                                    .select("total, vehicle_breakdown")
-                                    .eq("camera_id", rnd["camera_id"])
-                                    .gte("captured_at", rnd["opens_at"])
-                                    .order("captured_at", desc=False)
-                                    .limit(1)
-                                    .execute()
-                                )
-                                if round_open_snap_after.data:
-                                    open_snap = round_open_snap_after.data[0]
-                                    if vehicle_class is None:
-                                        round_baseline = int(open_snap.get("total", 0) or 0)
-                                    else:
-                                        round_baseline = int(
-                                            (open_snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0
-                                        )
-                        except Exception:
-                            round_baseline = 0
-
-                    current_count = 0
-                    if _counter_ref is not None:
-                        current_count = _counter_ref.get_class_total(vehicle_class)
-                    else:
-                        camera_id = rnd.get("camera_id")
-                        if camera_id:
-                            snap_resp = await (
-                                sb.table("count_snapshots")
-                                .select("total, vehicle_breakdown")
-                                .eq("camera_id", camera_id)
-                                .order("captured_at", desc=True)
-                                .limit(1)
-                                .execute()
-                            )
-                            if snap_resp.data:
-                                snap = snap_resp.data[0]
-                                if vehicle_class is None:
-                                    current_count = int(snap.get("total", 0) or 0)
-                                else:
-                                    current_count = int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
-
-                    bets_resp = await (
-                        sb.table("bets")
-                        .select("id, user_id, potential_payout, baseline_count, placed_at, markets(outcome_key)")
-                        .eq("round_id", round_id)
-                        .eq("status", "pending")
-                        .or_("bet_type.eq.market,bet_type.is.null")
-                        .execute()
-                    )
-                    for bet in (bets_resp.data or []):
-                        market = bet.get("markets") or {}
-                        outcome = str(market.get("outcome_key") or "").lower()
-                        if outcome not in {"over", "under", "exact"}:
-                            continue
-
-                        baseline = int(bet.get("baseline_count") or 0)
-                        if bet.get("placed_at"):
-                            try:
-                                placed_at = datetime.fromisoformat(str(bet.get("placed_at")).replace("Z", "+00:00"))
-                                if (datetime.now(timezone.utc) - placed_at).total_seconds() < _MARKET_EARLY_RESOLVE_GRACE_SEC:
-                                    # Guard against instant settlement right after placement when snapshots lag.
-                                    continue
-                            except Exception:
-                                pass
-
-                        if rnd.get("camera_id") and bet.get("placed_at"):
-                            try:
-                                snap_before_bet = await (
-                                    sb.table("count_snapshots")
-                                    .select("total, vehicle_breakdown")
-                                    .eq("camera_id", rnd["camera_id"])
-                                    .lte("captured_at", bet.get("placed_at"))
-                                    .order("captured_at", desc=True)
-                                    .limit(1)
-                                    .execute()
-                                )
-                                snap_after_bet = await (
-                                    sb.table("count_snapshots")
-                                    .select("total, vehicle_breakdown")
-                                    .eq("camera_id", rnd["camera_id"])
-                                    .gte("captured_at", bet.get("placed_at"))
-                                    .order("captured_at", desc=False)
-                                    .limit(1)
-                                    .execute()
-                                )
-                                if snap_before_bet.data:
-                                    snap = snap_before_bet.data[0]
-                                    if vehicle_class is None:
-                                        baseline = max(baseline, int(snap.get("total", 0) or 0))
-                                    else:
-                                        baseline = max(
-                                            baseline,
-                                            int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0),
-                                        )
-                                if snap_after_bet.data:
-                                    snap = snap_after_bet.data[0]
-                                    if vehicle_class is None:
-                                        baseline = max(baseline, int(snap.get("total", 0) or 0))
-                                    else:
-                                        baseline = max(
-                                            baseline,
-                                            int((snap.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0),
-                                        )
-                            except Exception:
-                                pass
-                        baseline = max(int(baseline or 0), int(round_baseline or 0))
-                        actual = max(0, current_count - baseline)
-                        if actual <= threshold:
-                            continue
-
-                        # Once threshold is exceeded, over is won; under/exact cannot win.
-                        won = (outcome == "over")
-                        await sb.table("bets").update({
-                            "status": "won" if won else "lost",
-                            "actual_count": actual,
-                            "resolved_at": datetime.now(timezone.utc).isoformat(),
-                        }).eq("id", bet["id"]).execute()
-
-                        if won:
-                            await sb.rpc(
-                                "credit_user_balance",
-                                {
-                                    "p_user_id": bet["user_id"],
-                                    "p_amount": int(bet["potential_payout"]),
-                                },
-                            ).execute()
-
-                        await manager.send_to_user(bet["user_id"], {
-                            "type": "bet_resolved",
-                            "user_id": str(bet["user_id"]),
-                            "bet_id": str(bet["id"]),
-                            "won": won,
-                            "payout": bet["potential_payout"] if won else 0,
-                            "actual": actual,
-                            "exact": threshold,
-                            "vehicle_class": vehicle_class,
-                        })
-                except Exception as early_exc:
-                    logger.warning("Early market resolve error for round %s: %s", rnd.get("id"), early_exc)
+            # Market bets are resolved only at round end through round_service.
+            # This avoids instant win/loss decisions from transient global counts.
 
         except Exception as exc:
             logger.warning("Bet resolver loop error: %s", exc)

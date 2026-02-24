@@ -4,6 +4,7 @@ All endpoints require a valid Supabase JWT.
 """
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from typing import Annotated
+from uuid import UUID
 
 from models.bet import PlaceBetRequest, PlaceBetResponse, BetHistoryItem, PlaceLiveBetRequest, PlaceLiveBetResponse
 from services.auth_service import validate_supabase_jwt, get_user_id
@@ -43,19 +44,56 @@ async def place_live_bet_endpoint(
     return await place_live_bet(user_id, body)
 
 
-@router.get("/history", response_model=list[BetHistoryItem])
+@router.get("/history")
 async def bet_history(
     user: Annotated[dict, Depends(_get_current_user)],
     limit: int = 50,
+    round_id: UUID | None = None,
 ):
     sb = await get_supabase()
     user_id = get_user_id(user)
-    resp = await (
+    safe_limit = max(1, min(int(limit or 50), 200))
+    query = (
         sb.table("bets")
-        .select("*")
+        .select(
+            "id,user_id,round_id,market_id,amount,potential_payout,status,bet_type,"
+            "vehicle_class,exact_count,actual_count,baseline_count,window_start,window_duration_sec,"
+            "placed_at,resolved_at,markets(label,odds,outcome_key)"
+        )
         .eq("user_id", user_id)
         .order("placed_at", desc=True)
-        .limit(limit)
+        .limit(safe_limit)
+    )
+    if round_id:
+        query = query.eq("round_id", str(round_id))
+    resp = await query.execute()
+    return resp.data or []
+
+
+@router.get("/my-round")
+async def my_round_bets(
+    user: Annotated[dict, Depends(_get_current_user)],
+    round_id: UUID,
+    limit: int = 20,
+):
+    """
+    Strictly user-scoped round bets for UI widgets.
+    Backend derives user_id from JWT to avoid any client-side identity drift.
+    """
+    sb = await get_supabase()
+    user_id = get_user_id(user)
+    safe_limit = max(1, min(int(limit or 20), 100))
+    resp = await (
+        sb.table("bets")
+        .select(
+            "id,user_id,round_id,market_id,amount,potential_payout,status,bet_type,"
+            "vehicle_class,exact_count,actual_count,baseline_count,window_start,window_duration_sec,"
+            "placed_at,resolved_at,markets(label,odds,outcome_key)"
+        )
+        .eq("user_id", user_id)
+        .eq("round_id", str(round_id))
+        .order("placed_at", desc=True)
+        .limit(safe_limit)
         .execute()
     )
     return resp.data or []

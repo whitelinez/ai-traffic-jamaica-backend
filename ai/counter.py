@@ -37,6 +37,12 @@ DEFAULT_COUNT_SETTINGS = {
     "track_conf_exit": 0.18,
     # Polygon count confirmation: require N consecutive inside frames.
     "count_zone_confirm_frames": 1,
+    # Congestion assist: in dense traffic, ease gating so short-lived tracks
+    # are still countable instead of being dropped before confirmation.
+    "burst_mode_enabled": True,
+    "burst_density_min_detections": 18,
+    "burst_min_track_frames": 1,
+    "burst_zone_confirm_frames": 1,
 }
 
 
@@ -148,6 +154,18 @@ class LineCounter:
             )
             rows = resp.data or []
             if not rows:
+                # Fallback to latest persisted snapshot across cameras.
+                # This keeps visible totals stable across deploys if alias/camera_id
+                # changed before camera metadata catches up.
+                fallback = await (
+                    sb.table("count_snapshots")
+                    .select("total, count_in, count_out, vehicle_breakdown")
+                    .order("captured_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                rows = fallback.data or []
+            if not rows:
                 return
 
             latest = rows[0] or {}
@@ -258,6 +276,19 @@ class LineCounter:
             merged["track_conf_exit"] = merged["track_conf_enter"]
         merged["count_zone_confirm_frames"] = max(
             1, int(merged.get("count_zone_confirm_frames", 2) or 2)
+        )
+        merged["burst_mode_enabled"] = self._to_bool(
+            merged.get("burst_mode_enabled", True),
+            True,
+        )
+        merged["burst_density_min_detections"] = max(
+            6, min(120, int(merged.get("burst_density_min_detections", 18) or 18))
+        )
+        merged["burst_min_track_frames"] = max(
+            1, min(3, int(merged.get("burst_min_track_frames", 1) or 1))
+        )
+        merged["burst_zone_confirm_frames"] = max(
+            1, min(3, int(merged.get("burst_zone_confirm_frames", 1) or 1))
         )
         merged["count_unknown_as_car"] = self._to_bool(
             merged.get("count_unknown_as_car", True),
@@ -382,6 +413,18 @@ class LineCounter:
         conf_enter = float(self._count_settings.get("track_conf_enter", 0.42) or 0.42)
         conf_exit = float(self._count_settings.get("track_conf_exit", 0.30) or 0.30)
         zone_confirm_frames = int(self._count_settings.get("count_zone_confirm_frames", 2) or 2)
+        burst_mode_enabled = self._to_bool(self._count_settings.get("burst_mode_enabled", True), True)
+        burst_density_min_detections = int(self._count_settings.get("burst_density_min_detections", 18) or 18)
+        burst_min_track_frames = int(self._count_settings.get("burst_min_track_frames", 1) or 1)
+        burst_zone_confirm_frames = int(self._count_settings.get("burst_zone_confirm_frames", 1) or 1)
+
+        burst_mode_active = burst_mode_enabled and len(detections) >= burst_density_min_detections
+        effective_min_track_frames = (
+            min(min_track_frames, burst_min_track_frames) if burst_mode_active else min_track_frames
+        )
+        effective_zone_confirm_frames = (
+            min(zone_confirm_frames, burst_zone_confirm_frames) if burst_mode_active else zone_confirm_frames
+        )
         frame_area = float(max(1, self.frame_width * self.frame_height))
 
         for i in range(len(detections)):
@@ -478,9 +521,9 @@ class LineCounter:
 
                 if self._detect_zone is not None and tid not in self._prevalidated_track_ids:
                     continue
-                if self._track_seen_frames.get(tid, 0) < min_track_frames:
+                if self._track_seen_frames.get(tid, 0) < effective_min_track_frames:
                     continue
-                if self._track_in_zone_frames.get(tid, 0) < zone_confirm_frames:
+                if self._track_in_zone_frames.get(tid, 0) < effective_zone_confirm_frames:
                     continue
 
                 if tid not in self._track_in_count_zone and tid not in self._confirmed_track_ids:
@@ -516,7 +559,7 @@ class LineCounter:
 
                 if self._detect_zone is not None and tid not in self._prevalidated_track_ids:
                     continue
-                if self._track_seen_frames.get(tid, 0) < min_track_frames:
+                if self._track_seen_frames.get(tid, 0) < effective_min_track_frames:
                     continue
 
                 cls_name = self._count_class_name(int(detections.class_id[i]), count_unknown_as_car)
@@ -571,6 +614,7 @@ class LineCounter:
             "per_class_total": dict(self._per_class_total),
             "pre_count_total": max(0, len(self._prevalidated_track_ids - self._confirmed_track_ids)),
             "confirmed_crossings_total": self._confirmed_total,
+            "burst_mode_active": burst_mode_active,
         }
         return snapshot
 

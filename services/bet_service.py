@@ -142,26 +142,68 @@ async def _assert_user_can_stake(sb, user_id: str, amount: int) -> None:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
 
-async def _get_baseline_count(sb, camera_id: str | None, market_type: str, params: dict | None) -> int:
+async def _get_snapshot_baseline_at_or_before(
+    sb,
+    camera_id: str | None,
+    at_iso: str | None,
+    market_type: str,
+    vehicle_class: str | None = None,
+) -> int:
+    """
+    Resolve baseline from snapshot nearest to a placement/open timestamp.
+    Priority: <= timestamp, then >= timestamp, then latest for the camera.
+    """
     if not camera_id:
         return 0
-    snap_resp = await (
-        sb.table("count_snapshots")
-        .select("total, vehicle_breakdown")
-        .eq("camera_id", camera_id)
-        .order("captured_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if not snap_resp.data:
-        return 0
-    snap = snap_resp.data[0]
-    if market_type == "vehicle_count":
-        cls = (params or {}).get("vehicle_class")
-        if not cls:
+
+    async def _extract(row: dict | None) -> int:
+        if not row:
             return 0
-        return int((snap.get("vehicle_breakdown") or {}).get(cls, 0) or 0)
-    return int(snap.get("total", 0) or 0)
+        if market_type == "vehicle_count":
+            if not vehicle_class:
+                return 0
+            return int((row.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
+        return int(row.get("total", 0) or 0)
+
+    try:
+        if at_iso:
+            before = await (
+                sb.table("count_snapshots")
+                .select("total, vehicle_breakdown")
+                .eq("camera_id", camera_id)
+                .lte("captured_at", at_iso)
+                .order("captured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if before.data:
+                return await _extract(before.data[0])
+
+            after = await (
+                sb.table("count_snapshots")
+                .select("total, vehicle_breakdown")
+                .eq("camera_id", camera_id)
+                .gte("captured_at", at_iso)
+                .order("captured_at", desc=False)
+                .limit(1)
+                .execute()
+            )
+            if after.data:
+                return await _extract(after.data[0])
+
+        latest = await (
+            sb.table("count_snapshots")
+            .select("total, vehicle_breakdown")
+            .eq("camera_id", camera_id)
+            .order("captured_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if latest.data:
+            return await _extract(latest.data[0])
+    except Exception:
+        return 0
+    return 0
 
 
 async def _get_round_start_baseline(sb, rnd: dict, market_type: str, params: dict | None) -> int:
@@ -298,19 +340,20 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
             raise HTTPException(status_code=400, detail=rpc_resp.data["error"])
 
         bet_id = _extract_bet_id_from_rpc_data(rpc_resp.data)
-        baseline_count = await _get_baseline_count(
+        # Anchor market bets to placement-time baseline so progress starts at 0 for the user.
+        market_type = str(rnd.get("market_type") or "")
+        params = rnd.get("params") or {}
+        vehicle_class = str(params.get("vehicle_class") or "") if market_type == "vehicle_count" else None
+        baseline_count = await _get_snapshot_baseline_at_or_before(
             sb,
             rnd.get("camera_id"),
-            str(rnd.get("market_type") or ""),
-            rnd.get("params") or {},
+            now.isoformat(),
+            market_type,
+            vehicle_class=vehicle_class,
         )
-        round_start_baseline = await _get_round_start_baseline(
-            sb,
-            rnd,
-            str(rnd.get("market_type") or ""),
-            rnd.get("params") or {},
-        )
-        baseline_count = max(int(baseline_count or 0), int(round_start_baseline or 0))
+        if baseline_count <= 0:
+            round_start_baseline = await _get_round_start_baseline(sb, rnd, market_type, params)
+            baseline_count = int(round_start_baseline or 0)
 
         # Optional enrichment fields for newer schemas; ignore if columns do not exist.
         try:
@@ -390,33 +433,15 @@ async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBet
         if req.vehicle_class is not None and req.vehicle_class not in valid_classes:
             raise HTTPException(status_code=400, detail=f"Invalid vehicle_class: {req.vehicle_class}")
 
-        # 3. Fetch baseline from latest count_snapshot for this camera
-        cam_resp = await sb.table("bet_rounds").select("camera_id").eq("id", str(req.round_id)).single().execute()
-        camera_id = cam_resp.data.get("camera_id") if cam_resp.data else None
-
-        baseline_count = 0
-        if camera_id:
-            snap_resp = await sb.table("count_snapshots") \
-                .select("total, vehicle_breakdown") \
-                .eq("camera_id", camera_id) \
-                .order("captured_at", desc=True) \
-                .limit(1) \
-                .execute()
-            if snap_resp.data:
-                snap = snap_resp.data[0]
-                if req.vehicle_class is None:
-                    baseline_count = int(snap.get("total", 0) or 0)
-                else:
-                    bd = snap.get("vehicle_breakdown") or {}
-                    baseline_count = int(bd.get(req.vehicle_class, 0) or 0)
-        live_baseline_params = {"vehicle_class": req.vehicle_class} if req.vehicle_class else {}
-        round_start_baseline = await _get_round_start_baseline(
+        # 3. Fetch baseline from snapshot nearest placement timestamp.
+        camera_id = rnd.get("camera_id")
+        baseline_count = await _get_snapshot_baseline_at_or_before(
             sb,
-            rnd,
+            camera_id,
+            now.isoformat(),
             "vehicle_count" if req.vehicle_class else "over_under",
-            live_baseline_params,
+            vehicle_class=req.vehicle_class,
         )
-        baseline_count = max(int(baseline_count or 0), int(round_start_baseline or 0))
 
         # 4. Check balance and deduct atomically
         potential_payout = int(req.amount * LIVE_BET_ODDS)

@@ -82,6 +82,15 @@ async def _send_bootstrap_count(websocket: WebSocket, camera_alias: str) -> None
         )
         rows = snap_resp.data or []
         if not rows:
+            fallback_snap = await (
+                sb.table("count_snapshots")
+                .select("camera_id,captured_at,count_in,count_out,total,vehicle_breakdown")
+                .order("captured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = fallback_snap.data or []
+        if not rows:
             return
         latest = rows[0] or {}
         payload = {
