@@ -17,6 +17,7 @@ from supabase_client import get_supabase
 logger = logging.getLogger(__name__)
 
 LINE_REFRESH_INTERVAL = 30  # seconds
+COUNT_CAP = 2500          # global count resets to 0 after this many crossings
 TRACK_TTL_SEC = 12.0
 DEFAULT_COUNT_SETTINGS = {
     "min_track_frames": 3,
@@ -377,6 +378,20 @@ class LineCounter:
         self._prevalidated_track_ids.difference_update(stale_set)
         self._track_in_count_zone.difference_update(stale_set)
 
+    def _hard_reset_counts(self) -> None:
+        """Reset all counters to 0. Called when COUNT_CAP is reached."""
+        self._counts = {}
+        self._per_class_total = {}
+        self._confirmed_total = 0
+        self._confirmed_in = 0
+        self._confirmed_out = 0
+        self._confirmed_track_ids = set()
+        self._round_baseline_total = 0
+        self._round_baseline_in = 0
+        self._round_baseline_out = 0
+        self._round_baseline_per_class = {}
+        logger.info("Counter hard-reset: reached %d-vehicle cap.", COUNT_CAP)
+
     def _confirm_crossing(self, cls_name: str, in_flag: bool, out_flag: bool, tid: int | None) -> int:
         if tid is not None and tid in self._confirmed_track_ids:
             return 0
@@ -394,6 +409,10 @@ class LineCounter:
 
         if tid is not None:
             self._confirmed_track_ids.add(tid)
+
+        # Cycle back to 0 after hitting the cap.
+        if self._confirmed_total >= COUNT_CAP:
+            self._hard_reset_counts()
 
         return 1
 
