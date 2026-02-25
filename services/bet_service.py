@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import HTTPException
 from supabase_client import get_supabase
 from models.bet import PlaceBetRequest, PlaceBetResponse, PlaceLiveBetRequest, PlaceLiveBetResponse
+from ai.live_state import get_live_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -151,12 +152,19 @@ async def _get_snapshot_baseline_at_or_before(
 ) -> int:
     """
     Resolve baseline from snapshot nearest to a placement/open timestamp.
-    Priority: <= timestamp, then >= timestamp, then latest for the camera.
+    Priority:
+      1. Live in-memory counter (most accurate — zero latency gap)
+      2. Latest non-zero snapshot <= timestamp
+      3. Latest non-zero snapshot >= timestamp
+      4. Latest non-zero snapshot for camera
+      5. Any latest non-zero snapshot
+
+    Skips zero-total rows so a bad redeploy snapshot can't zero-out the baseline.
     """
     if not camera_id:
         return 0
 
-    async def _extract(row: dict | None) -> int:
+    def _extract_snap(row: dict | None) -> int:
         if not row:
             return 0
         if market_type == "vehicle_count":
@@ -165,57 +173,69 @@ async def _get_snapshot_baseline_at_or_before(
             return int((row.get("vehicle_breakdown") or {}).get(vehicle_class, 0) or 0)
         return int(row.get("total", 0) or 0)
 
+    # 1. Live counter — exact count with zero timing gap.
+    live_snap = get_live_snapshot()
+    live_val = 0
+    if live_snap:
+        live_val = _extract_snap(live_snap)
+
     try:
         if at_iso:
             before = await (
                 sb.table("count_snapshots")
                 .select("total, vehicle_breakdown")
                 .eq("camera_id", camera_id)
+                .gt("total", 0)
                 .lte("captured_at", at_iso)
                 .order("captured_at", desc=True)
                 .limit(1)
                 .execute()
             )
             if before.data:
-                return await _extract(before.data[0])
+                return max(live_val, _extract_snap(before.data[0]))
 
             after = await (
                 sb.table("count_snapshots")
                 .select("total, vehicle_breakdown")
                 .eq("camera_id", camera_id)
+                .gt("total", 0)
                 .gte("captured_at", at_iso)
                 .order("captured_at", desc=False)
                 .limit(1)
                 .execute()
             )
             if after.data:
-                return await _extract(after.data[0])
+                return max(live_val, _extract_snap(after.data[0]))
+
+        if live_val > 0:
+            return live_val
 
         latest = await (
             sb.table("count_snapshots")
             .select("total, vehicle_breakdown")
             .eq("camera_id", camera_id)
+            .gt("total", 0)
             .order("captured_at", desc=True)
             .limit(1)
             .execute()
         )
         if latest.data:
-            return await _extract(latest.data[0])
+            return _extract_snap(latest.data[0])
 
         # Final fallback when camera mapping is stale/missing snapshots.
-        # Prefer a non-zero anchor over inheriting a zero baseline.
         any_latest = await (
             sb.table("count_snapshots")
             .select("total, vehicle_breakdown")
+            .gt("total", 0)
             .order("captured_at", desc=True)
             .limit(1)
             .execute()
         )
         if any_latest.data:
-            return await _extract(any_latest.data[0])
+            return _extract_snap(any_latest.data[0])
     except Exception:
-        return 0
-    return 0
+        return live_val
+    return live_val
 
 
 async def _get_round_start_baseline(sb, rnd: dict, market_type: str, params: dict | None) -> int:

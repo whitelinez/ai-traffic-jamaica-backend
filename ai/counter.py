@@ -148,6 +148,7 @@ class LineCounter:
                 sb.table("count_snapshots")
                 .select("total, count_in, count_out, vehicle_breakdown")
                 .eq("camera_id", self.camera_id)
+                .gt("total", 0)
                 .order("captured_at", desc=True)
                 .limit(1)
                 .execute()
@@ -160,6 +161,7 @@ class LineCounter:
                 fallback = await (
                     sb.table("count_snapshots")
                     .select("total, count_in, count_out, vehicle_breakdown")
+                    .gt("total", 0)
                     .order("captured_at", desc=True)
                     .limit(1)
                     .execute()
@@ -212,10 +214,16 @@ class LineCounter:
             sb.table("cameras")
             .select("count_line, detect_zone, count_settings")
             .eq("id", self.camera_id)
-            .single()
+            .maybe_single()
             .execute()
         )
-        data = resp.data or {}
+        if resp.data is None:
+            logger.warning(
+                "_refresh_line: camera_id=%s not found in DB — skipping refresh",
+                self.camera_id,
+            )
+            return
+        data = resp.data
         line_data = data.get("count_line")
         detect_data = data.get("detect_zone")
         count_settings = data.get("count_settings") or {}
@@ -392,7 +400,35 @@ class LineCounter:
     async def process(self, frame: np.ndarray, detections: sv.Detections) -> dict[str, Any]:
         now_mono = time.monotonic()
         if self._zone is None or (now_mono - self._last_refresh) > LINE_REFRESH_INTERVAL:
-            await self._refresh_line()
+            try:
+                await self._refresh_line()
+            except Exception as exc:
+                logger.warning("_refresh_line failed (camera_id=%s): %s", self.camera_id, exc)
+                if self._zone is None:
+                    # No zone yet and DB unreachable — return empty snapshot so AI loop stays alive.
+                    _bd = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
+                    return {
+                        "camera_id": self.camera_id,
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "count_in": self._confirmed_in,
+                        "count_out": self._confirmed_out,
+                        "total": self._confirmed_total,
+                        "vehicle_breakdown": _bd,
+                        "round_count_in": max(0, self._confirmed_in - self._round_baseline_in),
+                        "round_count_out": max(0, self._confirmed_out - self._round_baseline_out),
+                        "round_total": max(0, self._confirmed_total - self._round_baseline_total),
+                        "round_vehicle_breakdown": {
+                            cls: max(0, int(v["in"] + v["out"]) - int(self._round_baseline_per_class.get(cls, 0)))
+                            for cls, v in self._counts.items()
+                        },
+                        "detections": [],
+                        "new_crossings": 0,
+                        "per_class_total": dict(self._per_class_total),
+                        "pre_count_total": 0,
+                        "confirmed_crossings_total": self._confirmed_total,
+                        "burst_mode_active": False,
+                    }
+                # Zone exists from prior refresh — continue processing with stale config.
 
         new_crossings = 0
         tracker_ids = getattr(detections, "tracker_id", None)
@@ -680,7 +716,13 @@ class LineCounter:
 
 
 async def write_snapshot(snapshot: dict[str, Any]) -> None:
-    """Write a count snapshot to Supabase (non-blocking, fire-and-forget)."""
+    """Write a count snapshot to Supabase (non-blocking, fire-and-forget).
+
+    Skips writes where total == 0 to prevent poisoning the bootstrap query
+    on the next redeploy (bootstrap reads the latest row by captured_at).
+    """
+    if not snapshot.get("total"):
+        return
     try:
         sb = await get_supabase()
         await sb.table("count_snapshots").insert(snapshot).execute()

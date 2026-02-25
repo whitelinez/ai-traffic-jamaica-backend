@@ -55,8 +55,8 @@ class HLSStream:
             while True:
                 if self._grab_latest:
                     # Drop one queued frame when possible to reduce stale-latency feel.
-                    self._cap.grab()
-                ret, frame = self._cap.read()
+                    await asyncio.to_thread(self._cap.grab)
+                ret, frame = await asyncio.to_thread(self._cap.read)
                 if not ret:
                     logger.warning("Frame read failed - reconnecting in %.1fs", self._backoff)
                     break

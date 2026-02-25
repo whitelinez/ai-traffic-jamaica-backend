@@ -37,6 +37,8 @@ from ai.stream import HLSStream
 from ai.detector import VehicleDetector
 from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot
+from ai.box_smoother import BoxSmoother
+from ai.live_state import set_live_snapshot
 from ai.dataset_capture import LiveDatasetCapture
 from ai.dataset_upload import SupabaseDatasetUploader
 from ai.url_refresher import url_refresh_loop, get_current_url, get_current_alias
@@ -854,6 +856,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     profile_is_night: bool | None = None
     logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
+    box_smoother = BoxSmoother()
 
     async def _resolve_camera_id_for_alias(alias: str) -> str:
         resp = await (
@@ -962,6 +965,9 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             logger.info("AI camera switched alias %s -> %s (camera_id=%s)", old_alias, camera_alias, camera_id)
             counter = None
             _counter_ref = None
+            frame_buf = None      # reset so counter re-initialises on next frame
+            process_every_n = 1   # reset frame-skip so old camera's perf state doesn't carry over
+            box_smoother.reset()  # clear stale EMA state for previous camera
             try:
                 runtime_profile_name = ""
                 last_runtime_eval = 0.0
@@ -1153,6 +1159,9 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             if cfg.AUTO_CAPTURE_UPLOAD_ENABLED == 1:
                 asyncio.create_task(_upload_capture_async(capture_result))
 
+        # Keep live_state current so bet_service can read the exact count at bet placement time.
+        set_live_snapshot(snapshot)
+
         # Write snapshots at a fixed interval to reduce DB pressure without slowing live WS updates.
         loop_now = asyncio.get_running_loop().time()
         if (loop_now - last_db_write) >= cfg.DB_SNAPSHOT_INTERVAL_SEC:
@@ -1172,6 +1181,10 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             payload["scene_source"] = scene_status.get("scene_source") or "vision"
             if _active_round:
                 payload["round"] = _active_round
+            _ws_fps = max(1.0, float(_ai_runtime_state.get("fps_estimate", 15.0) or 15.0))
+            payload["detections"] = box_smoother.smooth_detections(
+                list(payload.get("detections") or []), fps=_ws_fps
+            )
             await manager.broadcast_public(payload)
 
 

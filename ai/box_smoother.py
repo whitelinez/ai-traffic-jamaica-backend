@@ -28,8 +28,8 @@ class BoxSmoother:
         self.alpha = max(0.0, min(0.99, float(alpha)))
         self.max_jump_ratio = max(0.01, float(max_jump_ratio))
         self.ttl_sec = max(0.5, float(ttl_sec))
-        self._boxes: dict[int, list[float]] = {}  # tid -> [x1, y1, x2, y2]
-        self._last_seen: dict[int, float] = {}     # tid -> monotonic timestamp
+        self._boxes: dict[int, list[float]] = {}   # tid -> [x1, y1, x2, y2]
+        self._last_seen: dict[int, float] = {}      # tid -> monotonic timestamp
 
     def smooth_detections(
         self,
@@ -38,9 +38,9 @@ class BoxSmoother:
     ) -> list[dict[str, Any]]:
         """
         Apply EMA smoothing to a list of detection dicts.
-        Each dict must have x1, y1, x2, y2 and tracker_id keys.
-        Returns a new list with smoothed coordinates; other fields are unchanged.
-        Detections without a valid tracker_id are passed through unmodified.
+        Each dict must have x1, y1, x2, y2 keys.
+        tracker_id is optional — untracked boxes pass through unmodified.
+        Returns a new list with smoothed coordinates; all other fields unchanged.
         """
         if not detections:
             return detections
@@ -72,13 +72,11 @@ class BoxSmoother:
             # per frame (scaled by fps), dampen more aggressively.
             box_w = max(1e-4, prev[2] - prev[0])
             box_h = max(1e-4, prev[3] - prev[1])
-            # At higher FPS, realistic per-frame movement is smaller.
             fps_factor = max(1.0, fps / 15.0)
             max_jump = self.max_jump_ratio * max(box_w, box_h) / fps_factor
             jump = max(abs(x1 - prev[0]), abs(y1 - prev[1]))
 
             if jump > max_jump:
-                # Unrealistic positional jump — hold mostly to previous position.
                 eff_alpha = min(0.95, self.alpha + 0.18)
             else:
                 eff_alpha = self.alpha

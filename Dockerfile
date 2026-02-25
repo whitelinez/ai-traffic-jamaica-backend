@@ -17,18 +17,20 @@ WORKDIR /app
 #    numpy 1.26.4 satisfies: ultralytics>=1.23, supervision>=1.21, scipy>=1.23.5
 RUN pip install --no-cache-dir numpy==1.26.4
 
-# 2. CPU-only PyTorch (picks up the pinned numpy above)
+# 2. CUDA-enabled PyTorch (cu121 — compatible with CUDA 12.x injected by Railway GPU)
+#    Falls back to CPU silently via detector.py if no GPU is attached.
 RUN pip install --no-cache-dir \
-    torch==2.3.1+cpu \
-    torchvision==0.18.1+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
+    torch==2.3.1+cu121 \
+    torchvision==0.18.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
 
 # 3. Remaining deps — all see numpy 1.26.4 already in site-packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download YOLO weights so they're baked in — avoids 6MB download on every cold start
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+# Pre-download YOLO weights so they're baked in — avoids download on every cold start
+# yolov8s.pt = small model (14MB, 2x accuracy vs nano, GPU makes the speed cost negligible)
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8s.pt')"
 
 # Clean pip cache to reduce image size
 RUN pip cache purge
