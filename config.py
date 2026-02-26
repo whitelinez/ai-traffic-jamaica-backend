@@ -106,9 +106,9 @@ class Config:
         self.SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
 
         self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
-        self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolo11s.pt")
-        self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.45"))
-        self.DETECT_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "448"))
+        self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8s.pt")
+        self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))
+        self.DETECT_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "960"))
         self.DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
         self.DETECT_MAX_DET = int(os.getenv("DETECT_MAX_DET", "80"))
         self.NIGHT_PROFILE_ENABLED = int(os.getenv("NIGHT_PROFILE_ENABLED", "1"))
