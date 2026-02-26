@@ -29,8 +29,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download YOLO weights so they're baked in — avoids download on every cold start
-# yolov8s.pt = small model (14MB, 2x accuracy vs nano, GPU makes the speed cost negligible)
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8s.pt')"
+# yolo11s.pt = YOLO11 small model, same API as YOLOv8, better accuracy/speed trade-off
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11s.pt')"
 
 # Clean pip cache to reduce image size
 RUN pip cache purge
