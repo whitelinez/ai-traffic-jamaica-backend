@@ -27,6 +27,7 @@ class VehicleDetector:
         iou_threshold: float | None = None,
         max_det: int | None = None,
         device: str | None = None,
+        tracker_yaml: str | None = None,
     ):
         requested_device = str(device or os.getenv("YOLO_DEVICE", "auto")).strip().lower()
         requested_device = requested_device.replace(" ", "")
@@ -89,6 +90,10 @@ class VehicleDetector:
         self.night_light_contrast = float(os.getenv("NIGHT_LIGHT_CONTRAST", "1.22"))
         self.night_light_sharpness = float(os.getenv("NIGHT_LIGHT_SHARPNESS", "1.10"))
         self._night_mode = False
+        raw_tracker = str(tracker_yaml or os.getenv("YOLO_TRACKER_YAML", "")).strip()
+        self.tracker_yaml: str | None = raw_tracker if raw_tracker else None
+        if self.tracker_yaml:
+            logger.info("YOLO native tracker enabled: %s", self.tracker_yaml)
 
     def set_night_mode(self, enabled: bool) -> None:
         self._night_mode = bool(enabled)
@@ -123,20 +128,26 @@ class VehicleDetector:
         )
         tensor = tensor.to(self.device, non_blocking=self.device.startswith("cuda"))
 
-        try:
-            results = self.model.predict(
-                source=tensor,
+        def _run_inference(t, dev):
+            common = dict(
+                source=t,
                 conf=self.conf,
                 iou=self.iou,
                 max_det=self.max_det,
                 classes=VEHICLE_CLASSES,
                 verbose=False,
-                device=self.device,
-            )[0]
+                device=dev,
+            )
+            if self.tracker_yaml:
+                return self.model.track(persist=True, tracker=self.tracker_yaml, **common)[0]
+            return self.model.predict(**common)[0]
+
+        try:
+            results = _run_inference(tensor, self.device)
         except Exception as exc:
             if self.device != "cpu":
                 logger.warning(
-                    "YOLO predict failed on device '%s' (%s). Retrying on CPU.",
+                    "YOLO inference failed on device '%s' (%s). Retrying on CPU.",
                     self.device,
                     exc,
                 )
@@ -144,15 +155,7 @@ class VehicleDetector:
                 self.device_name = None
                 tensor = tensor.to("cpu")
                 self.model.to("cpu")
-                results = self.model.predict(
-                    source=tensor,
-                    conf=self.conf,
-                    iou=self.iou,
-                    max_det=self.max_det,
-                    classes=VEHICLE_CLASSES,
-                    verbose=False,
-                    device="cpu",
-                )[0]
+                results = _run_inference(tensor, "cpu")
             else:
                 raise
 
@@ -161,16 +164,24 @@ class VehicleDetector:
             xyxy = np.array(boxes.xyxy.cpu().numpy(), dtype=np.float32)
             confidence = np.array(boxes.conf.cpu().numpy(), dtype=np.float32)
             class_id = np.array(boxes.cls.cpu().numpy(), dtype=np.int32)
+            # Extract tracker IDs assigned by YOLO's native tracker (model.track)
+            if self.tracker_yaml and boxes.id is not None:
+                tracker_id = np.array(boxes.id.cpu().numpy(), dtype=np.int32)
+            else:
+                tracker_id = None
         else:
             xyxy = np.empty((0, 4), dtype=np.float32)
             confidence = np.empty((0,), dtype=np.float32)
             class_id = np.empty((0,), dtype=np.int32)
+            tracker_id = None
 
         detections = sv.Detections(
             xyxy=xyxy,
             confidence=confidence,
             class_id=class_id,
         )
+        if tracker_id is not None:
+            detections.tracker_id = tracker_id
 
         if len(detections) > 0:
             detections.xyxy[:, [0, 2]] -= pad_left

@@ -850,6 +850,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         infer_size=cfg.DETECT_INFER_SIZE,
         iou_threshold=cfg.DETECT_IOU,
         max_det=cfg.DETECT_MAX_DET,
+        tracker_yaml=cfg.YOLO_TRACKER_YAML or None,
     )
     _ai_inference_runtime.update(detector.runtime_info())
     logger.info("AI inference runtime: %s", _ai_inference_runtime)

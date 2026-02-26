@@ -155,8 +155,21 @@ class VehicleTracker:
         return detections
 
     def update(self, detections: sv.Detections) -> sv.Detections:
-        """Update tracker and return detections with track IDs."""
-        tracked = self.tracker.update_with_detections(detections)
+        """Update tracker and return detections with track IDs.
+
+        If YOLO's native tracker (model.track) already assigned IDs,
+        bypass sv.ByteTrack and go straight to fallback assignment.
+        """
+        native_ids = getattr(detections, "tracker_id", None)
+        native_tracked = (
+            native_ids is not None
+            and len(native_ids) == len(detections)
+            and len(detections) > 0
+        )
+        if native_tracked:
+            tracked = detections
+        else:
+            tracked = self.tracker.update_with_detections(detections)
         if not self.fallback_enabled:
             return tracked
         return self._assign_fallback_ids(tracked)

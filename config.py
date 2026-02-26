@@ -23,6 +23,7 @@ class Config:
 
     # AI config
     YOLO_MODEL: str
+    YOLO_TRACKER_YAML: str
     YOLO_CONF: float
     DETECT_INFER_SIZE: int
     DETECT_IOU: float
@@ -107,6 +108,7 @@ class Config:
 
         self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
         self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8s.pt")
+        self.YOLO_TRACKER_YAML = os.getenv("YOLO_TRACKER_YAML", "")
         self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))
         self.DETECT_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "960"))
         self.DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
