@@ -1,5 +1,5 @@
 """
-ai/detector.py - YOLOv8 vehicle detector using Ultralytics + Supervision.
+ai/detector.py - YOLO11 vehicle detector using Ultralytics + Supervision.
 COCO classes used: 2=car, 3=motorcycle, 5=bus, 7=truck
 """
 import logging
@@ -21,7 +21,7 @@ CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 class VehicleDetector:
     def __init__(
         self,
-        model_path: str = "yolov8n.pt",
+        model_path: str = "yolo11s.pt",
         conf_threshold: float = 0.50,
         infer_size: int | None = None,
         iou_threshold: float | None = None,
