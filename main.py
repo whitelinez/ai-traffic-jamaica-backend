@@ -18,7 +18,7 @@ import json
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 import cv2
@@ -113,6 +113,7 @@ _ai_inference_runtime: dict[str, Any] = {
     "cuda_available": None,
     "device_name": None,
 }
+_latest_frame_jpeg: bytes | None = None
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
@@ -955,8 +956,15 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             )
 
     async for frame in hls_stream.frames():
+        global _latest_frame_jpeg
         frame_index += 1
         _mark_ai_frame_processed()
+        if frame_index % 15 == 0:  # cache every ~1s
+            try:
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                _latest_frame_jpeg = buf.tobytes()
+            except Exception:
+                pass
 
         latest_alias = get_current_alias() or cfg.CAMERA_ALIAS
         if latest_alias != camera_alias:
@@ -1280,6 +1288,13 @@ app.include_router(admin.router)
 app.include_router(stream.router)
 app.include_router(ws_public_router)
 app.include_router(ws_account_router)
+
+
+@app.get("/api/snapshot")
+async def snapshot():
+    if _latest_frame_jpeg is None:
+        return JSONResponse(status_code=503, content={"detail": "No frame available yet"})
+    return Response(content=_latest_frame_jpeg, media_type="image/jpeg")
 
 
 @app.get("/health")
