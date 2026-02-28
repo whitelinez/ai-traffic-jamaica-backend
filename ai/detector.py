@@ -13,23 +13,9 @@ from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
-# Custom model class IDs (best.pt — trained on Jamaican traffic, 13 classes)
-VEHICLE_CLASSES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-CLASS_NAMES = {
-    0: "car",
-    1: "taxi",
-    2: "suv",
-    3: "pickup_truck",
-    4: "minibus",
-    5: "coaster",
-    6: "bus",
-    7: "truck",
-    8: "box_truck",
-    9: "motorcycle",
-    10: "bicycle",
-    11: "emergency_vehicle",
-    12: "pedestrian",
-}
+# Populated from model.names at startup — do not hardcode
+VEHICLE_CLASSES: list[int] = []
+CLASS_NAMES: dict[int, str] = {}
 
 
 class VehicleDetector:
@@ -95,6 +81,16 @@ class VehicleDetector:
             self.device = "cpu"
             self.device_name = None
             self.model.to("cpu")
+
+        # Populate class maps from model metadata so they're always correct
+        if hasattr(self.model, "names") and self.model.names:
+            CLASS_NAMES.clear()
+            CLASS_NAMES.update(self.model.names)
+            VEHICLE_CLASSES[:] = sorted(self.model.names.keys())
+        else:
+            CLASS_NAMES.update({2: "car", 3: "motorcycle", 5: "bus", 7: "truck"})
+            VEHICLE_CLASSES[:] = [2, 3, 5, 7]
+        logger.info("Model classes: %s", CLASS_NAMES)
         self.conf = conf_threshold
         self.infer_size = int(infer_size or int(os.getenv("DETECT_INFER_SIZE", "448")))
         self.iou = float(iou_threshold if iou_threshold is not None else float(os.getenv("DETECT_IOU", "0.50")))
