@@ -13,9 +13,23 @@ from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
-# COCO class IDs for vehicles
-VEHICLE_CLASSES = [2, 3, 5, 7]
-CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+# Custom model class IDs (best.pt — trained on Jamaican traffic, 13 classes)
+VEHICLE_CLASSES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+CLASS_NAMES = {
+    0: "car",
+    1: "taxi",
+    2: "suv",
+    3: "pickup_truck",
+    4: "minibus",
+    5: "coaster",
+    6: "bus",
+    7: "truck",
+    8: "box_truck",
+    9: "motorcycle",
+    10: "bicycle",
+    11: "emergency_vehicle",
+    12: "pedestrian",
+}
 
 
 class VehicleDetector:

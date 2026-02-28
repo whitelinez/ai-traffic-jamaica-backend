@@ -1168,7 +1168,8 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         if (loop_now - last_db_write) >= cfg.DB_SNAPSHOT_INTERVAL_SEC:
             db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total", "burst_mode_active")}
             asyncio.create_task(write_snapshot(db_snapshot))
-            asyncio.create_task(write_ml_detection_event(camera_id, snapshot, cfg.YOLO_MODEL, detector.conf))
+            if cfg.ML_TELEMETRY_ENABLED == 1:
+                asyncio.create_task(write_ml_detection_event(camera_id, snapshot, cfg.YOLO_MODEL, detector.conf))
             last_db_write = loop_now
             _mark_ai_db_write()
 

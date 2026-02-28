@@ -57,6 +57,7 @@ class Config:
     TRAINER_EPOCHS: int
     TRAINER_IMGSZ: int
     TRAINER_BATCH: int
+    ML_TELEMETRY_ENABLED: int   # set to 0 to stop ml_detection_events inserts
     ML_AUTO_RETRAIN_ENABLED: int
     ML_AUTO_RETRAIN_INTERVAL_MIN: int
     ML_AUTO_RETRAIN_HOURS: int
@@ -144,6 +145,7 @@ class Config:
         self.TRAINER_EPOCHS = int(os.getenv("TRAINER_EPOCHS", "20"))
         self.TRAINER_IMGSZ = int(os.getenv("TRAINER_IMGSZ", "640"))
         self.TRAINER_BATCH = int(os.getenv("TRAINER_BATCH", "16"))
+        self.ML_TELEMETRY_ENABLED = int(os.getenv("ML_TELEMETRY_ENABLED", "0"))
         self.ML_AUTO_RETRAIN_ENABLED = int(os.getenv("ML_AUTO_RETRAIN_ENABLED", "0"))
         self.ML_AUTO_RETRAIN_INTERVAL_MIN = int(os.getenv("ML_AUTO_RETRAIN_INTERVAL_MIN", "180"))
         self.ML_AUTO_RETRAIN_HOURS = int(os.getenv("ML_AUTO_RETRAIN_HOURS", "24"))
