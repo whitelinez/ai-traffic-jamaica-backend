@@ -311,15 +311,22 @@ def _merge_scene_and_weather(
     if api_lighting in {"day", "night"}:
         merged["scene_lighting"] = api_lighting
 
-    # Keep strong visual rain detection when present, otherwise prefer API weather.
-    if vision_weather == "raining" and vision_conf >= 0.7:
+    # API is authoritative for weather — vision rain detection has too many false
+    # positives from vertical structures (poles, lane markings, vehicles).
+    # Vision rain detection only fires when API data is unavailable.
+    if api_weather in {"rain", "raining"}:
         merged["scene_weather"] = "raining"
-        merged["scene_confidence"] = max(vision_conf, api_conf)
-        merged["scene_source"] = "vision+weather"
-    elif api_weather:
-        merged["scene_weather"] = api_weather
-        merged["scene_confidence"] = max(vision_conf, api_conf)
+        merged["scene_confidence"] = api_conf
         merged["scene_source"] = "weather"
+    elif api_weather and api_weather != "scanning":
+        merged["scene_weather"] = api_weather
+        merged["scene_confidence"] = api_conf
+        merged["scene_source"] = "weather"
+    elif vision_weather == "raining" and vision_conf >= 0.85:
+        # No API data — only trust vision rain detection at very high confidence
+        merged["scene_weather"] = "raining"
+        merged["scene_confidence"] = vision_conf
+        merged["scene_source"] = "vision"
     else:
         merged["scene_source"] = "vision"
 
