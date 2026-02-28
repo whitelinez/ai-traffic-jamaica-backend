@@ -715,16 +715,29 @@ class LineCounter:
         self._round_baseline_per_class = dict(self._per_class_total)
 
 
+_snapshot_write_count = 0
+_SNAPSHOT_PURGE_EVERY = 1000
+_SNAPSHOT_KEEP_HOURS = 24
+
+
 async def write_snapshot(snapshot: dict[str, Any]) -> None:
     """Write a count snapshot to Supabase (non-blocking, fire-and-forget).
 
     Skips writes where total == 0 to prevent poisoning the bootstrap query
     on the next redeploy (bootstrap reads the latest row by captured_at).
+    Auto-purges rows older than 24h every 1000 writes to keep table small.
     """
+    global _snapshot_write_count
     if not snapshot.get("total"):
         return
     try:
         sb = await get_supabase()
         await sb.table("count_snapshots").insert(snapshot).execute()
+        _snapshot_write_count += 1
+        if _snapshot_write_count % _SNAPSHOT_PURGE_EVERY == 0:
+            from datetime import datetime, timezone, timedelta
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=_SNAPSHOT_KEEP_HOURS)).isoformat()
+            await sb.table("count_snapshots").delete().lt("captured_at", cutoff).execute()
+            logger.info("count_snapshots purged rows older than %sh", _SNAPSHOT_KEEP_HOURS)
     except Exception as exc:
         logger.warning("Snapshot write failed: %s", exc)

@@ -914,7 +914,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     weather_status: dict[str, Any] | None = None
     last_weather_eval = 0.0
     capture = LiveDatasetCapture(
-        enabled=(cfg.AUTO_CAPTURE_ENABLED == 1),
+        enabled=False,  # dataset collection disabled — prevents storage quota overrun
         dataset_root=cfg.AUTO_CAPTURE_DATASET_ROOT,
         classes=[c.strip() for c in cfg.AUTO_CAPTURE_CLASSES.split(",")],
         min_conf=cfg.AUTO_CAPTURE_MIN_CONF,
@@ -924,7 +924,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         max_boxes_per_frame=cfg.AUTO_CAPTURE_MAX_BOXES_PER_FRAME,
     )
     uploader = SupabaseDatasetUploader(
-        enabled=(cfg.AUTO_CAPTURE_UPLOAD_ENABLED == 1),
+        enabled=False,  # storage upload disabled — prevents storage quota overrun
         supabase_url=cfg.SUPABASE_URL,
         service_role_key=cfg.SUPABASE_SERVICE_ROLE_KEY,
         bucket=cfg.AUTO_CAPTURE_UPLOAD_BUCKET,
@@ -1007,9 +1007,15 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             h, w = frame.shape[:2]
             counter = LineCounter(camera_id, w, h)
             await counter.bootstrap_from_latest_snapshot()
+            if not counter._confirmed_total:
+                logger.warning("Counter bootstrap returned 0 — retrying in 2s")
+                await asyncio.sleep(2.0)
+                await counter.bootstrap_from_latest_snapshot()
+                if not counter._confirmed_total:
+                    logger.warning("Counter bootstrap still 0 after retry — starting from zero")
             _counter_ref = counter
             frame_buf = True
-            logger.info("AI loop started: frame size %dx%d", w, h)
+            logger.info("AI loop started: frame size %dx%d, bootstrapped total=%d", w, h, counter._confirmed_total)
 
         loop_now = asyncio.get_running_loop().time()
         runtime_interval_sec = 20.0
