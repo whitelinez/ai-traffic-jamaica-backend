@@ -229,3 +229,46 @@ async def url_refresh_loop(alias: str, interval_seconds: int = 240) -> None:
             logger.error("URL refresh error: %s", exc)
 
         await asyncio.sleep(interval_seconds)
+
+
+async def bulk_url_refresh_loop(interval_seconds: int = 21600) -> None:
+    """
+    Refresh stream URLs for ALL cameras in the DB on a long interval (default 6 h).
+
+    This ensures every camera has a fresh stream_url in Supabase so that
+    switching the active camera is instant — no on-demand fetch delay.
+    Runs once at startup (with a short delay to let the main refresh loop go
+    first), then every `interval_seconds`.
+    """
+    await asyncio.sleep(30)   # let the main refresh loop claim the active URL first
+    while True:
+        try:
+            from supabase_client import get_supabase
+            sb = await get_supabase()
+            resp = await (
+                sb.table("cameras")
+                .select("ipcam_alias")
+                .order("is_active", desc=True)   # active camera first
+                .execute()
+            )
+            all_aliases = [
+                r["ipcam_alias"] for r in (resp.data or [])
+                if r.get("ipcam_alias")
+            ]
+            logger.info("Bulk URL refresh starting for %d cameras", len(all_aliases))
+            refreshed = 0
+            for cam_alias in all_aliases:
+                try:
+                    url = await fetch_fresh_stream_url(cam_alias)
+                    if url:
+                        await _supabase_update_stream_url(cam_alias, url)
+                        refreshed += 1
+                    # Small gap between cameras — avoids hammering ipcamlive
+                    await asyncio.sleep(5)
+                except Exception as exc:
+                    logger.warning("Bulk refresh failed for alias=%s: %s", cam_alias, exc)
+            logger.info("Bulk URL refresh done: %d/%d cameras updated", refreshed, len(all_aliases))
+        except Exception as exc:
+            logger.error("Bulk URL refresh loop error: %s", exc)
+
+        await asyncio.sleep(interval_seconds)
