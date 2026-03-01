@@ -18,6 +18,7 @@ from ai.url_refresher import (
     _supabase_update_stream_url,
     fetch_fresh_stream_url,
     get_candidate_aliases,
+    get_current_alias,
     get_current_url,
 )
 from config import get_config
