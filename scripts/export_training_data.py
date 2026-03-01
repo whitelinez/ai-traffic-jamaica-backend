@@ -24,6 +24,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from config import get_config
+
 _BUCKET = "ml-training-frames"
 _YOLO_CLASSES = ["car", "truck", "bus", "motorcycle"]
 _CLASS_IDX = {cls: i for i, cls in enumerate(_YOLO_CLASSES)}
@@ -92,7 +94,7 @@ async def export(output_dir: Path, val_split: float = 0.15, limit: int = 10000) 
         (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
     # Get signed URLs and download
-    cfg = __import__("config").get_config()
+    cfg = get_config()
     storage_url_base = f"{cfg.SUPABASE_URL}/storage/v1/object/public/{_BUCKET}"
 
     async with httpx.AsyncClient(timeout=30) as client:

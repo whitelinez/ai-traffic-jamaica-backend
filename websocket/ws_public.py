@@ -139,10 +139,15 @@ async def ws_live(
         },
     )
     await _send_bootstrap_count(websocket, get_current_alias() or cfg.CAMERA_ALIAS)
+    _MAX_MSG = 256   # bytes; client only sends keep-alive pings
+
     try:
         while True:
-            # Keep alive — client doesn't send data, just listens
             data = await websocket.receive_text()
+            if len(data.encode()) > _MAX_MSG:
+                logger.warning("Public WS oversized message from %s (%d bytes)", origin, len(data.encode()))
+                await websocket.close(code=1009, reason="Message too large")
+                break
             # Accept ping frames silently
     except WebSocketDisconnect:
         manager.disconnect_public(websocket)

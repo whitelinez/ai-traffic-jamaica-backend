@@ -5,6 +5,7 @@ POST /admin/resolve    → manually resolve a round
 POST /admin/set-role   → grant/revoke admin role on a user
 """
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
@@ -317,9 +318,10 @@ async def set_user_role(
     if role not in ("admin", "user"):
         raise HTTPException(status_code=400, detail="role must be 'admin' or 'user'")
 
+    _audit(admin, "set_user_role", f"target={target_user_id} role={role}")
     sb = await get_supabase()
     # Supabase admin SDK: update user metadata
-    resp = await sb.auth.admin.update_user_by_id(
+    await sb.auth.admin.update_user_by_id(
         target_user_id,
         {"app_metadata": {"role": role}},
     )
@@ -330,7 +332,7 @@ async def set_user_role(
 async def admin_list_users(
     admin: Annotated[dict, Depends(_require_admin_user)],
     page: int = Query(default=1, ge=1),
-    per_page: int = Query(default=200, ge=1, le=1000),
+    per_page: int = Query(default=50, ge=1, le=200),
 ):
     """
     List registered users (admin-only) with auth info + betting summary.
@@ -554,6 +556,7 @@ async def admin_ml_retrain(
     imgsz = int(body.get("imgsz", cfg.TRAINER_IMGSZ))
     batch = int(body.get("batch", cfg.TRAINER_BATCH))
 
+    _audit(admin, "ml_retrain", f"hours={hours} min_rows={min_rows}")
     result = await auto_retrain_cycle(
         hours=hours,
         min_rows=min_rows,
@@ -937,7 +940,19 @@ async def admin_ml_runtime_profile_patch(
         "note": "Persisted to cameras.count_settings. Runtime applies on next counter refresh.",
     }
 
+# ── Audit logging ──────────────────────────────────────────────────────────────
+
+_audit_logger = logging.getLogger("admin.audit")
+
+def _audit(user: dict, action: str, detail: str) -> None:
+    """Emit a structured audit log line for every destructive/privileged admin op."""
+    uid = (user or {}).get("sub") or (user or {}).get("id") or "unknown"
+    _audit_logger.warning("[AUDIT] user=%s action=%s %s", uid, action, detail)
+
+
 # ── Data maintenance ───────────────────────────────────────────────────────────
+
+_MIN_PRUNE_DAYS = 7    # never allow pruning data newer than 7 days
 
 @router.post("/prune")
 async def prune_old_data(
@@ -946,14 +961,25 @@ async def prune_old_data(
 ):
     """
     Delete rows older than `days` from ml_detection_events, count_snapshots, messages.
-    Body: {"days": 14, "dry_run": false}
+    Body: {"days": 14, "dry_run": false, "confirm": true}
+    - Minimum 7 days (cannot delete recent data)
+    - Requires confirm=true for destructive (non-dry-run) runs
     """
     from scripts.prune_old_data import prune
     body = await request.json()
     days    = int(body.get("days", 14))
     dry_run = bool(body.get("dry_run", False))
-    if days < 1 or days > 365:
-        raise HTTPException(status_code=400, detail="days must be 1–365")
+    confirm = bool(body.get("confirm", False))
+
+    if days < _MIN_PRUNE_DAYS or days > 365:
+        raise HTTPException(status_code=400, detail=f"days must be {_MIN_PRUNE_DAYS}–365")
+    if not dry_run and not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail='Set "confirm": true to execute a destructive prune. Use "dry_run": true to preview.',
+        )
+
+    _audit(_user, "prune_old_data", f"days={days} dry_run={dry_run}")
     result = await prune(days=days, dry_run=dry_run)
     return result
 

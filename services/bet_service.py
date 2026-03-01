@@ -410,9 +410,9 @@ async def place_bet(user_id: str, req: PlaceBetRequest) -> PlaceBetResponse:
         if 400 <= int(exc.status_code) < 500:
             _record_validation_event(False, str(exc.detail))
         raise
-    except Exception as exc:
-        logger.exception("Unhandled place_bet crash user_id=%s round_id=%s market_id=%s", user_id, req.round_id, req.market_id)
-        raise HTTPException(status_code=500, detail=f"Bet placement crashed: {exc}")
+    except Exception:
+        logger.exception("Unhandled place_bet crash")   # full traceback to server logs only
+        raise HTTPException(status_code=500, detail="Bet placement failed. Please try again.")
 
 
 async def place_live_bet(user_id: str, req: PlaceLiveBetRequest) -> PlaceLiveBetResponse:

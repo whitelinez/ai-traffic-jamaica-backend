@@ -13,6 +13,10 @@ from fastapi import WebSocket
 logger = logging.getLogger(__name__)
 
 
+MAX_CONNECTIONS_PER_USER = 4    # prevents single JWT from exhausting sockets
+MAX_PUBLIC_CONNECTIONS   = 2000  # hard cap on unauthenticated public connections
+
+
 class ConnectionManager:
     """
     Manages:
@@ -46,6 +50,9 @@ class ConnectionManager:
         )
 
     async def connect_public(self, ws: WebSocket, meta: dict[str, Any] | None = None) -> None:
+        if len(self._public) >= MAX_PUBLIC_CONNECTIONS:
+            await ws.close(code=4029, reason="Server at capacity")
+            return
         await ws.accept()
         self._public.add(ws)
         self._public_connection_events += 1
@@ -89,7 +96,13 @@ class ConnectionManager:
 
     # ── User channel ───────────────────────────────────────────────────────
 
+    def user_socket_count_for(self, user_id: str) -> int:
+        return len(self._user_connections.get(user_id, set()))
+
     async def connect_user(self, ws: WebSocket, user_id: str, meta: dict[str, Any] | None = None) -> None:
+        if self.user_socket_count_for(user_id) >= MAX_CONNECTIONS_PER_USER:
+            await ws.close(code=4029, reason="Connection limit exceeded")
+            return
         await ws.accept()
         self._user_connections[user_id].add(ws)
         self._user_connection_events += 1

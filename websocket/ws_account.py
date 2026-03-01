@@ -82,9 +82,15 @@ async def ws_account(
     except Exception as exc:
         logger.warning("Failed to send initial balance to user %s: %s", user_id, exc)
 
+    _MAX_MSG = 256   # bytes; client only sends keep-alive pings, not data
+
     try:
         while True:
-            _ = await websocket.receive_text()  # keep alive
+            msg = await websocket.receive_text()
+            if len(msg.encode()) > _MAX_MSG:
+                logger.warning("Account WS oversized message from user %s (%d bytes)", user_id, len(msg.encode()))
+                await websocket.close(code=1009, reason="Message too large")
+                break
     except WebSocketDisconnect:
         manager.disconnect_user(websocket, user_id)
     except Exception as exc:

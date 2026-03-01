@@ -44,17 +44,34 @@ def _make_token() -> str:
 
 
 def _build_stream_url(details: dict) -> str | None:
+    from urllib.parse import urlparse, urlunparse
     if str(details.get("streamavailable", "")) != "1":
         logger.warning("Camera reports streamavailable=0")
         return None
 
-    address = str(details.get("address", "")).rstrip("/")
+    address  = str(details.get("address", "")).strip().rstrip("/")
     streamid = str(details.get("streamid", "")).strip()
     if not address or not streamid:
         logger.warning("Missing address/streamid in stream state details")
         return None
-    address = address.replace("http://", "https://")
-    return f"{address}/streams/{streamid}/stream.m3u8"
+
+    # Force HTTPS using proper URL parsing — avoids partial replace bugs
+    try:
+        parsed = urlparse(address if "://" in address else f"https://{address}")
+        if parsed.scheme not in ("http", "https"):
+            logger.warning("Unexpected stream address scheme: %s", parsed.scheme)
+            return None
+        safe_address = urlunparse(parsed._replace(scheme="https"))
+        url = f"{safe_address.rstrip('/')}/streams/{streamid}/stream.m3u8"
+        # Final sanity check — must be an absolute https URL
+        final = urlparse(url)
+        if final.scheme != "https" or not final.netloc:
+            logger.warning("Rejecting malformed stream URL: %s", url)
+            return None
+        return url
+    except Exception as exc:
+        logger.warning("Failed to build stream URL: %s", exc)
+        return None
 
 
 async def _validate_manifest(client: httpx.AsyncClient, url: str) -> bool:
@@ -119,21 +136,20 @@ async def fetch_fresh_stream_url(alias: str) -> str | None:
 
 
 async def _supabase_update_stream_url(alias: str, url: str) -> bool:
-    from config import get_config
-    cfg = get_config()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.patch(
-            f"{cfg.SUPABASE_URL}/rest/v1/cameras",
-            params={"ipcam_alias": f"eq.{alias}"},
-            json={"stream_url": url},
-            headers={
-                "apikey": cfg.SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=representation",
-            },
+    # Use the Supabase async SDK client — service role key stays off the wire
+    from supabase_client import get_supabase
+    try:
+        sb = await get_supabase()
+        await (
+            sb.table("cameras")
+            .update({"stream_url": url})
+            .eq("ipcam_alias", alias)
+            .execute()
         )
-    return resp.status_code in (200, 204)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to persist stream URL for alias=%s: %s", alias, exc)
+        return False
 
 
 async def get_candidate_aliases(primary_alias: str | None = None) -> list[str]:

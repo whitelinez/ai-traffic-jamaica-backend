@@ -131,6 +131,7 @@ _count_anomaly_detector: CountAnomalyDetector = CountAnomalyDetector()
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
+_active_round_lock: asyncio.Lock | None = None   # initialised in lifespan (after event loop starts)
 _counter_ref: LineCounter | None = None
 _weather_cache: dict[str, Any] = {
     "ts": 0.0,
@@ -618,7 +619,11 @@ async def round_monitor_loop() -> None:
                 .execute()
 
             round_data = resp.data[0] if resp.data else None
-            _active_round = round_data
+            if _active_round_lock:
+                async with _active_round_lock:
+                    _active_round = round_data
+            else:
+                _active_round = round_data
 
             if round_data:
                 round_id = round_data["id"]
@@ -1251,7 +1256,8 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task
+    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task, _active_round_lock
+    _active_round_lock = asyncio.Lock()
 
     cfg = get_config()
     logger.info("Config validated — starting WHITELINEZ backend")
@@ -1328,9 +1334,18 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 cfg_once = None
+allowed_origins: list[str] = []
 try:
     cfg_once = get_config()
-    allowed_origins = [cfg_once.ALLOWED_ORIGIN]
+    raw_origin = (cfg_once.ALLOWED_ORIGIN or "").strip()
+    if raw_origin == "*":
+        raise ValueError(
+            "ALLOWED_ORIGIN must not be '*' when allow_credentials=True — "
+            "set it to your exact frontend URL (e.g. https://whitelinez.vercel.app)"
+        )
+    allowed_origins = [o.strip() for o in raw_origin.split(",") if o.strip()]
+except ValueError:
+    raise   # fail-fast on wildcard misconfiguration
 except Exception:
     allowed_origins = []
 

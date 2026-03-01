@@ -2,7 +2,7 @@
 routers/bets.py — POST /bets/place, POST /bets/place-live, GET /bets/history
 All endpoints require a valid Supabase JWT.
 """
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from typing import Annotated
 from uuid import UUID
 
@@ -47,8 +47,8 @@ async def place_live_bet_endpoint(
 @router.get("/history")
 async def bet_history(
     user: Annotated[dict, Depends(_get_current_user)],
-    limit: int = 50,
-    round_id: UUID | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    round_id: UUID | None = Query(default=None),
 ):
     sb = await get_supabase()
     user_id = get_user_id(user)
