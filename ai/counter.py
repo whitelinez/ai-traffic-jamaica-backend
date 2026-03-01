@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 LINE_REFRESH_INTERVAL = 30  # seconds
 TRACK_TTL_SEC = 12.0
 DEFAULT_COUNT_SETTINGS = {
-    "min_track_frames": 3,
+    "min_track_frames": 4,
     "min_box_area_ratio": 0.0015,
     "min_confidence": 0.22,
     "allowed_classes": ["car", "truck", "bus", "motorcycle"],
+    "count_direction": "in",
     "class_min_confidence": {
         "car": 0.20,
         "truck": 0.28,
@@ -445,6 +446,7 @@ class LineCounter:
             self._count_settings.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"])
             or DEFAULT_COUNT_SETTINGS["min_track_frames"]
         )
+        count_direction = str(self._count_settings.get("count_direction", "in") or "in")
         conf_alpha = float(self._count_settings.get("track_conf_smoothing_alpha", 0.35) or 0.35)
         conf_enter = float(self._count_settings.get("track_conf_enter", 0.42) or 0.42)
         conf_exit = float(self._count_settings.get("track_conf_exit", 0.30) or 0.30)
@@ -589,6 +591,10 @@ class LineCounter:
                 if not eligible_mask[i]:
                     continue
                 if not in_flag and not out_flag:
+                    continue
+                if count_direction == "in" and not in_flag:
+                    continue
+                if count_direction == "out" and not out_flag:
                     continue
 
                 tid = None
