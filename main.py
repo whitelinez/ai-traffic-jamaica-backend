@@ -43,7 +43,12 @@ from ai.dataset_capture import LiveDatasetCapture
 from ai.dataset_upload import SupabaseDatasetUploader
 from ai.url_refresher import url_refresh_loop, get_current_url, get_current_alias
 from ai.quality import compute_quality, write_quality_snapshot, quality_probe_loop
+from ai.occlusion_guard import OcclusionGuard
 from services.round_service import resolve_round_from_latest_snapshot
+from services.leaderboard_service import leaderboard_refresh_loop
+from services.anomaly_service import CountAnomalyDetector, anomaly_monitor_loop
+from services.daily_summary_service import daily_summary_loop
+from middleware.request_logger import RequestLoggerMiddleware
 from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
 from services.ml_pipeline_service import auto_retrain_cycle
@@ -70,6 +75,9 @@ _resolver_task: asyncio.Task | None = None
 _ml_retrain_task: asyncio.Task | None = None
 _watchdog_task: asyncio.Task | None = None
 _quality_probe_task: asyncio.Task | None = None
+_leaderboard_task: asyncio.Task | None = None
+_anomaly_task: asyncio.Task | None = None
+_daily_summary_task: asyncio.Task | None = None
 
 _WATCHDOG_INTERVAL_SEC = 8.0
 _WATCHDOG_RESTART_COOLDOWN_SEC = 12.0
@@ -116,6 +124,10 @@ _ai_inference_runtime: dict[str, Any] = {
     "device_name": None,
 }
 _latest_frame_jpeg: bytes | None = None
+
+# ── Per-session AI helpers (reset on camera switch) ────────────────────────────
+_occlusion_guard: OcclusionGuard = OcclusionGuard()
+_count_anomaly_detector: CountAnomalyDetector = CountAnomalyDetector()
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
@@ -1203,7 +1215,18 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             _last_quality = await asyncio.to_thread(compute_quality, frame)
             if _last_quality and camera_id:
                 asyncio.create_task(write_quality_snapshot(str(camera_id), _last_quality))
+                # Check for occlusion and broadcast alert if detected
+                occ_alert = _occlusion_guard.check(_last_quality)
+                if occ_alert and manager.public_count > 0:
+                    asyncio.create_task(manager.broadcast_public({"type": "camera_alert", **occ_alert}))
             last_quality_write = loop_now
+
+        # Inline anomaly detection on live count
+        if snapshot.get("total") is not None:
+            _count_anomaly_detector.camera_id = str(camera_id or "")
+            anom = _count_anomaly_detector.feed(float(snapshot["total"]))
+            if anom and manager.public_count > 0:
+                asyncio.create_task(manager.broadcast_public({"type": "count_anomaly", **anom}))
 
         if manager.public_count > 0:
             payload: dict = {"type": "count", **snapshot}
@@ -1228,7 +1251,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task
+    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task
 
     cfg = get_config()
     logger.info("Config validated — starting WHITELINEZ backend")
@@ -1267,10 +1290,19 @@ async def lifespan(app: FastAPI):
     _quality_probe_task = asyncio.create_task(quality_probe_loop(), name="quality_probe")
     logger.info("Quality probe loop started")
 
+    _leaderboard_task = asyncio.create_task(leaderboard_refresh_loop(), name="leaderboard_refresh")
+    logger.info("Leaderboard refresh loop started")
+
+    _anomaly_task = asyncio.create_task(anomaly_monitor_loop(), name="anomaly_monitor")
+    logger.info("Anomaly monitor loop started")
+
+    _daily_summary_task = asyncio.create_task(daily_summary_loop(), name="daily_summary")
+    logger.info("Daily summary loop started")
+
     yield
 
     # Shutdown
-    for task in (_watchdog_task, _quality_probe_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
+    for task in (_watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
         if task and not task.done():
             task.cancel()
             try:
@@ -1309,6 +1341,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+app.add_middleware(RequestLoggerMiddleware)
 
 # ── Routers ────────────────────────────────────────────────────────────────────
 app.include_router(bets.router)

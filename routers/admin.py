@@ -936,6 +936,56 @@ async def admin_ml_runtime_profile_patch(
         "count_settings": settings,
         "note": "Persisted to cameras.count_settings. Runtime applies on next counter refresh.",
     }
+
+# ── Data maintenance ───────────────────────────────────────────────────────────
+
+@router.post("/prune")
+async def prune_old_data(
+    request: Request,
+    _user: dict = Depends(_require_admin_user),
+):
+    """
+    Delete rows older than `days` from ml_detection_events, count_snapshots, messages.
+    Body: {"days": 14, "dry_run": false}
+    """
+    from scripts.prune_old_data import prune
+    body = await request.json()
+    days    = int(body.get("days", 14))
+    dry_run = bool(body.get("dry_run", False))
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=400, detail="days must be 1–365")
+    result = await prune(days=days, dry_run=dry_run)
+    return result
+
+
+@router.get("/leaderboard")
+async def admin_leaderboard(
+    window: int = Query(60, description="Window in seconds: 60, 180, or 300"),
+    _user: dict = Depends(_require_admin_user),
+):
+    """Return cached pre-aggregated leaderboard for the given window."""
+    from services.leaderboard_service import get_leaderboard
+    if window not in (60, 180, 300):
+        raise HTTPException(status_code=400, detail="window must be 60, 180, or 300")
+    return get_leaderboard(window)
+
+
+@router.get("/daily-summary")
+async def admin_daily_summary(
+    date: str = Query(..., description="Date (YYYY-MM-DD)"),
+    _user: dict = Depends(_require_admin_user),
+):
+    """Build and return a daily traffic summary for the given date."""
+    from services.daily_summary_service import build_daily_summary
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    summary = await build_daily_summary(dt)
+    return summary
+
+
 async def _resolve_runtime_camera_id(sb, cfg, camera_id: str | None) -> str:
     if camera_id:
         return str(camera_id)
