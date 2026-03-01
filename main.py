@@ -42,6 +42,7 @@ from ai.live_state import set_live_snapshot
 from ai.dataset_capture import LiveDatasetCapture
 from ai.dataset_upload import SupabaseDatasetUploader
 from ai.url_refresher import url_refresh_loop, get_current_url, get_current_alias
+from ai.quality import compute_quality, write_quality_snapshot, quality_probe_loop
 from services.round_service import resolve_round_from_latest_snapshot
 from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
@@ -68,6 +69,7 @@ _round_task: asyncio.Task | None = None
 _resolver_task: asyncio.Task | None = None
 _ml_retrain_task: asyncio.Task | None = None
 _watchdog_task: asyncio.Task | None = None
+_quality_probe_task: asyncio.Task | None = None
 
 _WATCHDOG_INTERVAL_SEC = 8.0
 _WATCHDOG_RESTART_COOLDOWN_SEC = 12.0
@@ -897,6 +899,8 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     frame_buf = None
     counter: LineCounter | None = None
     last_db_write = 0.0
+    last_quality_write = 0.0
+    _last_quality: dict = {}
     frame_index = 0
     process_every_n = 1
     runtime_profile_name = ""
@@ -1194,6 +1198,13 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             last_db_write = loop_now
             _mark_ai_db_write()
 
+        # Compute quality every 30s from the live AI camera frame
+        if (loop_now - last_quality_write) >= 30.0:
+            _last_quality = await asyncio.to_thread(compute_quality, frame)
+            if _last_quality and camera_id:
+                asyncio.create_task(write_quality_snapshot(str(camera_id), _last_quality))
+            last_quality_write = loop_now
+
         if manager.public_count > 0:
             payload: dict = {"type": "count", **snapshot}
             payload["runtime_profile"] = runtime_profile_name or None
@@ -1206,6 +1217,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
                 payload["round"] = _active_round
             _ws_fps = max(1.0, float(_ai_runtime_state.get("fps_estimate", 15.0) or 15.0))
             payload["fps"] = round(_ws_fps, 2)
+            payload["quality"] = _last_quality or None
             payload["detections"] = box_smoother.smooth_detections(
                 list(payload.get("detections") or []), fps=_ws_fps
             )
@@ -1216,7 +1228,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task
+    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task
 
     cfg = get_config()
     logger.info("Config validated — starting WHITELINEZ backend")
@@ -1252,10 +1264,13 @@ async def lifespan(app: FastAPI):
     _watchdog_task = asyncio.create_task(health_watchdog_loop(cfg), name="health_watchdog")
     logger.info("Health watchdog started")
 
+    _quality_probe_task = asyncio.create_task(quality_probe_loop(), name="quality_probe")
+    logger.info("Quality probe loop started")
+
     yield
 
     # Shutdown
-    for task in (_watchdog_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
+    for task in (_watchdog_task, _quality_probe_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
         if task and not task.done():
             task.cancel()
             try:
