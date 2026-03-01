@@ -178,7 +178,7 @@ async def stream_manifest(
             raise HTTPException(status_code=502, detail="Stream unavailable")
 
         segment_proxy_base = (
-            f"{cfg.FRONTEND_URL}/api/stream/ts" if cfg.FRONTEND_URL else ""
+            f"{cfg.FRONTEND_URL}/api/stream-ts" if cfg.FRONTEND_URL else ""
         )
         rewritten = _rewrite_manifest(resp.text, base_url, segment_proxy_base=segment_proxy_base)
         _manifest_cache["body"] = rewritten
