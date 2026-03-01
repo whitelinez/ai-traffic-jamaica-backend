@@ -67,23 +67,42 @@ async def _get_stream_url(cfg, preferred_alias: str | None = None) -> str:
         return live_url
 
     # Fall back to DB lookup for the requested alias.
-    supabase = await get_supabase()
-    aliases = await get_candidate_aliases(preferred_alias or cfg.CAMERA_ALIAS)
-    stream_url = ""
-    resolved_alias = ""
-    for alias in aliases:
-        cam = await (
-            supabase.table("cameras")
-            .select("stream_url")
-            .eq("ipcam_alias", alias)
-            .limit(1)
-            .execute()
-        )
-        candidate = str((cam.data or [{}])[0].get("stream_url") or "").strip()
-        if candidate:
-            stream_url = candidate
-            resolved_alias = alias
-            break
+    try:
+        supabase = await get_supabase()
+        aliases = await get_candidate_aliases(preferred_alias or cfg.CAMERA_ALIAS)
+        stream_url = ""
+        resolved_alias = ""
+        for alias in aliases:
+            cam = await (
+                supabase.table("cameras")
+                .select("stream_url")
+                .eq("ipcam_alias", alias)
+                .limit(1)
+                .execute()
+            )
+            candidate = str((cam.data or [{}])[0].get("stream_url") or "").strip()
+            if candidate:
+                stream_url = candidate
+                resolved_alias = alias
+                break
+    except Exception as exc:
+        logger.error("DB lookup failed in _get_stream_url: %s", exc)
+        aliases = [preferred_alias or cfg.CAMERA_ALIAS]
+        stream_url = ""
+        resolved_alias = ""
+
+    # If DB has no URL (null or table error), fetch one on-demand.
+    # This handles: newly switched camera, stream rotation, first boot.
+    if not stream_url:
+        logger.info("No cached stream URL — fetching on-demand for aliases=%s", aliases[:3])
+        for alias in aliases[:3]:
+            fresh = await fetch_fresh_stream_url(alias)
+            if fresh:
+                stream_url = fresh
+                resolved_alias = alias
+                await _supabase_update_stream_url(alias, fresh)
+                break
+
     if not stream_url:
         raise HTTPException(status_code=503, detail="Stream URL not yet available")
 
@@ -155,7 +174,14 @@ async def stream_manifest(
                 headers={"Cache-Control": "no-cache, no-store"},
             )
 
-        stream_url = await _get_stream_url(cfg, preferred_alias=preferred_alias)
+        try:
+            stream_url = await _get_stream_url(cfg, preferred_alias=preferred_alias)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Unexpected error resolving stream URL: %s", exc)
+            raise HTTPException(status_code=503, detail="Stream URL not yet available")
+
         base_url = stream_url.rsplit("/", 1)[0] + "/"
 
         try:
