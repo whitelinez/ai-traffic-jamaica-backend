@@ -562,7 +562,12 @@ class LineCounter:
                 if self._track_in_zone_frames.get(tid, 0) < effective_zone_confirm_frames:
                     continue
 
-                if tid not in self._track_in_count_zone and tid not in self._confirmed_track_ids:
+                # Use only _confirmed_track_ids to prevent double-counting.
+                # Checking _track_in_count_zone here would conflict with
+                # zone_confirm_frames > 1: on frame 2+ in-zone, the vehicle IS
+                # in _track_in_count_zone so the "not in" check would suppress
+                # the count even after the required N frames have elapsed.
+                if tid not in self._confirmed_track_ids:
                     new_crossings += self._confirm_crossing(cls_name, True, False, tid)
 
             self._track_in_count_zone = inside_now
