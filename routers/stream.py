@@ -37,31 +37,40 @@ _PROXY_HEADERS = {
 }
 
 # Short in-process cache to reduce load when many clients request the same
-# manifest at the same time.
+# manifest at the same time.  Both caches are alias-aware so switching the
+# active camera on the frontend immediately serves the correct stream.
 _MANIFEST_CACHE_TTL_SEC = 1.25
 _STREAM_URL_CACHE_TTL_SEC = 8.0
 _cache_lock = asyncio.Lock()
-_manifest_cache: dict[str, object] = {"body": "", "fetched_at": 0.0}
-_stream_url_cache: dict[str, object] = {"url": "", "fetched_at": 0.0}
+_manifest_cache: dict[str, object] = {"body": "", "fetched_at": 0.0, "alias": ""}
+_stream_url_cache: dict[str, object] = {"url": "", "fetched_at": 0.0, "alias": ""}
 
 
 async def _get_stream_url(cfg, preferred_alias: str | None = None) -> str:
     now = time.monotonic()
     cached_url = str(_stream_url_cache.get("url") or "")
     cached_at = float(_stream_url_cache.get("fetched_at") or 0.0)
-    if cached_url and (now - cached_at) < _STREAM_URL_CACHE_TTL_SEC:
+    cached_alias = str(_stream_url_cache.get("alias") or "")
+
+    # Cache hit only valid when the alias matches (or no alias was requested).
+    alias_match = not preferred_alias or preferred_alias == cached_alias
+    if cached_url and alias_match and (now - cached_at) < _STREAM_URL_CACHE_TTL_SEC:
         return cached_url
 
-    # Prefer the refresher's live-selected URL first.
+    # Use the refresher's live-selected URL only if it matches the requested alias.
     live_url = str(get_current_url() or "").strip()
-    if live_url:
+    live_alias = str(get_current_alias() or "").strip()
+    if live_url and (not preferred_alias or preferred_alias == live_alias):
         _stream_url_cache["url"] = live_url
+        _stream_url_cache["alias"] = live_alias
         _stream_url_cache["fetched_at"] = now
         return live_url
 
+    # Fall back to DB lookup for the requested alias.
     supabase = await get_supabase()
     aliases = await get_candidate_aliases(preferred_alias or cfg.CAMERA_ALIAS)
     stream_url = ""
+    resolved_alias = ""
     for alias in aliases:
         cam = await (
             supabase.table("cameras")
@@ -73,11 +82,13 @@ async def _get_stream_url(cfg, preferred_alias: str | None = None) -> str:
         candidate = str((cam.data or [{}])[0].get("stream_url") or "").strip()
         if candidate:
             stream_url = candidate
+            resolved_alias = alias
             break
     if not stream_url:
         raise HTTPException(status_code=503, detail="Stream URL not yet available")
 
     _stream_url_cache["url"] = stream_url
+    _stream_url_cache["alias"] = resolved_alias
     _stream_url_cache["fetched_at"] = now
     return stream_url
 
@@ -117,10 +128,14 @@ async def stream_manifest(
     if not validate_ws_token(token, cfg.WS_AUTH_SECRET):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+    preferred_alias = str(alias or "").strip() or None
+
     now = time.monotonic()
     cached_body = str(_manifest_cache.get("body") or "")
     cached_at = float(_manifest_cache.get("fetched_at") or 0.0)
-    if cached_body and (now - cached_at) < _MANIFEST_CACHE_TTL_SEC:
+    cached_alias = str(_manifest_cache.get("alias") or "")
+    alias_match = not preferred_alias or preferred_alias == cached_alias
+    if cached_body and alias_match and (now - cached_at) < _MANIFEST_CACHE_TTL_SEC:
         return Response(
             content=cached_body,
             media_type="application/vnd.apple.mpegurl",
@@ -131,14 +146,15 @@ async def stream_manifest(
         now = time.monotonic()
         cached_body = str(_manifest_cache.get("body") or "")
         cached_at = float(_manifest_cache.get("fetched_at") or 0.0)
-        if cached_body and (now - cached_at) < _MANIFEST_CACHE_TTL_SEC:
+        cached_alias = str(_manifest_cache.get("alias") or "")
+        alias_match = not preferred_alias or preferred_alias == cached_alias
+        if cached_body and alias_match and (now - cached_at) < _MANIFEST_CACHE_TTL_SEC:
             return Response(
                 content=cached_body,
                 media_type="application/vnd.apple.mpegurl",
                 headers={"Cache-Control": "no-cache, no-store"},
             )
 
-        preferred_alias = str(alias or "").strip() or None
         stream_url = await _get_stream_url(cfg, preferred_alias=preferred_alias)
         base_url = stream_url.rsplit("/", 1)[0] + "/"
 
@@ -152,16 +168,17 @@ async def stream_manifest(
                 # If the persisted URL is stale, force one refresh and retry.
                 if resp.status_code == 404:
                     logger.warning("Stored HLS URL returned 404, attempting one forced refresh")
-                    aliases = await get_candidate_aliases(preferred_alias or cfg.CAMERA_ALIAS)
-                    for alias in aliases:
-                        fresh = await fetch_fresh_stream_url(alias)
+                    fallback_aliases = await get_candidate_aliases(preferred_alias or cfg.CAMERA_ALIAS)
+                    for fa in fallback_aliases:
+                        fresh = await fetch_fresh_stream_url(fa)
                         if not fresh:
                             continue
                         stream_url = fresh
                         base_url = stream_url.rsplit("/", 1)[0] + "/"
                         _stream_url_cache["url"] = stream_url
+                        _stream_url_cache["alias"] = fa
                         _stream_url_cache["fetched_at"] = time.monotonic()
-                        await _supabase_update_stream_url(alias, fresh)
+                        await _supabase_update_stream_url(fa, fresh)
                         resp = await client.get(
                             stream_url,
                             headers=_PROXY_HEADERS,
@@ -182,6 +199,7 @@ async def stream_manifest(
         )
         rewritten = _rewrite_manifest(resp.text, base_url, segment_proxy_base=segment_proxy_base)
         _manifest_cache["body"] = rewritten
+        _manifest_cache["alias"] = preferred_alias or ""
         _manifest_cache["fetched_at"] = time.monotonic()
 
     return Response(
