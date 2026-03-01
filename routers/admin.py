@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel
 
 from models.round import CreateRoundRequest, ResolveRoundRequest, RoundOut
 from models.round_session import CreateRoundSessionRequest
@@ -24,6 +25,7 @@ from config import get_config
 from supabase_client import get_supabase
 from websocket.ws_manager import manager
 from middleware.rate_limiter import limiter
+from ai.url_refresher import trigger_force_refresh
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -1035,3 +1037,68 @@ async def _resolve_runtime_camera_id(sb, cfg, camera_id: str | None) -> str:
     if active_resp.data:
         return str(active_resp.data[0]["id"])
     raise HTTPException(status_code=404, detail="No camera found for runtime profile controls")
+
+
+# ── Camera Switch ──────────────────────────────────────────────────────────────
+
+class CameraSwitchPayload(BaseModel):
+    camera_id: str
+
+
+@router.post("/camera-switch")
+async def admin_camera_switch(
+    body: CameraSwitchPayload,
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Atomically switch the active AI camera.
+    1. Updates cameras.is_active in Supabase (exclusive — one active at a time).
+    2. Signals url_refresh_loop to run immediately (bypass the 4-min interval).
+    3. The AI loop detects the alias change on next frame and resets tracker +
+       counter + scene lock automatically.
+    Total switch time: < 30s (time to fetch a fresh HLS manifest for new camera).
+    """
+    camera_id = str(body.camera_id).strip()
+    if not camera_id:
+        raise HTTPException(status_code=400, detail="camera_id is required")
+
+    sb = await get_supabase()
+
+    # Verify camera exists
+    cam_resp = await (
+        sb.table("cameras")
+        .select("id, ipcam_alias")
+        .eq("id", camera_id)
+        .limit(1)
+        .execute()
+    )
+    if not cam_resp.data:
+        raise HTTPException(status_code=404, detail=f"Camera {camera_id!r} not found")
+
+    # Exclusive activation: deactivate all others, activate target
+    await (
+        sb.table("cameras")
+        .update({"is_active": False})
+        .neq("id", camera_id)
+        .execute()
+    )
+    await (
+        sb.table("cameras")
+        .update({"is_active": True})
+        .eq("id", camera_id)
+        .execute()
+    )
+
+    # Wake up url_refresh_loop to pick up the new active camera immediately
+    trigger_force_refresh()
+
+    switched_at = datetime.now(timezone.utc).isoformat()
+    alias = cam_resp.data[0].get("ipcam_alias") or camera_id
+    logger.info("Admin camera switch: id=%s alias=%s at=%s", camera_id, alias, switched_at)
+
+    return {
+        "ok": True,
+        "camera_id": camera_id,
+        "alias": alias,
+        "switched_at": switched_at,
+    }

@@ -1005,9 +1005,11 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             frame_buf = None      # reset so counter re-initialises on next frame
             process_every_n = 1   # reset frame-skip so old camera's perf state doesn't carry over
             box_smoother.reset()  # clear stale EMA state for previous camera
+            tracker = VehicleTracker()  # full re-instantiate: clears all ByteTrack vehicle IDs
             try:
                 runtime_profile_name = ""
                 last_runtime_eval = 0.0
+                last_runtime_switch = 0.0  # clear scene-lock cooldown
                 runtime_events.clear()
             except Exception:
                 pass

@@ -29,6 +29,7 @@ _REQUEST_HEADERS = {
 
 _current_url: str | None = None
 _current_alias: str | None = None
+_force_refresh_event: asyncio.Event | None = None
 
 
 def get_current_url() -> str | None:
@@ -37,6 +38,21 @@ def get_current_url() -> str | None:
 
 def get_current_alias() -> str | None:
     return _current_alias
+
+
+def _get_or_create_event() -> asyncio.Event:
+    global _force_refresh_event
+    if _force_refresh_event is None:
+        _force_refresh_event = asyncio.Event()
+    return _force_refresh_event
+
+
+def trigger_force_refresh() -> None:
+    """Signal url_refresh_loop to skip its current sleep and run immediately."""
+    try:
+        _get_or_create_event().set()
+    except RuntimeError:
+        pass  # no running event loop yet — ignore
 
 
 def _make_token() -> str:
@@ -200,6 +216,7 @@ async def get_candidate_aliases(primary_alias: str | None = None) -> list[str]:
 
 async def url_refresh_loop(alias: str, interval_seconds: int = 240) -> None:
     global _current_url, _current_alias
+    event = _get_or_create_event()
     while True:
         try:
             # Always re-query Supabase so switching is_active is reflected
@@ -228,7 +245,13 @@ async def url_refresh_loop(alias: str, interval_seconds: int = 240) -> None:
         except Exception as exc:
             logger.error("URL refresh error: %s", exc)
 
-        await asyncio.sleep(interval_seconds)
+        # Wait for either the scheduled interval OR a forced-refresh signal.
+        event.clear()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=float(interval_seconds))
+            logger.info("URL refresh: forced refresh triggered — running immediately")
+        except asyncio.TimeoutError:
+            pass
 
 
 async def bulk_url_refresh_loop(interval_seconds: int = 21600) -> None:
