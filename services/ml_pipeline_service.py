@@ -265,7 +265,7 @@ async def auto_retrain_cycle(
     hours: int = 24,
     min_rows: int = 1000,
     min_score_gain: float = 0.015,
-    base_model: str = "yolov8n.pt",
+    base_model: str = "yolov8s.pt",
     provider: str = "webhook",
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:

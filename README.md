@@ -15,7 +15,7 @@
 
 ## Recommended Starter Variables
 - `URL_REFRESH_INTERVAL=240`
-- `YOLO_MODEL=yolov8n.pt`
+- `YOLO_MODEL=yolov8s.pt`
 - `YOLO_CONF=0.45`
 - `COUNT_LINE_RATIO=0.55`
 - `DB_SNAPSHOT_INTERVAL_SEC=0.75`
