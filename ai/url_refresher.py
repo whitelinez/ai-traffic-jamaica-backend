@@ -153,6 +153,15 @@ async def _supabase_update_stream_url(alias: str, url: str) -> bool:
 
 
 async def get_candidate_aliases(primary_alias: str | None = None) -> list[str]:
+    """
+    Build an ordered list of aliases to try for stream URL resolution.
+
+    Priority:
+      1. primary_alias (if given) — e.g. the alias explicitly requested
+      2. The current is_active camera from Supabase (source of truth)
+      3. CAMERA_ALIAS env var (static fallback)
+      4. CAMERA_ALIASES env var list
+    """
     from config import get_config
     cfg = get_config()
     out: list[str] = []
@@ -162,10 +171,10 @@ async def get_candidate_aliases(primary_alias: str | None = None) -> list[str]:
         if s and s not in out:
             out.append(s)
 
-    _push(primary_alias or cfg.CAMERA_ALIAS)
-    for alias in getattr(cfg, "CAMERA_ALIASES", []) or []:
-        _push(alias)
+    if primary_alias:
+        _push(primary_alias)
 
+    # Supabase is_active cameras are the authoritative source — put them first
     try:
         from supabase_client import get_supabase
         sb = await get_supabase()
@@ -173,13 +182,18 @@ async def get_candidate_aliases(primary_alias: str | None = None) -> list[str]:
             sb.table("cameras")
             .select("ipcam_alias,created_at")
             .eq("is_active", True)
-            .order("created_at", desc=False)
+            .order("created_at", desc=True)
             .execute()
         )
         for row in resp.data or []:
             _push(row.get("ipcam_alias"))
     except Exception as exc:
         logger.debug("Could not load aliases from cameras table: %s", exc)
+
+    # Env var aliases as fallback
+    _push(cfg.CAMERA_ALIAS)
+    for alias in getattr(cfg, "CAMERA_ALIASES", []) or []:
+        _push(alias)
 
     return out
 
@@ -188,7 +202,9 @@ async def url_refresh_loop(alias: str, interval_seconds: int = 240) -> None:
     global _current_url, _current_alias
     while True:
         try:
-            aliases = await get_candidate_aliases(alias)
+            # Always re-query Supabase so switching is_active is reflected
+            # without a backend restart.
+            aliases = await get_candidate_aliases()
             if not aliases:
                 aliases = [alias]
 
