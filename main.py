@@ -1205,6 +1205,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             if _active_round:
                 payload["round"] = _active_round
             _ws_fps = max(1.0, float(_ai_runtime_state.get("fps_estimate", 15.0) or 15.0))
+            payload["fps"] = round(_ws_fps, 2)
             payload["detections"] = box_smoother.smooth_detections(
                 list(payload.get("detections") or []), fps=_ws_fps
             )
