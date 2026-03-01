@@ -1,12 +1,14 @@
 """
-routers/stream.py - GET /stream/live.m3u8
+routers/stream.py - GET /stream/live.m3u8 + GET /stream/ts
 Validates HMAC token, reads the current HLS URL from Supabase, proxies the
-manifest, and rewrites relative URLs to absolute URLs.
+manifest, and rewrites all segment URLs through a server-side proxy so the
+upstream camera CDN URL is never visible in the browser.
 """
 import asyncio
+import base64
 import logging
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -80,12 +82,28 @@ async def _get_stream_url(cfg, preferred_alias: str | None = None) -> str:
     return stream_url
 
 
-def _rewrite_manifest(manifest_body: str, base_url: str) -> str:
+def _rewrite_manifest(manifest_body: str, base_url: str, segment_proxy_base: str = "") -> str:
+    """
+    Rewrite all non-comment/non-tag lines in an HLS manifest.
+
+    When *segment_proxy_base* is set every segment/playlist line is replaced by:
+        {segment_proxy_base}?p=<base64url(original_absolute_url)>
+    so the browser never sees the upstream camera CDN domain.
+
+    Without segment_proxy_base, relative lines are resolved to absolute URLs
+    (original fall-back behaviour).
+    """
     lines = []
     for line in manifest_body.splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#") and not stripped.startswith("http"):
-            line = urljoin(base_url, stripped)
+        if stripped and not stripped.startswith("#"):
+            if segment_proxy_base:
+                # Resolve relative paths to absolute, then encode the full URL.
+                full_url = stripped if stripped.startswith("http") else urljoin(base_url, stripped)
+                encoded = base64.urlsafe_b64encode(full_url.encode()).rstrip(b"=").decode()
+                line = f"{segment_proxy_base}?p={encoded}"
+            elif not stripped.startswith("http"):
+                line = urljoin(base_url, stripped)
         lines.append(line)
     return "\n".join(lines)
 
@@ -159,7 +177,10 @@ async def stream_manifest(
             logger.warning("HLS manifest returned %d for URL: %s", resp.status_code, stream_url)
             raise HTTPException(status_code=502, detail="Stream unavailable")
 
-        rewritten = _rewrite_manifest(resp.text, base_url)
+        segment_proxy_base = (
+            f"{cfg.FRONTEND_URL}/api/stream/ts" if cfg.FRONTEND_URL else ""
+        )
+        rewritten = _rewrite_manifest(resp.text, base_url, segment_proxy_base=segment_proxy_base)
         _manifest_cache["body"] = rewritten
         _manifest_cache["fetched_at"] = time.monotonic()
 
@@ -168,3 +189,59 @@ async def stream_manifest(
         media_type="application/vnd.apple.mpegurl",
         headers={"Cache-Control": "no-cache, no-store"},
     )
+
+
+# ── Segment proxy ────────────────────────────────────────────────────────────
+
+# Only proxy requests to known ipcamlive CDN domains — prevents open-proxy abuse.
+_ALLOWED_SEGMENT_SUFFIXES = (".ipcamlive.com",)
+
+
+@router.get("/ts")
+async def stream_segment(p: str = Query(..., max_length=512)):
+    """
+    Proxy a single HLS transport-stream (*.ts) or sub-playlist (*.m3u8) segment.
+
+    *p* is a base64url-encoded upstream segment URL produced by _rewrite_manifest.
+    The actual CDN URL is never sent to the browser.
+    """
+    # Decode the opaque segment reference
+    try:
+        padded = p + "=" * (-len(p) % 4)
+        segment_url = base64.urlsafe_b64decode(padded).decode()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid segment reference")
+
+    parsed = urlparse(segment_url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Invalid segment scheme")
+
+    # Guard against open-proxy abuse: only allow known ipcamlive CDN hosts
+    if not any(parsed.netloc.endswith(s) for s in _ALLOWED_SEGMENT_SUFFIXES):
+        logger.warning("Segment proxy blocked non-ipcamlive host: %s", parsed.netloc)
+        raise HTTPException(status_code=400, detail="Segment origin not allowed")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                segment_url,
+                headers=_PROXY_HEADERS,
+                follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail="Segment unavailable")
+            media_type = (
+                "video/MP2T"
+                if segment_url.endswith(".ts")
+                else "application/vnd.apple.mpegurl"
+            )
+            return Response(
+                content=resp.content,
+                media_type=media_type,
+                headers={"Cache-Control": "public, max-age=10"},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Segment proxy error: %s", exc)
+        raise HTTPException(status_code=502, detail="Segment unavailable")

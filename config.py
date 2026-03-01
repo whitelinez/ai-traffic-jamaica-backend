@@ -166,6 +166,11 @@ class Config:
         self.AUTO_CAPTURE_UPLOAD_TIMEOUT_SEC = float(os.getenv("AUTO_CAPTURE_UPLOAD_TIMEOUT_SEC", "20"))
         self.BET_LOCK_SECONDS = int(os.getenv("BET_LOCK_SECONDS", "10"))
         self.WS_PORT = int(os.getenv("WS_PORT", "8000"))
+        # Frontend URL — used to rewrite HLS segment URLs through the Vercel proxy so
+        # the upstream camera CDN URL is never sent to the browser.
+        # Set to the Vercel deployment URL, e.g. https://your-app.vercel.app
+        # Leave empty to fall back to passthrough (segments served directly from CDN).
+        self.FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 
 
 @lru_cache(maxsize=1)
