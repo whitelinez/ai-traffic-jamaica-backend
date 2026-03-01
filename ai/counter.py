@@ -234,15 +234,15 @@ class LineCounter:
         merged = dict(DEFAULT_COUNT_SETTINGS)
         merged.update(count_settings)
         merged["min_track_frames"] = min(
-            3,
+            8,       # raised from 3 — admin can now honour values up to 8 frames
             max(1, int(merged.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"]) or DEFAULT_COUNT_SETTINGS["min_track_frames"]))
         )
         merged["min_box_area_ratio"] = min(
-            0.0015,
+            0.01,    # raised from 0.0015 — allows filtering out small noise at admin's discretion
             max(0.0, min(1.0, float(merged.get("min_box_area_ratio", 0.0) or 0.0)))
         )
         merged["min_confidence"] = min(
-            0.22,
+            0.45,    # raised from 0.22 — admin can now set a stricter global floor
             max(0.0, min(1.0, float(merged.get("min_confidence", 0.0) or 0.0)))
         )
         allowed_classes = merged.get("allowed_classes", [])
@@ -260,10 +260,10 @@ class LineCounter:
                 except Exception:
                     continue
         class_conf_caps = {
-            "car": 0.20,
-            "truck": 0.28,
-            "bus": 0.30,
-            "motorcycle": 0.22,
+            "car": 0.50,        # raised from 0.20
+            "truck": 0.50,      # raised from 0.28
+            "bus": 0.50,        # raised from 0.30
+            "motorcycle": 0.50, # raised from 0.22
         }
         for cls_name, cap in class_conf_caps.items():
             if cls_name in class_conf:
