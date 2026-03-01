@@ -96,12 +96,28 @@ async def _get_stream_url(cfg, preferred_alias: str | None = None) -> str:
     if not stream_url:
         logger.info("No cached stream URL — fetching on-demand for aliases=%s", aliases[:3])
         for alias in aliases[:3]:
-            fresh = await fetch_fresh_stream_url(alias)
+            try:
+                fresh = await fetch_fresh_stream_url(alias)
+            except Exception as exc:
+                logger.warning("on-demand fetch failed for alias=%s: %s", alias, exc)
+                fresh = None
             if fresh:
                 stream_url = fresh
                 resolved_alias = alias
                 await _supabase_update_stream_url(alias, fresh)
                 break
+
+    # Last resort: use whatever the background refresh loop has, even if the
+    # alias doesn't match.  The AI is already reading from this URL successfully.
+    if not stream_url:
+        fallback_url = str(get_current_url() or "").strip()
+        if fallback_url:
+            logger.warning(
+                "Stream URL unavailable for alias=%s — falling back to refresh-loop URL",
+                preferred_alias,
+            )
+            stream_url = fallback_url
+            resolved_alias = str(get_current_alias() or "")
 
     if not stream_url:
         raise HTTPException(status_code=503, detail="Stream URL not yet available")
