@@ -23,7 +23,7 @@ DEFAULT_COUNT_SETTINGS = {
     "min_box_area_ratio": 0.0015,
     "min_confidence": 0.22,
     "allowed_classes": ["car", "truck", "bus", "motorcycle"],
-    "count_direction": "in",
+    "count_direction": "both",
     "class_min_confidence": {
         "car": 0.20,
         "truck": 0.28,
