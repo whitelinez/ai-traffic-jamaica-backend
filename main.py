@@ -755,40 +755,60 @@ async def bet_resolver_loop() -> None:
                             end_count = 0
 
                     actual = max(0, end_count - baseline)
-                    won = (actual == exact_count)
+
+                    # Tiered scoring:
+                    #   EXACT  — actual == guess           → full payout
+                    #   CLOSE  — within ±max(1, 20% of guess) → 50% payout
+                    #   MISS   — everything else            → 0
+                    tolerance = max(1, round(exact_count * 0.20))
+                    diff = abs(actual - exact_count)
+                    is_exact = (diff == 0)
+                    is_close = (not is_exact) and (diff <= tolerance)
+
+                    if is_exact:
+                        payout = int(bet["potential_payout"])
+                        status = "won"
+                    elif is_close:
+                        payout = int(bet["potential_payout"] * 0.50)
+                        status = "close"
+                    else:
+                        payout = 0
+                        status = "lost"
 
                     update_data = {
-                        "status": "won" if won else "lost",
+                        "status": status,
                         "actual_count": actual,
                         "resolved_at": now.isoformat(),
                     }
                     await sb.table("bets").update(update_data).eq("id", bet_id).execute()
 
-                    # Credit winner
-                    if won:
+                    # Credit exact wins and close partial wins
+                    if payout > 0:
                         await sb.rpc(
                             "credit_user_balance",
                             {
                                 "p_user_id": user_id,
-                                "p_amount": int(bet["potential_payout"]),
+                                "p_amount": payout,
                             },
                         ).execute()
 
                     # Broadcast resolution to user
+                    # won=True for both exact and close so frontend shows correct badge
                     await manager.send_to_user(user_id, {
                         "type": "bet_resolved",
                         "user_id": str(user_id),
                         "bet_id": str(bet_id),
-                        "won": won,
-                        "payout": bet["potential_payout"] if won else 0,
+                        "won": (is_exact or is_close),
+                        "score_tier": "exact" if is_exact else ("close" if is_close else "miss"),
+                        "payout": payout,
                         "actual": actual,
                         "exact": exact_count,
                         "vehicle_class": vehicle_class,
                     })
 
                     logger.info(
-                        "Resolved bet %s: actual=%d exact=%d → %s",
-                        bet_id, actual, exact_count, "WON" if won else "LOST"
+                        "Resolved bet %s: actual=%d exact=%d tolerance=%d → %s payout=%d",
+                        bet_id, actual, exact_count, tolerance, status.upper(), payout
                     )
 
                 except Exception as bet_exc:
