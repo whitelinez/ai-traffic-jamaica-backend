@@ -314,7 +314,14 @@ class LineCounter:
                 (int(line_data["x4"] * w), int(line_data["y4"] * h)),
             ])
             if len(polygon) >= 3:
-                self._zone = sv.PolygonZone(polygon=polygon)
+                self._zone = sv.PolygonZone(
+                    polygon=polygon,
+                    triggering_anchors=[
+                        sv.Position.TOP_LEFT,    sv.Position.TOP_CENTER,    sv.Position.TOP_RIGHT,
+                        sv.Position.CENTER_LEFT, sv.Position.CENTER,        sv.Position.CENTER_RIGHT,
+                        sv.Position.BOTTOM_LEFT, sv.Position.BOTTOM_CENTER, sv.Position.BOTTOM_RIGHT,
+                    ],
+                )
                 self._zone_type = "polygon"
             else:
                 self._zone = None
