@@ -230,6 +230,31 @@ class LineCounter:
         count_settings = data.get("count_settings") or {}
         if not isinstance(count_settings, dict):
             count_settings = {}
+
+        # If this camera has no zones, fall back to the is_active camera's zones.
+        # Handles mis-routed camera_id (e.g. runtime profile vs active camera).
+        if not line_data and not detect_data:
+            try:
+                active_resp = await (
+                    sb.table("cameras")
+                    .select("id, count_line, detect_zone, count_settings")
+                    .eq("is_active", True)
+                    .limit(1)
+                    .execute()
+                )
+                if active_resp.data:
+                    ad = active_resp.data[0]
+                    line_data = ad.get("count_line") or line_data
+                    detect_data = ad.get("detect_zone") or detect_data
+                    if ad.get("count_settings") and not count_settings:
+                        count_settings = ad["count_settings"]
+                    logger.info(
+                        "_refresh_line: camera_id=%s has no zones, using active camera %s",
+                        self.camera_id, ad["id"],
+                    )
+            except Exception as exc:
+                logger.warning("_refresh_line active-camera fallback failed: %s", exc)
+
         self._raw_count_settings = dict(count_settings)
 
         merged = dict(DEFAULT_COUNT_SETTINGS)
@@ -438,6 +463,11 @@ class LineCounter:
 
         eligible_mask = [True] * len(detections)
         allowed_classes = set(self._count_settings.get("allowed_classes", []))
+        blocked_classes = set(
+            str(x).strip().lower()
+            for x in self._count_settings.get("blocked_classes", [])
+            if str(x).strip()
+        )
         class_min_conf = self._count_settings.get("class_min_confidence", {})
         count_unknown_as_car = self._to_bool(self._count_settings.get("count_unknown_as_car", True), True)
         min_conf = float(self._count_settings.get("min_confidence", 0.0) or 0.0)
@@ -446,7 +476,7 @@ class LineCounter:
             self._count_settings.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"])
             or DEFAULT_COUNT_SETTINGS["min_track_frames"]
         )
-        count_direction = str(self._count_settings.get("count_direction", "in") or "in")
+        count_direction = str(self._count_settings.get("count_direction", "both") or "both")
         conf_alpha = float(self._count_settings.get("track_conf_smoothing_alpha", 0.35) or 0.35)
         conf_enter = float(self._count_settings.get("track_conf_enter", 0.42) or 0.42)
         conf_exit = float(self._count_settings.get("track_conf_exit", 0.30) or 0.30)
@@ -471,6 +501,9 @@ class LineCounter:
                 continue
             cls_name = self._count_class_name(int(detections.class_id[i]), count_unknown_as_car)
 
+            if blocked_classes and cls_name in blocked_classes:
+                eligible_mask[i] = False
+                continue
             if allowed_classes and cls_name not in allowed_classes:
                 eligible_mask[i] = False
                 continue
@@ -627,6 +660,9 @@ class LineCounter:
                 ) else -1
 
                 if cls_id not in valid_cls_ids:
+                    continue
+                cls_name_box = CLASS_NAMES[cls_id].lower()
+                if blocked_classes and cls_name_box in blocked_classes:
                     continue
 
                 conf = None
