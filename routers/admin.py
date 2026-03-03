@@ -225,34 +225,34 @@ async def _load_db_audience_snapshot() -> dict:
     except Exception:
         pass
 
-    # Guest activity from chat messages (DB).
+    # Guest visitors from site_views (DB truth — all site visitors, not just chatters).
     try:
-        msg_rows = await (
-            sb.table("messages")
-            .select("guest_id,username,created_at,content")
-            .order("created_at", desc=True)
-            .limit(1200)
+        sv_guest_resp = await (
+            sb.table("site_views")
+            .select("guest_id,viewed_at,page_path,referrer")
+            .not_.is_("guest_id", "null")
+            .order("viewed_at", desc=True)
+            .limit(2000)
             .execute()
         )
-        guest_rows = [m for m in (msg_rows.data or []) if m.get("guest_id")]
+        sv_guest_rows = sv_guest_resp.data or []
         guest_map: dict[str, dict] = {}
-        guests_24h: set[str] = set()
-        for row in guest_rows:
+        guests_24h_set: set[str] = set()
+        for row in sv_guest_rows:
             gid = str(row.get("guest_id") or "").strip()
             if not gid:
                 continue
-            created_at = str(row.get("created_at") or "")
+            viewed_at = str(row.get("viewed_at") or "")
             if gid not in guest_map:
                 guest_map[gid] = {
                     "guest_id": gid,
-                    "username": row.get("username") or gid,
-                    "last_seen": created_at,
-                    "messages": 0,
-                    "last_message": row.get("content") or "",
+                    "last_seen": viewed_at,
+                    "page_path": row.get("page_path") or "/",
+                    "visits": 0,
                 }
-            guest_map[gid]["messages"] += 1
-            if created_at and created_at >= since_24h:
-                guests_24h.add(gid)
+            guest_map[gid]["visits"] += 1
+            if viewed_at and viewed_at >= since_24h:
+                guests_24h_set.add(gid)
 
         guests_sorted = sorted(
             guest_map.values(),
@@ -260,7 +260,7 @@ async def _load_db_audience_snapshot() -> dict:
             reverse=True,
         )
         result["guests_total"] = len(guest_map)
-        result["guests_24h"] = len(guests_24h)
+        result["guests_24h"] = len(guests_24h_set)
         result["guest_recent"] = guests_sorted[:30]
     except Exception:
         pass
