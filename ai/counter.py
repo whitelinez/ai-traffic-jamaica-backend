@@ -80,6 +80,7 @@ class LineCounter:
         self._track_conf_stable: dict[int, bool] = {}
         self._tracker_history: dict[int, dict] = {}  # track_id → {cls, last_conf}
         self._scene_status: dict[str, Any] = {}  # set externally by ai_loop after scene eval
+        self._analytics = AnalyticsZoneProcessor(camera_id, frame_width, frame_height)
 
         self._confirmed_in = 0
         self._confirmed_out = 0
@@ -702,6 +703,10 @@ class LineCounter:
         if _crossing_details:
             asyncio.create_task(self._write_vehicle_crossings(_crossing_details, snapshot))
 
+        asyncio.create_task(
+            self._analytics.process(detections, self._tracker_history, snapshot, now_mono)
+        )
+
         return snapshot
 
     def set_scene_status(self, scene: dict[str, Any]) -> None:
@@ -821,3 +826,383 @@ async def write_snapshot(snapshot: dict[str, Any]) -> None:
             logger.info("count_snapshots purged rows older than %sh", _SNAPSHOT_KEEP_HOURS)
     except Exception as exc:
         logger.warning("Snapshot write failed: %s", exc)
+
+
+class AnalyticsZoneProcessor:
+    """
+    Processes named analytics zones (queue, entry, exit, speed_a, speed_b, roi).
+    Zones loaded from camera_zones table, refreshed every ZONE_REFRESH_INTERVAL seconds.
+
+    Per frame it:
+    - Counts occupancy of queue/roi zones → periodic traffic_snapshots writes
+    - Tracks entry→exit zone transitions per track_id → turning_movements writes
+    - Measures speed between speed_a and speed_b zones → updates vehicle_crossings.speed_kmh
+    - Writes daily aggregates to traffic_daily every DAILY_WRITE_INTERVAL seconds
+    """
+
+    ZONE_REFRESH_INTERVAL = 60    # seconds between zone config reloads
+    SNAPSHOT_INTERVAL     = 30    # seconds between traffic_snapshot writes
+    DAILY_WRITE_INTERVAL  = 300   # seconds between traffic_daily upserts
+    TRACK_TTL_SEC         = 15.0  # evict stale per-track state after this many seconds
+
+    def __init__(self, camera_id: str, frame_width: int, frame_height: int) -> None:
+        self.camera_id    = camera_id
+        self.frame_width  = frame_width
+        self.frame_height = frame_height
+
+        self._zone_polys: dict[str, "sv.PolygonZone"] = {}  # name → PolygonZone
+        self._zone_types: dict[str, str] = {}               # name → zone_type
+        self._zone_meta:  dict[str, dict] = {}              # name → metadata
+
+        self._last_refresh       = 0.0
+        self._last_snapshot_write = 0.0
+        self._last_daily_write   = 0.0
+
+        # Per-track state
+        # entry tracking: track_id → {entry_zone, entry_time_ms, cls, conf}
+        self._track_entry: dict[int, dict] = {}
+        # speed_a crossing: track_id → {time_ms, zone_name}
+        self._track_speed_a: dict[int, dict] = {}
+        # TTL tracking
+        self._track_last_seen: dict[int, float] = {}
+
+        # Queue depth accumulator between snapshot writes
+        self._queue_acc: list[int] = []
+
+    # ── Zone loading ──────────────────────────────────────────────────────────
+
+    async def refresh_zones(self) -> None:
+        """Reload zone definitions from camera_zones table."""
+        try:
+            sb = await get_supabase()
+            resp = await (
+                sb.table("camera_zones")
+                .select("id,name,zone_type,points,metadata")
+                .eq("camera_id", self.camera_id)
+                .eq("active", True)
+                .execute()
+            )
+            zones = resp.data or []
+            w, h = self.frame_width, self.frame_height
+            new_polys: dict[str, sv.PolygonZone] = {}
+            new_types: dict[str, str] = {}
+            new_meta:  dict[str, dict] = {}
+
+            for z in zones:
+                name      = z.get("name", "")
+                zone_type = z.get("zone_type", "roi")
+                pts       = z.get("points") or []
+                meta      = z.get("metadata") or {}
+                if not isinstance(pts, list) or len(pts) < 3:
+                    continue
+                pixel_pts = []
+                for p in pts:
+                    if isinstance(p, dict) and "x" in p and "y" in p:
+                        pixel_pts.append((int(float(p["x"]) * w), int(float(p["y"]) * h)))
+                if len(pixel_pts) < 3:
+                    continue
+                # Reuse LineCounter's polygon normaliser for consistent winding
+                poly_arr = LineCounter._normalize_polygon(pixel_pts)
+                if len(poly_arr) >= 3:
+                    new_polys[name] = sv.PolygonZone(polygon=poly_arr)
+                    new_types[name] = zone_type
+                    new_meta[name]  = meta
+
+            self._zone_polys = new_polys
+            self._zone_types = new_types
+            self._zone_meta  = new_meta
+            self._last_refresh = time.monotonic()
+            logger.debug(
+                "AnalyticsZoneProcessor: loaded %d zones for camera %s",
+                len(new_polys), self.camera_id,
+            )
+        except Exception as exc:
+            logger.warning("AnalyticsZoneProcessor.refresh_zones failed: %s", exc)
+
+    # ── Per-frame processing ──────────────────────────────────────────────────
+
+    async def process(
+        self,
+        detections: "sv.Detections",
+        tracker_history: dict,
+        snapshot: dict,
+        now_mono: float,
+    ) -> None:
+        """
+        Called after LineCounter.process().
+        Must not raise — all errors are caught internally.
+        """
+        try:
+            await self._process_inner(detections, tracker_history, snapshot, now_mono)
+        except Exception as exc:
+            logger.debug("AnalyticsZoneProcessor.process error: %s", exc)
+
+    async def _process_inner(
+        self,
+        detections: "sv.Detections",
+        tracker_history: dict,
+        snapshot: dict,
+        now_mono: float,
+    ) -> None:
+        # Refresh zone definitions periodically
+        if (now_mono - self._last_refresh) > self.ZONE_REFRESH_INTERVAL:
+            await self.refresh_zones()
+
+        if not self._zone_polys:
+            self._queue_acc.append(0)
+            await self._maybe_write_snapshot(0, 0, snapshot, now_mono)
+            return
+
+        tracker_ids = getattr(detections, "tracker_id", None)
+        has_trackers = (
+            tracker_ids is not None and len(tracker_ids) == len(detections) and len(detections) > 0
+        )
+
+        # Evaluate each zone → occupancy count + per-track membership
+        zone_occupancy: dict[str, int] = {}
+        track_zones: dict[int, set[str]] = {}  # track_id → set of zone names it's currently inside
+
+        for name, poly in self._zone_polys.items():
+            if len(detections) == 0:
+                zone_occupancy[name] = 0
+                continue
+            try:
+                inside_mask = poly.trigger(detections=detections)
+            except Exception:
+                continue
+            zone_occupancy[name] = int(np.sum(inside_mask))
+            if has_trackers:
+                for i, is_inside in enumerate(inside_mask):
+                    if not is_inside:
+                        continue
+                    try:
+                        tid = int(tracker_ids[i])
+                    except Exception:
+                        continue
+                    if tid < 0:
+                        continue
+                    track_zones.setdefault(tid, set()).add(name)
+                    self._track_last_seen[tid] = now_mono
+
+        # Process turning movements and speed traps
+        new_turnings: list[dict] = []
+        for tid, zones_in in track_zones.items():
+            h   = tracker_history.get(tid, {})
+            cls = h.get("cls", "car")
+            conf = h.get("last_conf", 0.0)
+            for zone_name in zones_in:
+                ztype = self._zone_types.get(zone_name, "roi")
+
+                if ztype == "entry" and tid not in self._track_entry:
+                    # Vehicle just arrived at an approach leg
+                    self._track_entry[tid] = {
+                        "entry_zone":    zone_name,
+                        "entry_time_ms": int(now_mono * 1000),
+                        "cls":           cls,
+                        "conf":          conf,
+                    }
+
+                elif ztype == "exit":
+                    entry_info = self._track_entry.get(tid)
+                    if entry_info:
+                        dwell_ms = int(now_mono * 1000) - entry_info["entry_time_ms"]
+                        new_turnings.append({
+                            "camera_id":     self.camera_id,
+                            "captured_at":   snapshot.get("captured_at"),
+                            "track_id":      tid,
+                            "vehicle_class": entry_info["cls"],
+                            "entry_zone":    entry_info["entry_zone"],
+                            "exit_zone":     zone_name,
+                            "dwell_ms":      max(0, dwell_ms),
+                            "confidence":    round(entry_info["conf"], 4),
+                        })
+                        del self._track_entry[tid]
+
+                elif ztype == "speed_a" and tid not in self._track_speed_a:
+                    self._track_speed_a[tid] = {
+                        "time_ms":  int(now_mono * 1000),
+                        "zone":     zone_name,
+                    }
+
+                elif ztype == "speed_b":
+                    sa = self._track_speed_a.get(tid)
+                    if sa:
+                        delta_ms = int(now_mono * 1000) - sa["time_ms"]
+                        if delta_ms > 50:  # ignore sub-50ms (tracker jitter)
+                            dist_m = float(
+                                self._zone_meta.get(sa["zone"], {}).get("distance_m", 0) or 0
+                            )
+                            if dist_m > 0:
+                                speed_kmh = round((dist_m / (delta_ms / 1000.0)) * 3.6, 1)
+                                asyncio.create_task(
+                                    self._update_crossing_speed(tid, speed_kmh)
+                                )
+                        del self._track_speed_a[tid]
+
+        if new_turnings:
+            asyncio.create_task(self._write_turnings(new_turnings))
+
+        # Queue depth = total vehicles in all queue-type zones
+        total_queue = sum(
+            v for k, v in zone_occupancy.items()
+            if self._zone_types.get(k) == "queue"
+        )
+        roi_visible = sum(
+            v for k, v in zone_occupancy.items()
+            if self._zone_types.get(k) == "roi"
+        )
+        self._queue_acc.append(total_queue)
+
+        # Evict stale track state
+        stale = [
+            tid for tid, ts in self._track_last_seen.items()
+            if (now_mono - ts) > self.TRACK_TTL_SEC
+        ]
+        for tid in stale:
+            self._track_last_seen.pop(tid, None)
+            self._track_entry.pop(tid, None)
+            self._track_speed_a.pop(tid, None)
+
+        await self._maybe_write_snapshot(total_queue, roi_visible, snapshot, now_mono)
+        await self._maybe_write_daily(snapshot, now_mono)
+
+    # ── Periodic writers ──────────────────────────────────────────────────────
+
+    async def _maybe_write_snapshot(
+        self, queue_depth: int, roi_visible: int, snapshot: dict, now_mono: float
+    ) -> None:
+        if (now_mono - self._last_snapshot_write) < self.SNAPSHOT_INTERVAL:
+            return
+        self._last_snapshot_write = now_mono
+        avg_queue = (
+            int(sum(self._queue_acc) / len(self._queue_acc))
+            if self._queue_acc else queue_depth
+        )
+        self._queue_acc.clear()
+        total_visible = len(self._track_last_seen)
+        asyncio.create_task(
+            self._write_snapshot_row(avg_queue, roi_visible, total_visible, snapshot)
+        )
+
+    async def _maybe_write_daily(self, snapshot: dict, now_mono: float) -> None:
+        if (now_mono - self._last_daily_write) < self.DAILY_WRITE_INTERVAL:
+            return
+        self._last_daily_write = now_mono
+        asyncio.create_task(self._upsert_daily(snapshot))
+
+    # ── DB writers ────────────────────────────────────────────────────────────
+
+    async def _write_snapshot_row(
+        self, queue_depth: int, roi_visible: int, total_visible: int, snapshot: dict
+    ) -> None:
+        try:
+            sb = await get_supabase()
+            await sb.table("traffic_snapshots").insert({
+                "camera_id":    self.camera_id,
+                "captured_at":  snapshot.get("captured_at"),
+                "queue_depth":  queue_depth,
+                "roi_visible":  roi_visible,
+                "total_visible": total_visible,
+            }).execute()
+        except Exception as exc:
+            logger.debug("traffic_snapshots write failed: %s", exc)
+
+    async def _write_turnings(self, rows: list[dict]) -> None:
+        try:
+            sb = await get_supabase()
+            await sb.table("turning_movements").insert(rows).execute()
+        except Exception as exc:
+            logger.debug("turning_movements write failed: %s", exc)
+
+    async def _update_crossing_speed(self, track_id: int, speed_kmh: float) -> None:
+        try:
+            sb = await get_supabase()
+            await (
+                sb.table("vehicle_crossings")
+                .update({"speed_kmh": speed_kmh})
+                .eq("track_id", track_id)
+                .eq("camera_id", self.camera_id)
+                .is_("speed_kmh", "null")   # only update if not already set
+                .execute()
+            )
+        except Exception as exc:
+            logger.debug("speed update failed track_id=%s: %s", track_id, exc)
+
+    async def _upsert_daily(self, snapshot: dict) -> None:
+        """Aggregate today's data from vehicle_crossings and traffic_snapshots into traffic_daily."""
+        try:
+            sb = await get_supabase()
+            today = datetime.now(timezone.utc).date().isoformat()
+            day_start = today + "T00:00:00+00:00"
+            day_end   = today + "T23:59:59+00:00"
+
+            # Crossing totals for today
+            xresp = await (
+                sb.table("vehicle_crossings")
+                .select("vehicle_class,direction")
+                .eq("camera_id", self.camera_id)
+                .gte("captured_at", day_start)
+                .lte("captured_at", day_end)
+                .execute()
+            )
+            rows = xresp.data or []
+            total = len(rows)
+            car_c = truck_c = bus_c = moto_c = in_c = out_c = 0
+            for r in rows:
+                cls = (r.get("vehicle_class") or "car").lower()
+                if cls == "car":        car_c  += 1
+                elif cls == "truck":    truck_c += 1
+                elif cls == "bus":      bus_c   += 1
+                elif cls == "motorcycle": moto_c += 1
+                if r.get("direction") == "in":  in_c  += 1
+                if r.get("direction") == "out": out_c += 1
+
+            # Queue stats for today
+            sresp = await (
+                sb.table("traffic_snapshots")
+                .select("queue_depth,captured_at")
+                .eq("camera_id", self.camera_id)
+                .gte("captured_at", day_start)
+                .lte("captured_at", day_end)
+                .execute()
+            )
+            snaps = sresp.data or []
+            avg_queue = peak_queue = 0
+            if snaps:
+                depths = [s.get("queue_depth", 0) for s in snaps]
+                avg_queue  = round(sum(depths) / len(depths), 2)
+                peak_queue = max(depths)
+
+            # Speed average
+            vresp = await (
+                sb.table("vehicle_crossings")
+                .select("speed_kmh")
+                .eq("camera_id", self.camera_id)
+                .gte("captured_at", day_start)
+                .lte("captured_at", day_end)
+                .not_.is_("speed_kmh", "null")
+                .execute()
+            )
+            speeds = [r["speed_kmh"] for r in (vresp.data or []) if r.get("speed_kmh")]
+            avg_speed = round(sum(speeds) / len(speeds), 2) if speeds else None
+
+            await (
+                sb.table("traffic_daily")
+                .upsert({
+                    "camera_id":        self.camera_id,
+                    "date":             today,
+                    "total_crossings":  total,
+                    "car_count":        car_c,
+                    "truck_count":      truck_c,
+                    "bus_count":        bus_c,
+                    "motorcycle_count": moto_c,
+                    "count_in":         in_c,
+                    "count_out":        out_c,
+                    "avg_queue_depth":  avg_queue,
+                    "peak_queue_depth": peak_queue,
+                    "avg_speed_kmh":    avg_speed,
+                }, on_conflict="camera_id,date")
+                .execute()
+            )
+        except Exception as exc:
+            logger.debug("traffic_daily upsert failed: %s", exc)
