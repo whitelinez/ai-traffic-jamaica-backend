@@ -1187,6 +1187,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
                     weather_status = None
                 last_weather_eval = loop_now
             scene_status = _merge_scene_and_weather(vision_scene, weather_status)
+            counter.set_scene_status(scene_status)
             last_scene_eval = loop_now
         capture_result = None
         capture_is_paused = is_capture_paused()
@@ -1233,7 +1234,8 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total", "burst_mode_active")}
             asyncio.create_task(write_snapshot(db_snapshot))
             if cfg.ML_TELEMETRY_ENABLED == 1:
-                asyncio.create_task(write_ml_detection_event(camera_id, snapshot, cfg.YOLO_MODEL, detector.conf))
+                snapshot_with_scene = {**snapshot, "scene_lighting": scene_status.get("scene_lighting"), "scene_weather": scene_status.get("scene_weather")}
+                asyncio.create_task(write_ml_detection_event(camera_id, snapshot_with_scene, cfg.YOLO_MODEL, detector.conf))
             last_db_write = loop_now
             _mark_ai_db_write()
 

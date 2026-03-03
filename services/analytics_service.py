@@ -129,6 +129,8 @@ async def write_ml_detection_event(camera_id: str, snapshot: dict[str, Any], mod
             "avg_confidence": round(avg_conf, 4),
             "class_counts": class_counts,
             "new_crossings": int(snapshot.get("new_crossings", 0) or 0),
+            "scene_lighting": snapshot.get("scene_lighting"),
+            "scene_weather": snapshot.get("scene_weather"),
         }
         await sb.table("ml_detection_events").insert(row).execute()
     except Exception:

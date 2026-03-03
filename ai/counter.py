@@ -2,6 +2,7 @@
 ai/counter.py - LineZone crossing counter + Supabase snapshot writer.
 Polls the cameras table for admin-defined count and detect zones every 30s.
 """
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -77,6 +78,8 @@ class LineCounter:
         self._track_in_zone_frames: dict[int, int] = {}
         self._track_conf_ema: dict[int, float] = {}
         self._track_conf_stable: dict[int, bool] = {}
+        self._tracker_history: dict[int, dict] = {}  # track_id → {cls, last_conf}
+        self._scene_status: dict[str, Any] = {}  # set externally by ai_loop after scene eval
 
         self._confirmed_in = 0
         self._confirmed_out = 0
@@ -374,6 +377,7 @@ class LineCounter:
             self._track_in_zone_frames.pop(tid, None)
             self._track_conf_ema.pop(tid, None)
             self._track_conf_stable.pop(tid, None)
+            self._tracker_history.pop(tid, None)
         self._prevalidated_track_ids.difference_update(stale_set)
         self._track_in_count_zone.difference_update(stale_set)
 
@@ -520,6 +524,20 @@ class LineCounter:
                     self._track_seen_frames[tid] = self._track_seen_frames.get(tid, 0) + 1
                     seen_this_frame.add(tid)
             self._cleanup_stale_tracks(now_mono)
+            # Update tracker history with latest class + confidence per track
+            for i in range(len(detections)):
+                tid = self._safe_tracker_id(tracker_ids[i])
+                if tid is None:
+                    continue
+                cls_h = self._count_class_name(int(detections.class_id[i]), count_unknown_as_car) if (
+                    detections.class_id is not None and i < len(detections.class_id)
+                ) else "car"
+                conf_h = float(detections.confidence[i]) if (
+                    detections.confidence is not None and i < len(detections.confidence)
+                ) else 0.0
+                h = self._tracker_history.setdefault(tid, {"cls": cls_h, "last_conf": conf_h})
+                h["cls"] = cls_h
+                h["last_conf"] = conf_h
 
         if self._detect_zone is not None and len(detections) > 0:
             detect_mask = self._detect_zone.trigger(detections=detections)
@@ -534,6 +552,9 @@ class LineCounter:
                     self._prevalidated_track_ids.add(tid)
         if self._detect_zone is None:
             detect_inside_mask = [True] * len(detections)
+
+        _crossing_details: list[dict] = []
+        confirmed_before = frozenset(self._confirmed_track_ids)
 
         if self._zone_type == "polygon":
             inside_mask = self._zone.trigger(detections=detections) if len(detections) > 0 else []
@@ -568,7 +589,17 @@ class LineCounter:
                 # in _track_in_count_zone so the "not in" check would suppress
                 # the count even after the required N frames have elapsed.
                 if tid not in self._confirmed_track_ids:
-                    new_crossings += self._confirm_crossing(cls_name, True, False, tid)
+                    added = self._confirm_crossing(cls_name, True, False, tid)
+                    new_crossings += added
+                    if added:
+                        h = self._tracker_history.get(tid, {})
+                        _crossing_details.append({
+                            "track_id": tid,
+                            "vehicle_class": h.get("cls", cls_name),
+                            "confidence": round(h.get("last_conf", 0.0), 4),
+                            "direction": "in",
+                            "dwell_frames": self._track_seen_frames.get(tid, 0),
+                        })
 
             self._track_in_count_zone = inside_now
             # Reset inside streak for tracks no longer inside.
@@ -604,7 +635,17 @@ class LineCounter:
                     continue
 
                 cls_name = self._count_class_name(int(detections.class_id[i]), count_unknown_as_car)
-                new_crossings += self._confirm_crossing(cls_name, bool(in_flag), bool(out_flag), tid)
+                added = self._confirm_crossing(cls_name, bool(in_flag), bool(out_flag), tid)
+                new_crossings += added
+                if added:
+                    h = self._tracker_history.get(tid, {})
+                    _crossing_details.append({
+                        "track_id": tid,
+                        "vehicle_class": h.get("cls", cls_name),
+                        "confidence": round(h.get("last_conf", 0.0), 4),
+                        "direction": "in" if in_flag else "out",
+                        "dwell_frames": self._track_seen_frames.get(tid, 0),
+                    })
 
             total_in = self._confirmed_in
             total_out = self._confirmed_out
@@ -657,7 +698,40 @@ class LineCounter:
             "confirmed_crossings_total": self._confirmed_total,
             "burst_mode_active": burst_mode_active,
         }
+
+        if _crossing_details:
+            asyncio.create_task(self._write_vehicle_crossings(_crossing_details, snapshot))
+
         return snapshot
+
+    def set_scene_status(self, scene: dict[str, Any]) -> None:
+        """Called by ai_loop after scene inference to keep scene fields fresh for crossing writes."""
+        self._scene_status = scene or {}
+
+    async def _write_vehicle_crossings(self, crossings: list[dict], snapshot: dict[str, Any]) -> None:
+        """Bulk-insert confirmed vehicle crossings into vehicle_crossings table."""
+        try:
+            sb = await get_supabase()
+            captured_at = snapshot.get("captured_at") or datetime.now(timezone.utc).isoformat()
+            lighting = self._scene_status.get("scene_lighting")
+            weather = self._scene_status.get("scene_weather")
+            rows = [
+                {
+                    "camera_id": self.camera_id,
+                    "captured_at": captured_at,
+                    "track_id": c["track_id"],
+                    "vehicle_class": c["vehicle_class"],
+                    "confidence": c["confidence"],
+                    "direction": c["direction"],
+                    "dwell_frames": c["dwell_frames"],
+                    "scene_lighting": lighting,
+                    "scene_weather": weather,
+                }
+                for c in crossings
+            ]
+            await sb.table("vehicle_crossings").insert(rows).execute()
+        except Exception as exc:
+            logger.debug("vehicle_crossings write failed: %s", exc)
 
     def zone_filter(self, detections: sv.Detections) -> sv.Detections:
         """
@@ -698,6 +772,7 @@ class LineCounter:
         self._track_in_zone_frames.clear()
         self._track_conf_ema.clear()
         self._track_conf_stable.clear()
+        self._tracker_history.clear()
         self._confirmed_in = 0
         self._confirmed_out = 0
         self._confirmed_total = 0
