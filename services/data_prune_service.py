@@ -27,14 +27,19 @@ _POLICY: list[tuple[str, str, timedelta]] = [
 
 
 async def _prune_table(sb, table: str, ts_col: str, cutoff_iso: str) -> int:
+    """Delete rows in batches until none remain — handles large backlogs."""
+    total = 0
     try:
-        resp = await sb.table(table).delete().lt(ts_col, cutoff_iso).execute()
-        deleted = len(resp.data or [])
-        logger.info("[DataPrune] %s: %d rows deleted (cutoff %s)", table, deleted, cutoff_iso[:19])
-        return deleted
+        while True:
+            resp = await sb.table(table).delete().lt(ts_col, cutoff_iso).execute()
+            batch = len(resp.data or [])
+            total += batch
+            if batch == 0:
+                break   # nothing left to delete
+        logger.info("[DataPrune] %s: %d rows deleted (cutoff %s)", table, total, cutoff_iso[:19])
     except Exception as exc:
         logger.warning("[DataPrune] %s: error — %s", table, exc)
-        return 0
+    return total
 
 
 async def run_prune() -> dict[str, int]:
