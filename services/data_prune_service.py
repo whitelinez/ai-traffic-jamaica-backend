@@ -1,13 +1,14 @@
 """
 services/data_prune_service.py — Periodic pruning of high-volume tables.
 
-Runs every 6 hours automatically.
+Runs every hour automatically.
 
 Retention policy:
-    ml_detection_events   — 2 hours  (writes ~15 rows/sec; keeps ~108K rows max)
-    count_snapshots       — 6 hours  (writes ~1 row/sec;  keeps ~21.6K rows max)
-    turning_movements     — 7 days   (smaller, needed for analytics)
-    traffic_snapshots     — 7 days   (used by analytics API)
+    ml_detection_events   — 2 hours   (writes ~15 rows/sec; keeps ~108K rows max)
+    count_snapshots       — 6 hours   (writes ~1 row/sec;  keeps ~21.6K rows max)
+    vehicle_crossings     — 24 hours  (per-vehicle events; ~4K rows/day)
+    turning_movements     — 24 hours  (was 7 days; 30K rows/day x 7d = 210K rows = ~50 MB)
+    traffic_snapshots     — 3 days    (used by analytics API)
 """
 import asyncio
 import logging
@@ -15,14 +16,15 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
-_PRUNE_INTERVAL_SEC = 6 * 3600   # every 6 hours
+_PRUNE_INTERVAL_SEC = 3600        # every 1 hour
 _STARTUP_DELAY_SEC  = 60          # wait 60s after boot before first run
 
 _POLICY: list[tuple[str, str, timedelta]] = [
     ("ml_detection_events", "captured_at", timedelta(hours=2)),
     ("count_snapshots",     "captured_at", timedelta(hours=6)),
-    ("turning_movements",   "captured_at", timedelta(days=7)),
-    ("traffic_snapshots",   "captured_at", timedelta(days=7)),
+    ("vehicle_crossings",   "captured_at", timedelta(hours=24)),
+    ("turning_movements",   "captured_at", timedelta(hours=24)),
+    ("traffic_snapshots",   "captured_at", timedelta(days=3)),
 ]
 
 
