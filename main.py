@@ -48,6 +48,7 @@ from services.round_service import resolve_round_from_latest_snapshot
 from services.leaderboard_service import leaderboard_refresh_loop
 from services.anomaly_service import CountAnomalyDetector, anomaly_monitor_loop
 from services.daily_summary_service import daily_summary_loop
+from services.data_prune_service import data_prune_loop
 from middleware.request_logger import RequestLoggerMiddleware
 from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
@@ -78,6 +79,7 @@ _quality_probe_task: asyncio.Task | None = None
 _leaderboard_task: asyncio.Task | None = None
 _anomaly_task: asyncio.Task | None = None
 _daily_summary_task: asyncio.Task | None = None
+_prune_task: asyncio.Task | None = None
 
 _WATCHDOG_INTERVAL_SEC = 8.0
 _WATCHDOG_RESTART_COOLDOWN_SEC = 12.0
@@ -1280,7 +1282,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task, _active_round_lock
+    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task, _prune_task, _active_round_lock
     _active_round_lock = asyncio.Lock()
 
     cfg = get_config()
@@ -1331,10 +1333,13 @@ async def lifespan(app: FastAPI):
     _daily_summary_task = asyncio.create_task(daily_summary_loop(), name="daily_summary")
     logger.info("Daily summary loop started")
 
+    _prune_task = asyncio.create_task(data_prune_loop(), name="data_prune")
+    logger.info("Data prune loop started (ml_events=2h, snapshots=6h, movements/snapshots=7d)")
+
     yield
 
     # Shutdown
-    for task in (_watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
+    for task in (_watchdog_task, _quality_probe_task, _leaderboard_task, _anomaly_task, _daily_summary_task, _prune_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
         if task and not task.done():
             task.cancel()
             try:
