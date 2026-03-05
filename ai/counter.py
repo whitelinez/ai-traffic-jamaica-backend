@@ -80,6 +80,7 @@ class LineCounter:
         self._track_conf_stable: dict[int, bool] = {}
         self._tracker_history: dict[int, dict] = {}  # track_id → {cls, last_conf}
         self._scene_status: dict[str, Any] = {}  # set externally by ai_loop after scene eval
+        self._exclusion_zones: list["sv.PolygonZone"] = []  # polygons from scene_map exclusion features
         self._analytics = AnalyticsZoneProcessor(camera_id, frame_width, frame_height)
 
         self._confirmed_in = 0
@@ -216,7 +217,7 @@ class LineCounter:
         sb = await get_supabase()
         resp = await (
             sb.table("cameras")
-            .select("count_line, detect_zone, count_settings")
+            .select("count_line, detect_zone, count_settings, scene_map")
             .eq("id", self.camera_id)
             .maybe_single()
             .execute()
@@ -361,6 +362,38 @@ class LineCounter:
             self._detect_zone = sv.PolygonZone(polygon=dz_polygon)
         else:
             self._detect_zone = None
+
+        # ── Exclusion zones from scene_map ───────────────────────────────────────
+        # Admin-drawn polygons of type "exclusion" in admin-mapping.js are stored
+        # in cameras.scene_map.features. Detections whose center falls inside any
+        # exclusion zone are silently dropped before counting — reduces false
+        # positives from static objects (signs, parked vehicles, foliage).
+        scene_map = data.get("scene_map") or {}
+        features = scene_map.get("features") if isinstance(scene_map, dict) else []
+        exclusion_zones: list[sv.PolygonZone] = []
+        if isinstance(features, list):
+            for feat in features:
+                if not isinstance(feat, dict) or feat.get("type") != "exclusion":
+                    continue
+                pts = feat.get("points") or []
+                if not isinstance(pts, list) or len(pts) < 3:
+                    continue
+                pixel_pts = [
+                    (int(float(p["x"]) * w), int(float(p["y"]) * h))
+                    for p in pts
+                    if isinstance(p, dict) and "x" in p and "y" in p
+                ]
+                if len(pixel_pts) < 3:
+                    continue
+                poly_arr = self._normalize_polygon(pixel_pts)
+                if len(poly_arr) >= 3:
+                    exclusion_zones.append(sv.PolygonZone(polygon=poly_arr))
+        self._exclusion_zones = exclusion_zones
+        if exclusion_zones:
+            logger.debug(
+                "Counter: loaded %d exclusion zone(s) for camera %s",
+                len(exclusion_zones), self.camera_id,
+            )
 
         self._last_refresh = time.monotonic()
 
@@ -513,6 +546,19 @@ class LineCounter:
                     if not is_stable:
                         eligible_mask[i] = False
                         continue
+
+        # ── Exclusion zone filter ────────────────────────────────────────────────
+        # Batch-evaluate all exclusion zones. Any detection whose centroid lands
+        # inside an exclusion polygon is suppressed before counting/tracking logic.
+        if self._exclusion_zones and len(detections) > 0:
+            for excl_zone in self._exclusion_zones:
+                try:
+                    excl_mask = excl_zone.trigger(detections=detections)
+                    for i, is_excluded in enumerate(excl_mask):
+                        if is_excluded:
+                            eligible_mask[i] = False
+                except Exception:
+                    pass
 
         if has_tracker_ids:
             seen_this_frame: set[int] = set()
