@@ -122,15 +122,23 @@ class LineCounter:
         # ── count zone ────────────────────────────────────────────────────────
         line = data.get("count_line")
         if line and "x3" in line:
-            # 4-point polygon — use admin point order directly
-            poly = np.array([
-                [int(line["x1"] * w), int(line["y1"] * h)],
-                [int(line["x2"] * w), int(line["y2"] * h)],
-                [int(line["x3"] * w), int(line["y3"] * h)],
-                [int(line["x4"] * w), int(line["y4"] * h)],
-            ], dtype=np.int32)
-            self._zone      = sv.PolygonZone(polygon=poly)
-            self._zone_type = "polygon"
+            # 4-point polygon — derive midline LineZone for reliable crossing detection.
+            # supervision's PolygonZone uses BOTTOM_CENTER anchor which misses most
+            # vehicles on road cameras (bbox bottom falls below the zone band).
+            # The midline (midpoint(p1,p4) → midpoint(p2,p3)) is perpendicular to
+            # traffic flow and correctly fires once per crossing.
+            x1, y1 = int(line["x1"] * w), int(line["y1"] * h)
+            x2, y2 = int(line["x2"] * w), int(line["y2"] * h)
+            x3, y3 = int(line["x3"] * w), int(line["y3"] * h)
+            x4, y4 = int(line["x4"] * w), int(line["y4"] * h)
+            mx1, my1 = (x1 + x4) // 2, (y1 + y4) // 2
+            mx2, my2 = (x2 + x3) // 2, (y2 + y3) // 2
+            self._zone      = sv.LineZone(start=sv.Point(mx1, my1), end=sv.Point(mx2, my2))
+            self._zone_type = "line"
+            logger.info(
+                "Counter zone: polygon→midline LineZone (%d,%d)→(%d,%d) camera=%s",
+                mx1, my1, mx2, my2, self.camera_id,
+            )
         elif line and "x1" in line and "x2" in line:
             # 2-point line
             x1 = int(line["x1"] * w); y1 = int(line["y1"] * h)
