@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+import cv2
 import numpy as np
 import supervision as sv
 
@@ -54,7 +55,7 @@ class LineCounter:
 
         self._zone:       sv.LineZone | sv.PolygonZone | None = None
         self._zone_type:  str = "line"   # "line" | "polygon"
-        self._excl_zones: list[sv.PolygonZone] = []
+        self._excl_polys: list[np.ndarray] = []  # pixel-coord polygons for CENTER exclusion
         self._last_refresh = 0.0
 
         # counts
@@ -152,10 +153,16 @@ class LineCounter:
             self._zone_type = "line"
 
         # ── exclusion zones from scene_map ────────────────────────────────────
-        excl: list[sv.PolygonZone] = []
+        # Use CENTER-point-in-polygon check (cv2.pointPolygonTest) instead of
+        # supervision's PolygonZone which uses BOTTOM_CENTER anchor.  This prevents
+        # large sidewalk/exclusion zones from excluding vehicles that are near-but-not-
+        # inside the zone, and correctly ignores zones that overlap the count band.
+        # "crossing" is intentionally excluded: pedestrian crossings should not suppress
+        # vehicle detections (vehicles are counted as they cross the intersection).
+        excl_polys: list[np.ndarray] = []
         scene_map = data.get("scene_map") or {}
         features  = scene_map.get("features") if isinstance(scene_map, dict) else []
-        EXCL_TYPES = {"exclusion", "parking", "sidewalk", "crossing"}
+        EXCL_TYPES = {"exclusion", "parking", "sidewalk"}
         if isinstance(features, list):
             for feat in features:
                 if not isinstance(feat, dict):
@@ -169,8 +176,8 @@ class LineCounter:
                     if isinstance(p, dict) and "x" in p and "y" in p
                 ]
                 if len(pixel_pts) >= 3:
-                    excl.append(sv.PolygonZone(polygon=np.array(pixel_pts, dtype=np.int32)))
-        self._excl_zones = excl
+                    excl_polys.append(np.array(pixel_pts, dtype=np.int32))
+        self._excl_polys = excl_polys
 
         self._last_refresh = time.monotonic()
         logger.debug(
@@ -248,16 +255,23 @@ class LineCounter:
                     mask[i] = False
                     continue
 
-        # exclusion zones
-        if self._excl_zones and n > 0:
-            for excl in self._excl_zones:
-                try:
-                    em = excl.trigger(detections=detections)
-                    for i, hit in enumerate(em):
-                        if hit:
+        # exclusion zones — center-point-in-polygon (avoids BOTTOM_CENTER anchor issue)
+        if self._excl_polys and n > 0 and detections.xyxy is not None:
+            for i in range(n):
+                if not mask[i]:
+                    continue
+                if i >= len(detections.xyxy):
+                    continue
+                x1e, y1e, x2e, y2e = detections.xyxy[i]
+                cx = float((x1e + x2e) / 2)
+                cy = float((y1e + y2e) / 2)
+                for poly in self._excl_polys:
+                    try:
+                        if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
                             mask[i] = False
-                except Exception:
-                    pass
+                            break
+                    except Exception:
+                        pass
 
         return mask
 
