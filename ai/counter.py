@@ -53,9 +53,10 @@ class LineCounter:
         self.frame_width  = frame_width
         self.frame_height = frame_height
 
-        self._zone:       sv.LineZone | sv.PolygonZone | None = None
-        self._zone_type:  str = "line"   # "line" | "polygon"
-        self._excl_polys: list[np.ndarray] = []  # pixel-coord polygons for CENTER exclusion
+        self._zone:        sv.LineZone | sv.PolygonZone | None = None
+        self._zone_type:   str = "line"   # "line" | "polygon"
+        self._zone_coords: tuple[int, int, int, int] = (0, 0, 0, 0)  # (x1,y1,x2,y2) pixels
+        self._excl_polys:  list[np.ndarray] = []  # pixel-coord polygons for CENTER exclusion
         self._last_refresh = 0.0
 
         # counts
@@ -141,8 +142,9 @@ class LineCounter:
             x4, y4 = int(line["x4"] * w), int(line["y4"] * h)
             mx1, my1 = (x1 + x4) // 2, (y1 + y4) // 2
             mx2, my2 = (x2 + x3) // 2, (y2 + y3) // 2
-            self._zone      = sv.LineZone(start=sv.Point(mx1, my1), end=sv.Point(mx2, my2))
-            self._zone_type = "line"
+            self._zone        = sv.LineZone(start=sv.Point(mx1, my1), end=sv.Point(mx2, my2))
+            self._zone_type   = "line"
+            self._zone_coords = (mx1, my1, mx2, my2)
             logger.info(
                 "Counter zone: polygon→midline LineZone (%d,%d)→(%d,%d) camera=%s",
                 mx1, my1, mx2, my2, self.camera_id,
@@ -151,13 +153,15 @@ class LineCounter:
             # 2-point line
             x1 = int(line["x1"] * w); y1 = int(line["y1"] * h)
             x2 = int(line["x2"] * w); y2 = int(line["y2"] * h)
-            self._zone      = sv.LineZone(start=sv.Point(x1, y1), end=sv.Point(x2, y2))
-            self._zone_type = "line"
+            self._zone        = sv.LineZone(start=sv.Point(x1, y1), end=sv.Point(x2, y2))
+            self._zone_type   = "line"
+            self._zone_coords = (x1, y1, x2, y2)
         else:
             # fallback horizontal line at 55%
             y = int(0.55 * h)
-            self._zone      = sv.LineZone(start=sv.Point(0, y), end=sv.Point(w, y))
-            self._zone_type = "line"
+            self._zone        = sv.LineZone(start=sv.Point(0, y), end=sv.Point(w, y))
+            self._zone_type   = "line"
+            self._zone_coords = (0, y, w, y)
 
         # ── exclusion zones from scene_map ────────────────────────────────────
         # Use CENTER-point-in-polygon check (cv2.pointPolygonTest) instead of
@@ -335,9 +339,7 @@ class LineCounter:
 
                 # ── diagnostic log ──────────────────────────────────────────
                 if do_diag and detections.xyxy is not None:
-                    zone = self._zone
-                    lx1, ly1 = float(zone.start.x), float(zone.start.y)
-                    lx2, ly2 = float(zone.end.x),   float(zone.end.y)
+                    lx1, ly1, lx2, ly2 = self._zone_coords
                     centers = []
                     for i in range(min(len(detections.xyxy), 8)):
                         bx1, by1, bx2, by2 = detections.xyxy[i]
