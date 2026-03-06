@@ -139,47 +139,22 @@ class LineCounter:
         line = data.get("count_line")
 
         def _line_to_tripwire(lx1: int, ly1: int, lx2: int, ly2: int) -> np.ndarray:
-            """Return a thin band extended to frame boundaries along the drawn line's slope.
+            """Return a thin rectangular band around the drawn line segment.
 
-            The admin's drawn segment gives the angle and approximate position of the
-            count zone.  We extend it wall-to-wall so vehicles in all lanes are captured
-            regardless of which part of the road the admin clicked on.  Exclusion zones
-            still filter out any non-road areas (sky, buildings, sidewalks).
+            The band is exactly the drawn segment width — no extension to frame edges.
+            The admin should draw the line to cover all lanes they want counted.
+            half-width: 3% of shorter frame dimension, clamped 18–45 px.
             """
             dx = float(lx2 - lx1)
             dy = float(ly2 - ly1)
             length = max(1.0, (dx * dx + dy * dy) ** 0.5)
-            ux, uy = dx / length, dy / length          # unit direction
-            nx, ny = -uy, ux                           # unit perpendicular (band width axis)
-
-            # Extend from midpoint in ±direction until hitting frame edges
-            mx, my = (lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0
-            big = float(max(w, h)) * 2
-            # positive direction
-            ts_pos = [big]
-            if ux > 1e-6:  ts_pos.append((w - mx) / ux)
-            elif ux < -1e-6: ts_pos.append(-mx / ux)
-            if uy > 1e-6:  ts_pos.append((h - my) / uy)
-            elif uy < -1e-6: ts_pos.append(-my / uy)
-            t_pos = max(0.0, min(t for t in ts_pos if t >= 0))
-            # negative direction
-            ts_neg = [big]
-            if ux < -1e-6: ts_neg.append((w - mx) / ux)
-            elif ux > 1e-6: ts_neg.append(-mx / ux)
-            if uy < -1e-6: ts_neg.append((h - my) / uy)
-            elif uy > 1e-6: ts_neg.append(-my / uy)
-            t_neg = max(0.0, min(t for t in ts_neg if t >= 0))
-
-            ex1 = int(mx - t_neg * ux); ey1 = int(my - t_neg * uy)
-            ex2 = int(mx + t_pos * ux); ey2 = int(my + t_pos * uy)
-
-            # half-width: 3% of shorter frame dimension, clamped 18–45 px
+            nx, ny = -dy / length, dx / length   # unit perpendicular
             half_w = max(18, min(45, int(min(w, h) * 0.030)))
             return np.array([
-                [int(ex1 + nx * half_w), int(ey1 + ny * half_w)],
-                [int(ex2 + nx * half_w), int(ey2 + ny * half_w)],
-                [int(ex2 - nx * half_w), int(ey2 - ny * half_w)],
-                [int(ex1 - nx * half_w), int(ey1 - ny * half_w)],
+                [int(lx1 + nx * half_w), int(ly1 + ny * half_w)],
+                [int(lx2 + nx * half_w), int(ly2 + ny * half_w)],
+                [int(lx2 - nx * half_w), int(ly2 - ny * half_w)],
+                [int(lx1 - nx * half_w), int(ly1 - ny * half_w)],
             ], dtype=np.int32)
 
         if line and "x3" in line:
@@ -191,7 +166,7 @@ class LineCounter:
             mx1, my1 = (x1 + x4) // 2, (y1 + y4) // 2
             mx2, my2 = (x2 + x3) // 2, (y2 + y3) // 2
             self._zone_coords = (mx1, my1, mx2, my2)
-            self._zone        = sv.PolygonZone(polygon=_line_to_tripwire(mx1, my1, mx2, my2))
+            self._zone        = sv.PolygonZone(polygon=_line_to_tripwire(mx1, my1, mx2, my2), triggering_anchors=[sv.Position.CENTER])
             self._zone_type   = "polygon"
             logger.info(
                 "Counter zone: polygon→midline trip-wire band (%d,%d)→(%d,%d) camera=%s",
@@ -202,7 +177,7 @@ class LineCounter:
             lx1 = int(float(line["x1"]) * w); ly1 = int(float(line["y1"]) * h)
             lx2 = int(float(line["x2"]) * w); ly2 = int(float(line["y2"]) * h)
             self._zone_coords = (lx1, ly1, lx2, ly2)
-            self._zone        = sv.PolygonZone(polygon=_line_to_tripwire(lx1, ly1, lx2, ly2))
+            self._zone        = sv.PolygonZone(polygon=_line_to_tripwire(lx1, ly1, lx2, ly2), triggering_anchors=[sv.Position.CENTER])
             self._zone_type   = "polygon"
             logger.info(
                 "Counter zone: 2-pt trip-wire band (%d,%d)→(%d,%d) camera=%s",
@@ -225,7 +200,7 @@ class LineCounter:
                     [w,       int(0.70 * h)],
                     [0,       int(0.70 * h)],
                 ], dtype=np.int32)
-            self._zone      = sv.PolygonZone(polygon=zone_poly)
+            self._zone      = sv.PolygonZone(polygon=zone_poly, triggering_anchors=[sv.Position.CENTER])
             self._zone_type = "polygon"
             logger.info(
                 "Counter zone: no count_line → PolygonZone entry-counter camera=%s",
