@@ -84,15 +84,13 @@ class LineCounter:
     # ── zone loading ──────────────────────────────────────────────────────────
 
     async def _refresh(self) -> None:
-        sb = get_supabase()
+        sb = await get_supabase()
         resp = (
-            await asyncio.to_thread(
-                lambda: sb.table("cameras")
-                .select("count_line, detect_zone, count_settings, scene_map")
-                .eq("id", self.camera_id)
-                .maybe_single()
-                .execute()
-            )
+            await sb.table("cameras")
+            .select("count_line, detect_zone, count_settings, scene_map")
+            .eq("id", self.camera_id)
+            .maybe_single()
+            .execute()
         )
         if resp.data is None:
             logger.warning("Counter: camera %s not found", self.camera_id)
@@ -443,9 +441,9 @@ class LineCounter:
     async def bootstrap_from_latest_snapshot(self) -> None:
         """Restore confirmed_total from the latest DB snapshot on startup."""
         try:
-            sb = get_supabase()
-            resp = await asyncio.to_thread(
-                lambda: sb.table("count_snapshots")
+            sb = await get_supabase()
+            resp = await (
+                sb.table("count_snapshots")
                 .select("total, vehicle_breakdown")
                 .eq("camera_id", self.camera_id)
                 .order("captured_at", desc=True)
@@ -470,7 +468,7 @@ class LineCounter:
 async def write_snapshot(snapshot: dict) -> None:
     """Write a count snapshot row to Supabase. Called by main.py at DB_SNAPSHOT_INTERVAL_SEC."""
     try:
-        sb = get_supabase()
+        sb = await get_supabase()
         row = {
             "camera_id":         snapshot.get("camera_id"),
             "captured_at":       snapshot.get("captured_at"),
@@ -482,9 +480,7 @@ async def write_snapshot(snapshot: dict) -> None:
             "round_count_in":    snapshot.get("round_count_in", 0),
             "round_count_out":   snapshot.get("round_count_out", 0),
         }
-        await asyncio.to_thread(
-            lambda: sb.table("count_snapshots").insert(row).execute()
-        )
+        await sb.table("count_snapshots").insert(row).execute()
     except Exception as exc:
         logger.warning("write_snapshot failed: %s", exc)
 
