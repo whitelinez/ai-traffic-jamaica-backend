@@ -80,7 +80,8 @@ class LineCounter:
         self._track_conf_stable: dict[int, bool] = {}
         self._tracker_history: dict[int, dict] = {}  # track_id → {cls, last_conf}
         self._scene_status: dict[str, Any] = {}  # set externally by ai_loop after scene eval
-        self._exclusion_zones: list["sv.PolygonZone"] = []  # polygons from scene_map exclusion features
+        self._exclusion_zones: list["sv.PolygonZone"] = []  # polygons from scene_map exclusion/parking/sidewalk
+        self._road_zones: list["sv.PolygonZone"] = []       # polygons from scene_map road features (positive filter)
         self._analytics = AnalyticsZoneProcessor(camera_id, frame_width, frame_height)
 
         self._confirmed_in = 0
@@ -390,10 +391,34 @@ class LineCounter:
                 if len(poly_arr) >= 3:
                     exclusion_zones.append(sv.PolygonZone(polygon=poly_arr))
         self._exclusion_zones = exclusion_zones
-        if exclusion_zones:
+
+        # ── Road zones (positive filter) ─────────────────────────────────────────
+        # If any road polygons are defined, detections whose centroid does NOT land
+        # on any road surface are suppressed. Falls back to no filter if no roads mapped.
+        road_zones: list[sv.PolygonZone] = []
+        if isinstance(features, list):
+            for feat in features:
+                if not isinstance(feat, dict) or feat.get("type") != "road":
+                    continue
+                pts = feat.get("points") or []
+                if not isinstance(pts, list) or len(pts) < 3:
+                    continue
+                pixel_pts = [
+                    (int(float(p["x"]) * w), int(float(p["y"]) * h))
+                    for p in pts
+                    if isinstance(p, dict) and "x" in p and "y" in p
+                ]
+                if len(pixel_pts) < 3:
+                    continue
+                poly_arr = self._normalize_polygon(pixel_pts)
+                if len(poly_arr) >= 3:
+                    road_zones.append(sv.PolygonZone(polygon=poly_arr))
+        self._road_zones = road_zones
+
+        if exclusion_zones or road_zones:
             logger.debug(
-                "Counter: loaded %d exclusion zone(s) for camera %s",
-                len(exclusion_zones), self.camera_id,
+                "Counter: loaded %d exclusion zone(s), %d road zone(s) for camera %s",
+                len(exclusion_zones), len(road_zones), self.camera_id,
             )
 
         self._last_refresh = time.monotonic()
@@ -560,6 +585,23 @@ class LineCounter:
                             eligible_mask[i] = False
                 except Exception:
                     pass
+
+        # ── Road zone filter (positive) ──────────────────────────────────────────
+        # If road polygons are mapped, only detections on a road surface are counted.
+        # A detection is kept if its centroid falls inside ANY of the road polygons.
+        if self._road_zones and len(detections) > 0:
+            try:
+                on_road = [False] * len(detections)
+                for road_zone in self._road_zones:
+                    road_mask = road_zone.trigger(detections=detections)
+                    for i, is_on_road in enumerate(road_mask):
+                        if is_on_road:
+                            on_road[i] = True
+                for i, on in enumerate(on_road):
+                    if not on:
+                        eligible_mask[i] = False
+            except Exception:
+                pass  # if road filter errors, fall back to no filter
 
         if has_tracker_ids:
             seen_this_frame: set[int] = set()
