@@ -364,16 +364,17 @@ class LineCounter:
             self._detect_zone = None
 
         # ── Exclusion zones from scene_map ───────────────────────────────────────
-        # Admin-drawn polygons of type "exclusion" in admin-mapping.js are stored
-        # in cameras.scene_map.features. Detections whose center falls inside any
-        # exclusion zone are silently dropped before counting — reduces false
-        # positives from static objects (signs, parked vehicles, foliage).
+        # Admin-drawn polygons of type "exclusion", "parking", or "sidewalk" are
+        # treated as exclusion zones. Detections whose center falls inside any of
+        # these are silently dropped before counting — reduces false positives from
+        # static objects, parked vehicles, and pedestrian areas.
+        _EXCLUSION_TYPES = {"exclusion", "parking", "sidewalk"}
         scene_map = data.get("scene_map") or {}
         features = scene_map.get("features") if isinstance(scene_map, dict) else []
         exclusion_zones: list[sv.PolygonZone] = []
         if isinstance(features, list):
             for feat in features:
-                if not isinstance(feat, dict) or feat.get("type") != "exclusion":
+                if not isinstance(feat, dict) or feat.get("type") not in _EXCLUSION_TYPES:
                     continue
                 pts = feat.get("points") or []
                 if not isinstance(pts, list) or len(pts) < 3:

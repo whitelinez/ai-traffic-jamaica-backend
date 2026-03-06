@@ -1039,11 +1039,15 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             except Exception:
                 pass
 
-        now_is_night = _is_night_hour()
-        if profile_is_night is None or now_is_night != profile_is_night:
-            detector.set_night_mode(now_is_night)
-            tracker.set_night_mode(now_is_night)
-            profile_is_night = now_is_night
+        now_is_night = _is_night_hour()  # clock-based — drives runtime profile selection
+        # Vision-based night detection: use scene_status from previous 2s interval.
+        # OR with clock so overcast/dark daytime frames also get night enhancement.
+        vision_is_night = scene_status.get("scene_lighting") == "night"
+        effective_night_mode = vision_is_night or now_is_night
+        if profile_is_night is None or effective_night_mode != profile_is_night:
+            detector.set_night_mode(effective_night_mode)
+            tracker.set_night_mode(effective_night_mode)
+            profile_is_night = effective_night_mode
 
         # Hot-reload stream URL if the refresher has a newer one
         fresh = get_current_url()
