@@ -158,11 +158,28 @@ class LineCounter:
             self._zone_type   = "line"
             self._zone_coords = (x1, y1, x2, y2)
         else:
-            # fallback horizontal line at 55%
-            y = int(0.55 * h)
-            self._zone        = sv.LineZone(start=sv.Point(0, y), end=sv.Point(w, y))
-            self._zone_type   = "line"
-            self._zone_coords = (0, y, w, y)
+            # No count_line configured: use a PolygonZone entry-counter.
+            # This is more robust than line-crossing when the detector sporadically
+            # misses vehicles (common at intersection cameras where vehicles are
+            # briefly occluded or move fast relative to the stream FPS).
+            # A vehicle is counted once the FIRST TIME its tracker ID appears
+            # inside the zone.  Using detect_zone polygon if available, otherwise
+            # a default road-band covering y=0.30-0.70 (full frame width).
+            if self._detect_poly is not None:
+                zone_poly = self._detect_poly
+            else:
+                zone_poly = np.array([
+                    [0,       int(0.30 * h)],
+                    [w,       int(0.30 * h)],
+                    [w,       int(0.70 * h)],
+                    [0,       int(0.70 * h)],
+                ], dtype=np.int32)
+            self._zone      = sv.PolygonZone(polygon=zone_poly)
+            self._zone_type = "polygon"
+            logger.info(
+                "Counter zone: no count_line → PolygonZone entry-counter camera=%s",
+                self.camera_id,
+            )
 
         # ── exclusion zones from scene_map ────────────────────────────────────
         # Use CENTER-point-in-polygon check (cv2.pointPolygonTest) instead of
