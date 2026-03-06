@@ -74,9 +74,16 @@ class LineCounter:
         self._confirmed_ids:    set[int] = set()   # already counted
         self._track_frames:     dict[int, int] = {}  # tid → frames seen
         self._track_last_seen:  dict[int, float] = {}
+        # pending crossings: vehicles that crossed the line but hadn't reached
+        # min_track_frames yet. Keyed by tid, value = direction_in bool.
+        # Counted as soon as the track accumulates enough frames.
+        self._pending_crossings: dict[int, bool] = {}
 
         # polygon zone: inside-last-frame memory
         self._inside_ids: set[int] = set()
+
+        # diagnostic counter for throttled logging
+        self._process_calls: int = 0
 
         # settings + scene
         self._settings:     dict[str, Any] = dict(DEFAULTS)
@@ -182,7 +189,7 @@ class LineCounter:
         self._last_refresh = time.monotonic()
         logger.debug(
             "Counter refreshed: zone=%s excl=%d camera=%s",
-            self._zone_type, len(excl), self.camera_id,
+            self._zone_type, len(excl_polys), self.camera_id,
         )
 
     # ── track bookkeeping ─────────────────────────────────────────────────────
@@ -199,6 +206,7 @@ class LineCounter:
             self._track_frames.pop(t, None)
             self._track_last_seen.pop(t, None)
             self._inside_ids.discard(t)
+            self._pending_crossings.pop(t, None)  # discard pending if track died
             # do NOT remove from _confirmed_ids — prevents double-count on re-entry
 
     def _add_count(self, cls_name: str, direction_in: bool) -> None:
@@ -313,22 +321,46 @@ class LineCounter:
         s           = self._settings
         unk_as_car  = bool(s.get("count_unknown_as_car", True))
 
+        self._process_calls += 1
+        do_diag = (self._process_calls % 50 == 1)  # log every 50 calls (~12 min at 1/15s)
+
         if self._zone_type == "line":
             # LineZone: use sv.LineZone.trigger which tracks crossed_in/crossed_out
             if len(detections) > 0:
                 try:
                     crossed_in, crossed_out = self._zone.trigger(detections=detections)
-                except Exception:
+                except Exception as e:
+                    logger.warning("LineZone.trigger failed: %s", e)
                     crossed_in = crossed_out = np.array([], dtype=bool)
+
+                # ── diagnostic log ──────────────────────────────────────────
+                if do_diag and detections.xyxy is not None:
+                    zone = self._zone
+                    lx1, ly1 = float(zone.start.x), float(zone.start.y)
+                    lx2, ly2 = float(zone.end.x),   float(zone.end.y)
+                    centers = []
+                    for i in range(min(len(detections.xyxy), 8)):
+                        bx1, by1, bx2, by2 = detections.xyxy[i]
+                        cx = (float(bx1) + float(bx2)) / 2
+                        cy = (float(by1) + float(by2)) / 2
+                        tf = self._track_frames.get(tracker_ids[i] if has_ids and i < len(tracker_ids) else -1, 0)
+                        ci = bool(crossed_in[i]) if i < len(crossed_in) else False
+                        co = bool(crossed_out[i]) if i < len(crossed_out) else False
+                        elig = i in eligible_indices
+                        centers.append(f"({cx/self.frame_width:.2f},{cy/self.frame_height:.2f})tf={tf}e={elig}ci={ci}co={co}")
+                    logger.info(
+                        "DIAG line=(%d,%d)->(%d,%d) n=%d eligible=%d pending=%d det=%s",
+                        int(lx1), int(ly1), int(lx2), int(ly2),
+                        len(detections), len(eligible_indices),
+                        len(self._pending_crossings),
+                        " ".join(centers),
+                    )
+                # ────────────────────────────────────────────────────────────
 
                 for i in eligible_indices:
                     if i >= len(crossed_in):
                         continue
                     tid = tracker_ids[i] if has_ids and i < len(tracker_ids) else None
-
-                    # require min_track_frames before counting
-                    if tid is not None and self._track_frames.get(tid, 0) < min_tf:
-                        continue
                     if tid is not None and tid in self._confirmed_ids:
                         continue
 
@@ -337,16 +369,53 @@ class LineCounter:
                     if cls_name == "unknown" and unk_as_car:
                         cls_name = "car"
 
+                    direction_in: bool | None = None
                     if crossed_in[i]:
-                        self._add_count(cls_name, True)
-                        new_crossings += 1
-                        if tid is not None:
-                            self._confirmed_ids.add(tid)
+                        direction_in = True
                     elif crossed_out[i]:
-                        self._add_count(cls_name, False)
-                        new_crossings += 1
-                        if tid is not None:
+                        direction_in = False
+
+                    if direction_in is not None:
+                        frames_seen = self._track_frames.get(tid, 0) if tid is not None else min_tf
+                        if frames_seen >= min_tf:
+                            # Immediately count — track is mature enough.
+                            self._add_count(cls_name, direction_in)
+                            new_crossings += 1
+                            if tid is not None:
+                                self._confirmed_ids.add(tid)
+                                self._pending_crossings.pop(tid, None)
+                        elif tid is not None and tid not in self._pending_crossings:
+                            # Track crossed but not mature yet — queue it.
+                            self._pending_crossings[tid] = direction_in
+                            logger.info(
+                                "Crossing queued: tid=%d frames=%d/%d cls=%s dir=%s",
+                                tid, frames_seen, min_tf, cls_name,
+                                "in" if direction_in else "out",
+                            )
+
+                # ── flush pending crossings for now-mature tracks ────────────
+                if self._pending_crossings and has_ids:
+                    for tid, direction_in in list(self._pending_crossings.items()):
+                        if tid in self._confirmed_ids:
+                            del self._pending_crossings[tid]
+                            continue
+                        if self._track_frames.get(tid, 0) >= min_tf:
+                            # Find class for this tid
+                            cls_name = "car"
+                            for i, t in enumerate(tracker_ids):
+                                if t == tid and detections.class_id is not None and i < len(detections.class_id):
+                                    c = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
+                                    cls_name = c if c != "unknown" else ("car" if unk_as_car else "unknown")
+                                    break
+                            self._add_count(cls_name, direction_in)
+                            new_crossings += 1
                             self._confirmed_ids.add(tid)
+                            del self._pending_crossings[tid]
+                            logger.info(
+                                "Pending crossing flushed: tid=%d cls=%s dir=%s total=%d",
+                                tid, cls_name, "in" if direction_in else "out",
+                                self._confirmed_total,
+                            )
 
         else:  # polygon
             if len(detections) > 0:
