@@ -247,7 +247,7 @@ class LineCounter:
             max(0.0, min(1.0, float(merged.get("min_box_area_ratio", 0.0) or 0.0)))
         )
         merged["min_confidence"] = min(
-            0.45,    # raised from 0.22 — admin can now set a stricter global floor
+            0.25,    # global floor cap — class_min_confidence takes precedence per class
             max(0.0, min(1.0, float(merged.get("min_confidence", 0.0) or 0.0)))
         )
         allowed_classes = merged.get("allowed_classes", [])
@@ -265,10 +265,10 @@ class LineCounter:
                 except Exception:
                     continue
         class_conf_caps = {
-            "car": 0.50,        # raised from 0.20
-            "truck": 0.50,      # raised from 0.28
-            "bus": 0.50,        # raised from 0.30
-            "motorcycle": 0.50, # raised from 0.22
+            "car": 0.30,
+            "truck": 0.30,
+            "bus": 0.30,
+            "motorcycle": 0.25,
         }
         for cls_name, cap in class_conf_caps.items():
             if cls_name in class_conf:
@@ -312,17 +312,16 @@ class LineCounter:
         w, h = self.frame_width, self.frame_height
 
         if line_data and "x3" in line_data:
-            polygon = self._normalize_polygon([
-                (int(line_data["x1"] * w), int(line_data["y1"] * h)),
-                (int(line_data["x2"] * w), int(line_data["y2"] * h)),
-                (int(line_data["x3"] * w), int(line_data["y3"] * h)),
-                (int(line_data["x4"] * w), int(line_data["y4"] * h)),
-            ])
-            if len(polygon) >= 3:
-                self._zone = sv.PolygonZone(polygon=polygon)
-                self._zone_type = "polygon"
-            else:
-                self._zone = None
+            # Use admin-defined point order directly — _normalize_polygon's arctan2
+            # sort corrupts non-convex quads, causing trigger() to return all-False.
+            polygon = np.array([
+                [int(line_data["x1"] * w), int(line_data["y1"] * h)],
+                [int(line_data["x2"] * w), int(line_data["y2"] * h)],
+                [int(line_data["x3"] * w), int(line_data["y3"] * h)],
+                [int(line_data["x4"] * w), int(line_data["y4"] * h)],
+            ], dtype=np.int32)
+            self._zone = sv.PolygonZone(polygon=polygon)
+            self._zone_type = "polygon"
         elif line_data:
             x1, y1 = int(line_data["x1"] * w), int(line_data["y1"] * h)
             x2, y2 = int(line_data["x2"] * w), int(line_data["y2"] * h)
@@ -338,19 +337,20 @@ class LineCounter:
             pts = detect_data.get("points") or []
             pts = [p for p in pts if isinstance(p, dict) and "x" in p and "y" in p]
             if len(pts) >= 3:
-                dz_polygon = self._normalize_polygon(
-                    [(int(float(p["x"]) * w), int(float(p["y"]) * h)) for p in pts]
+                dz_polygon = np.array(
+                    [(int(float(p["x"]) * w), int(float(p["y"]) * h)) for p in pts],
+                    dtype=np.int32,
                 )
                 self._detect_zone = sv.PolygonZone(polygon=dz_polygon) if len(dz_polygon) >= 3 else None
             else:
                 self._detect_zone = None
         elif detect_data and "x3" in detect_data:
-            dz_polygon = self._normalize_polygon([
-                (int(detect_data["x1"] * w), int(detect_data["y1"] * h)),
-                (int(detect_data["x2"] * w), int(detect_data["y2"] * h)),
-                (int(detect_data["x3"] * w), int(detect_data["y3"] * h)),
-                (int(detect_data["x4"] * w), int(detect_data["y4"] * h)),
-            ])
+            dz_polygon = np.array([
+                [int(detect_data["x1"] * w), int(detect_data["y1"] * h)],
+                [int(detect_data["x2"] * w), int(detect_data["y2"] * h)],
+                [int(detect_data["x3"] * w), int(detect_data["y3"] * h)],
+                [int(detect_data["x4"] * w), int(detect_data["y4"] * h)],
+            ], dtype=np.int32)
             self._detect_zone = sv.PolygonZone(polygon=dz_polygon) if len(dz_polygon) >= 3 else None
         elif detect_data and "x1" in detect_data:
             dz_polygon = np.array([
@@ -386,7 +386,7 @@ class LineCounter:
                 ]
                 if len(pixel_pts) < 3:
                     continue
-                poly_arr = self._normalize_polygon(pixel_pts)
+                poly_arr = np.array(pixel_pts, dtype=np.int32)
                 if len(poly_arr) >= 3:
                     exclusion_zones.append(sv.PolygonZone(polygon=poly_arr))
         self._exclusion_zones = exclusion_zones
