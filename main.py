@@ -49,6 +49,7 @@ from services.leaderboard_service import leaderboard_refresh_loop
 from services.anomaly_service import CountAnomalyDetector
 from services.daily_summary_service import daily_summary_loop
 from services.data_prune_service import data_prune_loop
+from services.traffic_daily_service import traffic_daily_loop
 from middleware.request_logger import RequestLoggerMiddleware
 from services.round_session_service import session_scheduler_tick, next_session_round_at
 from services.analytics_service import write_ml_detection_event
@@ -79,6 +80,7 @@ _quality_probe_task: asyncio.Task | None = None
 _leaderboard_task: asyncio.Task | None = None
 _daily_summary_task: asyncio.Task | None = None
 _prune_task: asyncio.Task | None = None
+_traffic_daily_task: asyncio.Task | None = None
 
 _WATCHDOG_INTERVAL_SEC = 8.0
 _WATCHDOG_RESTART_COOLDOWN_SEC = 12.0
@@ -809,6 +811,10 @@ async def bet_resolver_loop() -> None:
                         "actual": actual,
                         "exact": exact_count,
                         "vehicle_class": vehicle_class,
+                        "window_start": window_start.isoformat(),
+                        "window_end": window_end.isoformat(),
+                        "camera_id": str(camera_id) if camera_id else None,
+                        "baseline": baseline,
                     })
 
                     logger.info(
@@ -1289,7 +1295,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task, _leaderboard_task, _daily_summary_task, _prune_task, _active_round_lock
+    global _refresh_task, _ai_task, _round_task, _resolver_task, _ml_retrain_task, _watchdog_task, _quality_probe_task, _leaderboard_task, _daily_summary_task, _prune_task, _traffic_daily_task, _active_round_lock
     _active_round_lock = asyncio.Lock()
 
     cfg = get_config()
@@ -1340,10 +1346,13 @@ async def lifespan(app: FastAPI):
     _prune_task = asyncio.create_task(data_prune_loop(), name="data_prune")
     logger.info("Data prune loop started (ml_events=2h, snapshots=6h, movements/snapshots=7d)")
 
+    _traffic_daily_task = asyncio.create_task(traffic_daily_loop(), name="traffic_daily")
+    logger.info("Traffic daily aggregation loop started (runs at midnight UTC)")
+
     yield
 
     # Shutdown
-    for task in (_watchdog_task, _quality_probe_task, _leaderboard_task, _daily_summary_task, _prune_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
+    for task in (_watchdog_task, _quality_probe_task, _leaderboard_task, _daily_summary_task, _prune_task, _traffic_daily_task, _ai_task, _refresh_task, _round_task, _resolver_task, _ml_retrain_task):
         if task and not task.done():
             task.cancel()
             try:
