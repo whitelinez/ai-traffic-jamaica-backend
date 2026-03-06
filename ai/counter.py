@@ -130,33 +130,56 @@ class LineCounter:
         self._settings = merged
 
         # ── count zone ────────────────────────────────────────────────────────
+        # Both 2-point lines and 4-point polygon count lines are converted to a
+        # thin PolygonZone "trip-wire" band.  sv.LineZone requires the same tracker
+        # ID to transition sides in consecutive frames — impossible when YOLO only
+        # detects each vehicle in 1-2 frames at intersection FPS.  The PolygonZone
+        # entry-counter counts each new tracker ID the first time its center falls
+        # inside the band, which works reliably with tf=1 sporadic detections.
         line = data.get("count_line")
+
+        def _line_to_tripwire(lx1: int, ly1: int, lx2: int, ly2: int) -> np.ndarray:
+            """Return a thin rectangular PolygonZone band perpendicular to the line."""
+            dx = float(lx2 - lx1)
+            dy = float(ly2 - ly1)
+            length = max(1.0, (dx * dx + dy * dy) ** 0.5)
+            # Perpendicular unit vector
+            nx, ny = -dy / length, dx / length
+            # half-width: 3% of shorter frame dimension, clamped 18–45 px
+            half_w = max(18, min(45, int(min(w, h) * 0.030)))
+            return np.array([
+                [int(lx1 + nx * half_w), int(ly1 + ny * half_w)],
+                [int(lx2 + nx * half_w), int(ly2 + ny * half_w)],
+                [int(lx2 - nx * half_w), int(ly2 - ny * half_w)],
+                [int(lx1 - nx * half_w), int(ly1 - ny * half_w)],
+            ], dtype=np.int32)
+
         if line and "x3" in line:
-            # 4-point polygon — derive midline LineZone for reliable crossing detection.
-            # supervision's PolygonZone uses BOTTOM_CENTER anchor which misses most
-            # vehicles on road cameras (bbox bottom falls below the zone band).
-            # The midline (midpoint(p1,p4) → midpoint(p2,p3)) is perpendicular to
-            # traffic flow and correctly fires once per crossing.
+            # 4-point polygon drawn by admin — use the midline as the trip-wire axis.
             x1, y1 = int(line["x1"] * w), int(line["y1"] * h)
             x2, y2 = int(line["x2"] * w), int(line["y2"] * h)
             x3, y3 = int(line["x3"] * w), int(line["y3"] * h)
             x4, y4 = int(line["x4"] * w), int(line["y4"] * h)
             mx1, my1 = (x1 + x4) // 2, (y1 + y4) // 2
             mx2, my2 = (x2 + x3) // 2, (y2 + y3) // 2
-            self._zone        = sv.LineZone(start=sv.Point(mx1, my1), end=sv.Point(mx2, my2))
-            self._zone_type   = "line"
             self._zone_coords = (mx1, my1, mx2, my2)
+            self._zone        = sv.PolygonZone(polygon=_line_to_tripwire(mx1, my1, mx2, my2))
+            self._zone_type   = "polygon"
             logger.info(
-                "Counter zone: polygon→midline LineZone (%d,%d)→(%d,%d) camera=%s",
+                "Counter zone: polygon→midline trip-wire band (%d,%d)→(%d,%d) camera=%s",
                 mx1, my1, mx2, my2, self.camera_id,
             )
         elif line and "x1" in line and "x2" in line:
-            # 2-point line
-            x1 = int(line["x1"] * w); y1 = int(line["y1"] * h)
-            x2 = int(line["x2"] * w); y2 = int(line["y2"] * h)
-            self._zone        = sv.LineZone(start=sv.Point(x1, y1), end=sv.Point(x2, y2))
-            self._zone_type   = "line"
-            self._zone_coords = (x1, y1, x2, y2)
+            # 2-point line drawn by admin — wrap in a trip-wire band.
+            lx1 = int(float(line["x1"]) * w); ly1 = int(float(line["y1"]) * h)
+            lx2 = int(float(line["x2"]) * w); ly2 = int(float(line["y2"]) * h)
+            self._zone_coords = (lx1, ly1, lx2, ly2)
+            self._zone        = sv.PolygonZone(polygon=_line_to_tripwire(lx1, ly1, lx2, ly2))
+            self._zone_type   = "polygon"
+            logger.info(
+                "Counter zone: 2-pt trip-wire band (%d,%d)→(%d,%d) camera=%s",
+                lx1, ly1, lx2, ly2, self.camera_id,
+            )
         else:
             # No count_line configured: use a PolygonZone entry-counter.
             # This is more robust than line-crossing when the detector sporadically
