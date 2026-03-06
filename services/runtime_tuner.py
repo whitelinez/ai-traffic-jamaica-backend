@@ -49,6 +49,16 @@ RUNTIME_PROFILES: dict[str, dict[str, Any]] = {
         "tracker": {"lost_buffer": 5, "fallback_ttl_sec": 2.00, "fallback_dist_ratio": 0.070},
         "loop": {"process_every_n": 2},
     },
+    # High-speed / low-FPS stream profile.
+    # Triples fallback_dist_ratio so the Kalman tracker can link fast-moving vehicles
+    # that jump large pixel distances between processed frames (e.g. stream at 5-10 fps
+    # with vehicles at 60-100 km/h).  process_every_n=1 maximises frame rate so the
+    # window between frames is shorter and ID-tracking is more reliable.
+    "day_fast": {
+        "detector": {"conf": 0.22, "infer_size": 480, "iou": 0.45, "max_det": 150},
+        "tracker": {"lost_buffer": 8, "fallback_ttl_sec": 3.00, "fallback_dist_ratio": 0.20},
+        "loop": {"process_every_n": 1},
+    },
 }
 
 
