@@ -239,7 +239,7 @@ class LineCounter:
         merged = dict(DEFAULT_COUNT_SETTINGS)
         merged.update(count_settings)
         merged["min_track_frames"] = min(
-            8,       # raised from 3 — admin can now honour values up to 8 frames
+            4,       # cap at 4 — high values cause missed counts at low FPS
             max(1, int(merged.get("min_track_frames", DEFAULT_COUNT_SETTINGS["min_track_frames"]) or DEFAULT_COUNT_SETTINGS["min_track_frames"]))
         )
         merged["min_box_area_ratio"] = min(

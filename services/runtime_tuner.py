@@ -20,32 +20,32 @@ from typing import Any
 
 RUNTIME_PROFILES: dict[str, dict[str, Any]] = {
     # Day profile for normal traffic.
-    # CPU + low-FPS stream: infer_size 320, process_every_n 2 to keep loop responsive.
+    # 480 gives significantly better small-vehicle recall than 320 on real road scenes.
     "day_balanced": {
-        "detector": {"conf": 0.34, "infer_size": 320, "iou": 0.50, "max_det": 100},
+        "detector": {"conf": 0.28, "infer_size": 480, "iou": 0.50, "max_det": 100},
         "tracker": {"lost_buffer": 5, "fallback_ttl_sec": 2.00, "fallback_dist_ratio": 0.065},
         "loop": {"process_every_n": 2},
     },
     # Day profile when many vehicles are present.
     "day_heavy": {
-        "detector": {"conf": 0.30, "infer_size": 320, "iou": 0.48, "max_det": 120},
+        "detector": {"conf": 0.25, "infer_size": 480, "iou": 0.48, "max_det": 120},
         "tracker": {"lost_buffer": 4, "fallback_ttl_sec": 1.50, "fallback_dist_ratio": 0.055},
         "loop": {"process_every_n": 2},
     },
     # Day profile for harsh light/reflections where false positives rise.
     "day_glare": {
-        "detector": {"conf": 0.38, "infer_size": 320, "iou": 0.52, "max_det": 90},
+        "detector": {"conf": 0.32, "infer_size": 480, "iou": 0.52, "max_det": 90},
         "tracker": {"lost_buffer": 4, "fallback_ttl_sec": 1.80, "fallback_dist_ratio": 0.060},
         "loop": {"process_every_n": 2},
     },
-    # Night: keep 416 for visibility; CPU can handle it at low stream FPS.
+    # Night: 480 for better visibility in low light.
     "night_balanced": {
-        "detector": {"conf": 0.28, "infer_size": 416, "iou": 0.45, "max_det": 120},
+        "detector": {"conf": 0.25, "infer_size": 480, "iou": 0.45, "max_det": 120},
         "tracker": {"lost_buffer": 6, "fallback_ttl_sec": 2.50, "fallback_dist_ratio": 0.075},
         "loop": {"process_every_n": 2},
     },
     "night_heavy": {
-        "detector": {"conf": 0.26, "infer_size": 416, "iou": 0.44, "max_det": 140},
+        "detector": {"conf": 0.22, "infer_size": 480, "iou": 0.44, "max_det": 140},
         "tracker": {"lost_buffer": 5, "fallback_ttl_sec": 2.00, "fallback_dist_ratio": 0.070},
         "loop": {"process_every_n": 2},
     },
