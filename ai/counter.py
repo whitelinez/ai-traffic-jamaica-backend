@@ -467,6 +467,28 @@ class LineCounter:
             logger.warning("Counter bootstrap failed: %s", exc)
 
 
+async def write_snapshot(snapshot: dict) -> None:
+    """Write a count snapshot row to Supabase. Called by main.py at DB_SNAPSHOT_INTERVAL_SEC."""
+    try:
+        sb = get_supabase()
+        row = {
+            "camera_id":         snapshot.get("camera_id"),
+            "captured_at":       snapshot.get("captured_at"),
+            "total":             snapshot.get("total", 0),
+            "count_in":          snapshot.get("count_in", 0),
+            "count_out":         snapshot.get("count_out", 0),
+            "vehicle_breakdown": snapshot.get("vehicle_breakdown", {}),
+            "round_total":       snapshot.get("round_total", 0),
+            "round_count_in":    snapshot.get("round_count_in", 0),
+            "round_count_out":   snapshot.get("round_count_out", 0),
+        }
+        await asyncio.to_thread(
+            lambda: sb.table("count_snapshots").insert(row).execute()
+        )
+    except Exception as exc:
+        logger.warning("write_snapshot failed: %s", exc)
+
+
 # ── Analytics zone processor stub (keeps analytics_service import happy) ──────
 
 class AnalyticsZoneProcessor:
