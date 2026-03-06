@@ -108,17 +108,17 @@ class Config:
         self.SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
 
         self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
-        self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8s.pt")
+        self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")           # nano: 3-4x faster on CPU vs small
         self.YOLO_TRACKER_YAML = os.getenv("YOLO_TRACKER_YAML", "")
         self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))
-        self.DETECT_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "960"))
+        self.DETECT_INFER_SIZE = int(os.getenv("DETECT_INFER_SIZE", "320"))   # was 960; 320 = ~9x faster on CPU
         self.DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
         self.DETECT_MAX_DET = int(os.getenv("DETECT_MAX_DET", "80"))
         self.NIGHT_PROFILE_ENABLED = int(os.getenv("NIGHT_PROFILE_ENABLED", "1"))
         self.NIGHT_PROFILE_START_HOUR = int(os.getenv("NIGHT_PROFILE_START_HOUR", "18"))
         self.NIGHT_PROFILE_END_HOUR = int(os.getenv("NIGHT_PROFILE_END_HOUR", "6"))
         self.NIGHT_YOLO_CONF = float(os.getenv("NIGHT_YOLO_CONF", "0.30"))
-        self.NIGHT_DETECT_INFER_SIZE = int(os.getenv("NIGHT_DETECT_INFER_SIZE", "640"))
+        self.NIGHT_DETECT_INFER_SIZE = int(os.getenv("NIGHT_DETECT_INFER_SIZE", "416"))  # was 640
         self.NIGHT_DETECT_IOU = float(os.getenv("NIGHT_DETECT_IOU", "0.45"))
         self.NIGHT_DETECT_MAX_DET = int(os.getenv("NIGHT_DETECT_MAX_DET", "120"))
         self.NIGHT_LIGHT_TRACK_ENABLED = int(os.getenv("NIGHT_LIGHT_TRACK_ENABLED", "1"))
@@ -126,14 +126,14 @@ class Config:
         self.NIGHT_LIGHT_CONTRAST = float(os.getenv("NIGHT_LIGHT_CONTRAST", "1.22"))
         self.NIGHT_LIGHT_SHARPNESS = float(os.getenv("NIGHT_LIGHT_SHARPNESS", "1.10"))
         self.TRACK_ACTIVATION_THRESHOLD = float(os.getenv("TRACK_ACTIVATION_THRESHOLD", "0.2"))
-        self.TRACK_LOST_BUFFER = int(os.getenv("TRACK_LOST_BUFFER", "20"))
+        self.TRACK_LOST_BUFFER = int(os.getenv("TRACK_LOST_BUFFER", "5"))    # was 20; scaled to ~3fps processing rate
         self.TRACK_MATCH_THRESHOLD = float(os.getenv("TRACK_MATCH_THRESHOLD", "0.65"))
-        self.TRACK_FRAME_RATE = int(os.getenv("TRACK_FRAME_RATE", "25"))
+        self.TRACK_FRAME_RATE = int(os.getenv("TRACK_FRAME_RATE", "3"))      # was 25; matches real CPU processing FPS
         self.TRACK_FALLBACK_ENABLED = int(os.getenv("TRACK_FALLBACK_ENABLED", "1"))
         self.TRACK_FALLBACK_MAX_CENTER_DIST_RATIO = float(
             os.getenv("TRACK_FALLBACK_MAX_CENTER_DIST_RATIO", "0.08")
         )
-        self.TRACK_FALLBACK_TTL_SEC = float(os.getenv("TRACK_FALLBACK_TTL_SEC", "1.5"))
+        self.TRACK_FALLBACK_TTL_SEC = float(os.getenv("TRACK_FALLBACK_TTL_SEC", "2.0"))  # was 1.5; more gap between frames
         self.COUNT_LINE_RATIO = float(os.getenv("COUNT_LINE_RATIO", "0.55"))
         self.DB_SNAPSHOT_INTERVAL_SEC = float(os.getenv("DB_SNAPSHOT_INTERVAL_SEC", "0.75"))
         self.STREAM_GRAB_LATEST = int(os.getenv("STREAM_GRAB_LATEST", "1"))

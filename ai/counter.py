@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 LINE_REFRESH_INTERVAL = 30  # seconds
 TRACK_TTL_SEC = 12.0
 DEFAULT_COUNT_SETTINGS = {
-    "min_track_frames": 3,
+    "min_track_frames": 2,  # reduced from 3: low-FPS stream means fewer frames per crossing
     "min_box_area_ratio": 0.0015,
     "min_confidence": 0.22,
     "allowed_classes": ["car", "truck", "bus", "motorcycle"],
