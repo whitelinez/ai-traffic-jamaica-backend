@@ -777,6 +777,8 @@ class LineCounter:
                     "dwell_frames": c["dwell_frames"],
                     "scene_lighting": lighting,
                     "scene_weather": weather,
+                    "zone_source": "game",   # game count line — NOT intersection analytics
+                    "zone_name": None,
                 }
                 for c in crossings
             ]
@@ -1032,6 +1034,7 @@ class AnalyticsZoneProcessor:
 
         # Process turning movements and speed traps
         new_turnings: list[dict] = []
+        new_entry_crossings: list[dict] = []   # intersection analytics — entry zone hits
         for tid, zones_in in track_zones.items():
             h   = tracker_history.get(tid, {})
             cls = h.get("cls", "car")
@@ -1040,13 +1043,24 @@ class AnalyticsZoneProcessor:
                 ztype = self._zone_types.get(zone_name, "roi")
 
                 if ztype == "entry" and tid not in self._track_entry:
-                    # Vehicle just arrived at an approach leg
+                    # Vehicle just arrived at an approach leg — record as analytics crossing
                     self._track_entry[tid] = {
                         "entry_zone":    zone_name,
                         "entry_time_ms": int(now_mono * 1000),
                         "cls":           cls,
                         "conf":          conf,
                     }
+                    new_entry_crossings.append({
+                        "camera_id":     self.camera_id,
+                        "captured_at":   snapshot.get("captured_at"),
+                        "track_id":      tid,
+                        "vehicle_class": cls,
+                        "confidence":    round(conf, 4),
+                        "direction":     "entry",
+                        "dwell_frames":  0,
+                        "zone_source":   "entry",   # intersection analytics — NOT game line
+                        "zone_name":     zone_name,
+                    })
 
                 elif ztype == "exit":
                     entry_info = self._track_entry.get(tid)
@@ -1087,6 +1101,8 @@ class AnalyticsZoneProcessor:
 
         if new_turnings:
             asyncio.create_task(self._write_turnings(new_turnings))
+        if new_entry_crossings:
+            asyncio.create_task(self._write_entry_crossings(new_entry_crossings))
 
         # Queue depth = total vehicles in all queue-type zones
         total_queue = sum(
@@ -1159,6 +1175,17 @@ class AnalyticsZoneProcessor:
             await sb.table("turning_movements").insert(rows).execute()
         except Exception as exc:
             logger.debug("turning_movements write failed: %s", exc)
+
+    async def _write_entry_crossings(self, rows: list[dict]) -> None:
+        """Write entry-zone crossings to vehicle_crossings as zone_source='entry'.
+        These represent true intersection throughput — one row per unique vehicle
+        entering the intersection through any named entry zone.
+        """
+        try:
+            sb = await get_supabase()
+            await sb.table("vehicle_crossings").insert(rows).execute()
+        except Exception as exc:
+            logger.debug("entry_crossings write failed: %s", exc)
 
     async def _update_crossing_speed(self, track_id: int, speed_kmh: float) -> None:
         try:
