@@ -57,6 +57,7 @@ class LineCounter:
         self._zone_type:   str = "line"   # "line" | "polygon"
         self._zone_coords: tuple[int, int, int, int] = (0, 0, 0, 0)  # (x1,y1,x2,y2) pixels
         self._excl_polys:  list[np.ndarray] = []  # pixel-coord polygons for CENTER exclusion
+        self._detect_poly: np.ndarray | None = None  # inclusion zone — None = whole frame
         self._last_refresh = 0.0
 
         # counts
@@ -190,10 +191,37 @@ class LineCounter:
                     excl_polys.append(np.array(pixel_pts, dtype=np.int32))
         self._excl_polys = excl_polys
 
+        # ── detect zone (inclusion filter) ────────────────────────────────────
+        # If detect_zone is configured, only detections whose CENTER falls inside
+        # this polygon are counted.  This is the primary way to restrict counting
+        # to the road area and exclude sky/buildings/parked-car false-positives.
+        self._detect_poly = None
+        dz = data.get("detect_zone")
+        if isinstance(dz, dict):
+            dz_pts_raw = dz.get("points") or []
+            if not dz_pts_raw:
+                # legacy 4-key format {x1,y1,x2,y2,x3,y3,x4,y4}
+                if "x1" in dz and "y1" in dz:
+                    dz_pts_raw = [
+                        {"x": dz["x1"], "y": dz["y1"]},
+                        {"x": dz["x2"], "y": dz["y2"]},
+                        {"x": dz["x3"], "y": dz["y3"]},
+                        {"x": dz["x4"], "y": dz["y4"]},
+                    ]
+            dz_pixels = [
+                (int(float(p["x"]) * w), int(float(p["y"]) * h))
+                for p in dz_pts_raw
+                if isinstance(p, dict) and "x" in p and "y" in p
+            ]
+            if len(dz_pixels) >= 3:
+                self._detect_poly = np.array(dz_pixels, dtype=np.int32)
+
         self._last_refresh = time.monotonic()
-        logger.debug(
-            "Counter refreshed: zone=%s excl=%d camera=%s",
-            self._zone_type, len(excl_polys), self.camera_id,
+        logger.info(
+            "Counter refreshed: zone=%s excl=%d detect_zone=%s camera=%s",
+            self._zone_type, len(excl_polys),
+            "yes" if self._detect_poly is not None else "none",
+            self.camera_id,
         )
 
     # ── track bookkeeping ─────────────────────────────────────────────────────
@@ -266,6 +294,22 @@ class LineCounter:
                 if area < min_area:
                     mask[i] = False
                     continue
+
+        # detect zone — inclusion filter: center must be INSIDE detect_zone polygon
+        if self._detect_poly is not None and n > 0 and detections.xyxy is not None:
+            for i in range(n):
+                if not mask[i]:
+                    continue
+                if i >= len(detections.xyxy):
+                    continue
+                x1d, y1d, x2d, y2d = detections.xyxy[i]
+                cx = float((x1d + x2d) / 2)
+                cy = float((y1d + y2d) / 2)
+                try:
+                    if cv2.pointPolygonTest(self._detect_poly, (cx, cy), False) < 0:
+                        mask[i] = False
+                except Exception:
+                    pass
 
         # exclusion zones — center-point-in-polygon (avoids BOTTOM_CENTER anchor issue)
         if self._excl_polys and n > 0 and detections.xyxy is not None:
