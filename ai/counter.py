@@ -351,8 +351,12 @@ class LineCounter:
                         elig = i in eligible_indices
                         centers.append(f"({cx/self.frame_width:.2f},{cy/self.frame_height:.2f})tf={tf}e={elig}ci={ci}co={co}")
                     logger.info(
-                        "DIAG line=(%d,%d)->(%d,%d) n=%d eligible=%d pending=%d det=%s",
+                        "DIAG frame=%dx%d line=(%d,%d)->(%d,%d) rel=(%.2f,%.2f)->(%.2f,%.2f) "
+                        "n=%d eligible=%d pending=%d det=%s",
+                        self.frame_width, self.frame_height,
                         int(lx1), int(ly1), int(lx2), int(ly2),
+                        lx1/self.frame_width, ly1/self.frame_height,
+                        lx2/self.frame_width, ly2/self.frame_height,
                         len(detections), len(eligible_indices),
                         len(self._pending_crossings),
                         " ".join(centers),
