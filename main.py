@@ -37,6 +37,7 @@ from ai.stream import HLSStream
 from ai.detector import VehicleDetector
 from ai.tracker import VehicleTracker
 from ai.counter import LineCounter, write_snapshot, write_vehicle_crossings
+from ai.turning_tracker import TurningMovementTracker, write_turning_movements
 from ai.box_smoother import BoxSmoother
 from ai.live_state import set_live_snapshot
 from ai.dataset_capture import LiveDatasetCapture
@@ -946,6 +947,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     logger.info("AI loop inner: opening HLS stream")
     frame_buf = None
     counter: LineCounter | None = None
+    turning_tracker: TurningMovementTracker | None = None
     last_db_write = 0.0
     last_quality_write = 0.0
     _last_quality: dict = {}
@@ -1072,6 +1074,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
                 if not counter._confirmed_total:
                     logger.warning("Counter bootstrap still 0 after retry — starting from zero")
             _counter_ref = counter
+            turning_tracker = TurningMovementTracker(camera_id, w, h)
             frame_buf = True
             logger.info("AI loop started: frame size %dx%d, bootstrapped total=%d", w, h, counter._confirmed_total)
 
@@ -1185,6 +1188,16 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         # Count logic still applies detect/count zones inside LineCounter.process().
         tracked = tracker.update(detections)
         snapshot = await counter.process(frame, tracked)
+
+        # Turning movement tracker — run on every processed frame
+        if turning_tracker is not None and len(tracked) > 0 and tracked.tracker_id is not None:
+            _tt_ids   = [int(t) for t in tracked.tracker_id]
+            _tt_cls   = list(tracked.class_id) if tracked.class_id is not None else []
+            _tt_confs = list(tracked.confidence) if tracked.confidence is not None else []
+            _movements = await turning_tracker.process(tracked, _tt_ids, _tt_cls, _tt_confs)
+            if _movements:
+                asyncio.create_task(write_turning_movements(_movements))
+
         det_boxes = snapshot.get("detections") or []
         conf_vals = [float(d.get("conf")) for d in det_boxes if d.get("conf") is not None]
         runtime_events.append((
