@@ -21,8 +21,10 @@ from supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-LINE_REFRESH_INTERVAL = 30  # seconds
-TRACK_TTL_SEC         = 10.0
+LINE_REFRESH_INTERVAL  = 30   # seconds
+TRACK_TTL_SEC          = 10.0
+DEDUP_RADIUS_RATIO     = 0.06  # 6% of frame diagonal — suppresses same-vehicle re-counts
+DEDUP_TTL_SEC          = 2.0   # seconds to remember a counted position
 
 # ── defaults (all overridable via cameras.count_settings) ─────────────────────
 DEFAULTS: dict[str, Any] = {
@@ -83,6 +85,9 @@ class LineCounter:
 
         # polygon zone: inside-last-frame memory
         self._inside_ids: set[int] = set()
+
+        # position-based dedup: list of (cx, cy, mono_ts) for recently counted vehicles
+        self._recent_count_pos: list[tuple[float, float, float]] = []
 
         # diagnostic counter for throttled logging
         self._process_calls: int = 0
@@ -293,6 +298,27 @@ class LineCounter:
             self._confirmed_total += 1
         bucket = self._counts.setdefault(cls_name, {"in": 0, "out": 0})
         bucket["in" if direction_in else "out"] += 1
+
+    # ── position-based deduplication ─────────────────────────────────────────
+
+    def _is_pos_duplicate(self, cx: float, cy: float) -> bool:
+        """Return True if a recently counted vehicle was within DEDUP_RADIUS of (cx, cy).
+
+        Handles two double-counting sources:
+        1. YOLO dual-class detection (car + truck same vehicle → two overlapping boxes).
+        2. Tracker ID flip: ByteTrack assigns a new ID to the same vehicle while still
+           inside the trip-wire, causing the new ID to pass the _confirmed_ids check.
+        """
+        now = time.monotonic()
+        diag = (self.frame_width ** 2 + self.frame_height ** 2) ** 0.5
+        max_d = diag * DEDUP_RADIUS_RATIO
+        self._recent_count_pos = [
+            (x, y, t) for x, y, t in self._recent_count_pos if now - t < DEDUP_TTL_SEC
+        ]
+        return any(
+            ((cx - x) ** 2 + (cy - y) ** 2) ** 0.5 < max_d
+            for x, y, t in self._recent_count_pos
+        )
 
     # ── eligibility filter ────────────────────────────────────────────────────
 
@@ -518,6 +544,7 @@ class LineCounter:
                     inside_mask = np.zeros(len(detections), dtype=bool)
 
                 inside_now: set[int] = set()
+                tid_to_center: dict[int, tuple[float, float]] = {}
 
                 for i in eligible_indices:
                     if i >= len(inside_mask) or not inside_mask[i]:
@@ -531,10 +558,20 @@ class LineCounter:
                         continue
 
                     inside_now.add(tid)
+                    if detections.xyxy is not None and i < len(detections.xyxy):
+                        x1b, y1b, x2b, y2b = detections.xyxy[i]
+                        tid_to_center[tid] = (float((x1b + x2b) / 2), float((y1b + y2b) / 2))
 
                 # count tracks that just entered (were outside last frame, inside now)
                 newly_entered = inside_now - self._inside_ids
                 for tid in newly_entered:
+                    # Position-based dedup: suppress tracker ID flips and dual-class
+                    # detections that refer to the same physical vehicle.
+                    center = tid_to_center.get(tid)
+                    if center and self._is_pos_duplicate(center[0], center[1]):
+                        self._confirmed_ids.add(tid)  # mark so it's never counted
+                        continue
+
                     # find class for this tid
                     cls_name = "car"
                     if has_ids:
@@ -548,6 +585,8 @@ class LineCounter:
                     self._add_count(cls_name, True)
                     self._confirmed_ids.add(tid)
                     new_crossings += 1
+                    if center:
+                        self._recent_count_pos.append((center[0], center[1], time.monotonic()))
 
                 self._inside_ids = inside_now
 

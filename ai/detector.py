@@ -145,6 +145,7 @@ class VehicleDetector:
                 iou=self.iou,
                 max_det=self.max_det,
                 classes=VEHICLE_CLASSES,
+                agnostic_nms=True,   # suppress car+truck dual-detection on same vehicle
                 verbose=False,
                 device=dev,
             )
