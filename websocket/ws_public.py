@@ -121,12 +121,14 @@ async def ws_live(
     origin = websocket.headers.get("origin", "")
     if not _origin_allowed(origin, cfg.ALLOWED_ORIGIN):
         logger.warning("WS rejected — bad origin: %s", origin)
+        await websocket.accept()
         await websocket.close(code=4003)
         return
 
     # Validate HMAC token
     if not validate_ws_token(token, cfg.WS_AUTH_SECRET):
         logger.warning("WS rejected — invalid HMAC token")
+        await websocket.accept()
         await websocket.close(code=4001)
         return
 

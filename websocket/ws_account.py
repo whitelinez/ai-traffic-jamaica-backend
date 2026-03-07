@@ -51,17 +51,20 @@ async def ws_account(
     origin = websocket.headers.get("origin", "")
     if not _origin_allowed(origin, cfg.ALLOWED_ORIGIN):
         logger.warning("Account WS rejected due to origin=%s allowed=%s", origin, cfg.ALLOWED_ORIGIN)
+        await websocket.accept()
         await websocket.close(code=4003)
         return
 
     # Validate Supabase JWT
     if not token:
+        await websocket.accept()
         await websocket.close(code=4001)
         return
     try:
         payload = await validate_supabase_jwt(token)
         user_id = get_user_id(payload)
     except Exception:
+        await websocket.accept()
         await websocket.close(code=4001)
         return
 
