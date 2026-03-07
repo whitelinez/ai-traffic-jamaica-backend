@@ -766,9 +766,10 @@ async def bet_resolver_loop() -> None:
 
                     # Tiered scoring:
                     #   EXACT  — actual == guess           → full payout
-                    #   CLOSE  — within ±max(1, 20% of guess) → 50% payout
+                    #   CLOSE  — within ±max(1, 40% of guess) → 50% payout
                     #   MISS   — everything else            → 0
-                    tolerance = max(1, round(exact_count * 0.20))
+                    # 40% tolerance: guess 8 → ±3, guess 20 → ±8, guess 5 → ±2
+                    tolerance = max(1, round(exact_count * 0.40))
                     diff = abs(actual - exact_count)
                     is_exact = (diff == 0)
                     is_close = (not is_exact) and (diff <= tolerance)
