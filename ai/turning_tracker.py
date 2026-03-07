@@ -3,23 +3,23 @@ ai/turning_tracker.py — Tracks vehicle turning movements between entry/exit zo
 
 Loads entry and exit zone definitions from camera_zones table.
 For each frame's tracked detections, detects when a vehicle:
-  1. Enters an entry zone  → records (entry_zone, entry_time, class, conf)
-  2. Later enters an exit zone → writes a turning_movements row
+  1. Crosses an entry zone line → records (entry_zone, entry_time, class, conf)
+                                   and writes a vehicle_crossings row
+  2. Later crosses an exit zone → writes a turning_movements row
 
-Hit test uses center-of-zone + adaptive radius, which works for
-the thin triangular zones drawn by the admin zone editor.
-
-Results from process() are lists of dicts ready for batch insert
-into turning_movements via write_turning_movements().
+Hit test uses distance-to-line-segment against the zone's longest edge.
+This correctly handles the thin triangular zones saved by the admin zone editor
+(where 2 of 3 points are nearly identical = a line segment, not an area).
+All zones share the same perpendicular strip width: ZONE_HIT_DIST_RATIO * frame_diagonal.
 """
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-import numpy as np
 import supervision as sv
 
 from ai.detector import CLASS_NAMES
@@ -27,39 +27,61 @@ from supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-ZONE_REFRESH_SEC = 60       # reload camera_zones every 60 s
-TRANSIT_TTL_SEC  = 45       # discard unresolved entry after 45 s
-MIN_ZONE_RADIUS  = 45       # minimum hit-circle radius (pixels)
-ZONE_RADIUS_PAD  = 1.8      # expand zone radius by this factor
+ZONE_REFRESH_SEC    = 60     # reload camera_zones every 60 s
+TRANSIT_TTL_SEC     = 45     # discard unresolved entry after 45 s
+ZONE_HIT_DIST_RATIO = 0.08   # hit strip half-width = 8% of frame diagonal
 
 
-def _zone_hit_circle(
+# ── geometry helpers ──────────────────────────────────────────────────────────
+
+def _longest_edge(
     points: list[dict], frame_w: int, frame_h: int
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     """
-    Convert relative zone points to a (cx, cy, radius) hit-circle in pixels.
-    Works reliably for thin/degenerate triangular zones drawn as line segments.
-    radius = max(MIN_ZONE_RADIUS, ZONE_RADIUS_PAD * max_dist_from_centroid).
+    Return (ax, ay, bx, by) — the longest edge of the zone polygon in pixels.
+    For degenerate triangles (two near-identical points), this is the real edge.
     """
     px = [p["x"] * frame_w for p in points]
     py = [p["y"] * frame_h for p in points]
-    cx = sum(px) / len(px)
-    cy = sum(py) / len(py)
-    max_d = max(((x - cx) ** 2 + (y - cy) ** 2) ** 0.5 for x, y in zip(px, py))
-    radius = max(float(MIN_ZONE_RADIUS), max_d * ZONE_RADIUS_PAD)
-    return cx, cy, radius
+    n = len(px)
+    best_d2, best = 0.0, (px[0], py[0], px[1 % n], py[1 % n])
+    for i in range(n):
+        j = (i + 1) % n
+        d2 = (px[j] - px[i]) ** 2 + (py[j] - py[i]) ** 2
+        if d2 > best_d2:
+            best_d2 = d2
+            best = (px[i], py[i], px[j], py[j])
+    return best
+
+
+def _dist_to_segment(
+    px: float, py: float,
+    ax: float, ay: float,
+    bx: float, by: float,
+) -> float:
+    """Perpendicular distance from point P to line segment A–B."""
+    dx, dy = bx - ax, by - ay
+    len_sq = dx * dx + dy * dy
+    if len_sq < 1.0:
+        return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len_sq))
+    return math.sqrt((px - (ax + t * dx)) ** 2 + (py - (ay + t * dy)) ** 2)
 
 
 class TurningMovementTracker:
     """
-    Per-camera turning movement tracker. Loaded once per AI loop session.
+    Per-camera turning movement tracker. Initialised once per AI loop session.
 
     Usage (in main.py):
         tt = TurningMovementTracker(camera_id, frame_w, frame_h)
         ...
-        movements = await tt.process(detections, tracker_ids, class_ids, confidences)
+        movements, entry_crossings = await tt.process(
+            detections, tracker_ids, class_ids, confidences
+        )
         if movements:
             asyncio.create_task(write_turning_movements(movements))
+        if entry_crossings:
+            asyncio.create_task(write_vehicle_crossings(entry_crossings))
     """
 
     def __init__(self, camera_id: str, frame_width: int, frame_height: int) -> None:
@@ -67,9 +89,12 @@ class TurningMovementTracker:
         self.frame_width  = frame_width
         self.frame_height = frame_height
 
-        # (name, cx, cy, radius)
-        self._entry_zones: list[tuple[str, float, float, float]] = []
-        self._exit_zones:  list[tuple[str, float, float, float]] = []
+        diag = math.sqrt(frame_width ** 2 + frame_height ** 2)
+        self._hit_dist = diag * ZONE_HIT_DIST_RATIO   # pixels
+
+        # (name, ax, ay, bx, by) — longest edge of each zone in pixels
+        self._entry_zones: list[tuple[str, float, float, float, float]] = []
+        self._exit_zones:  list[tuple[str, float, float, float, float]] = []
 
         # tid → (entry_zone_name, entry_mono, vehicle_class, confidence)
         self._in_entry: dict[int, tuple[str, float, str, float | None]] = {}
@@ -101,22 +126,28 @@ class TurningMovementTracker:
             if len(pts) < 2:
                 continue
             try:
-                hit = _zone_hit_circle(pts, self.frame_width, self.frame_height)
+                ax, ay, bx, by = _longest_edge(pts, self.frame_width, self.frame_height)
             except Exception:
                 continue
-            rec = (z["name"], *hit)
+            rec = (z["name"], ax, ay, bx, by)
             if z["zone_type"] == "entry":
                 entry.append(rec)
-            elif z["zone_type"] in {"exit"}:
+            elif z["zone_type"] == "exit":
                 exit_.append(rec)
 
         self._entry_zones = entry
         self._exit_zones  = exit_
         self._last_refresh = time.monotonic()
         logger.info(
-            "TurningTracker refreshed: %d entry zones, %d exit zones, camera=%s",
-            len(entry), len(exit_), self.camera_id,
+            "TurningTracker: %d entry zones, %d exit zones, hit_dist=%.0fpx camera=%s",
+            len(entry), len(exit_), self._hit_dist, self.camera_id,
         )
+        for name, ax, ay, bx, by in entry:
+            edge_len = math.sqrt((bx-ax)**2 + (by-ay)**2)
+            logger.debug(
+                "  entry zone '%s': (%.0f,%.0f)→(%.0f,%.0f) edge=%.0fpx",
+                name, ax, ay, bx, by, edge_len,
+            )
 
     # ── frame processing ──────────────────────────────────────────────────────
 
@@ -128,7 +159,7 @@ class TurningMovementTracker:
         confidences: list[float],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """
-        Check detections against entry/exit zones.
+        Check detections against entry/exit zone lines.
 
         Returns:
             (movements, entry_crossings)
@@ -173,8 +204,8 @@ class TurningMovementTracker:
             # ── exit check first ─────────────────────────────────────────────
             if tid in self._in_entry:
                 entry_name, entry_ts, entry_cls, entry_conf = self._in_entry[tid]
-                for (ez_name, ez_cx, ez_cy, ez_r) in self._exit_zones:
-                    if (cx - ez_cx) ** 2 + (cy - ez_cy) ** 2 <= ez_r ** 2:
+                for (ez_name, ax, ay, bx, by) in self._exit_zones:
+                    if _dist_to_segment(cx, cy, ax, ay, bx, by) <= self._hit_dist:
                         dwell_ms = max(0, int((now - entry_ts) * 1000))
                         completed.append({
                             "camera_id":     self.camera_id,
@@ -192,8 +223,8 @@ class TurningMovementTracker:
                 continue   # already in transit — skip entry check
 
             # ── entry check ──────────────────────────────────────────────────
-            for (ez_name, ez_cx, ez_cy, ez_r) in self._entry_zones:
-                if (cx - ez_cx) ** 2 + (cy - ez_cy) ** 2 <= ez_r ** 2:
+            for (ez_name, ax, ay, bx, by) in self._entry_zones:
+                if _dist_to_segment(cx, cy, ax, ay, bx, by) <= self._hit_dist:
                     self._in_entry[tid] = (ez_name, now, cls, conf)
                     # Write one vehicle_crossings row per entry zone visit
                     if tid not in self._entry_written:
@@ -213,7 +244,7 @@ class TurningMovementTracker:
         return completed, entry_crossings
 
 
-# ── DB writer ─────────────────────────────────────────────────────────────────
+# ── DB writers ────────────────────────────────────────────────────────────────
 
 async def write_turning_movements(movements: list[dict]) -> None:
     """Batch-insert completed turning movements into Supabase."""
