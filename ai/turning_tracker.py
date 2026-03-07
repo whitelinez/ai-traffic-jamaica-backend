@@ -73,6 +73,8 @@ class TurningMovementTracker:
 
         # tid → (entry_zone_name, entry_mono, vehicle_class, confidence)
         self._in_entry: dict[int, tuple[str, float, str, float | None]] = {}
+        # tids for which we've already written a vehicle_crossings entry row
+        self._entry_written: set[int] = set()
 
         self._last_refresh = 0.0
 
@@ -124,10 +126,15 @@ class TurningMovementTracker:
         tracker_ids: list[int],
         class_ids: list[int],
         confidences: list[float],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """
         Check detections against entry/exit zones.
-        Returns list of completed turning_movements rows (may be empty).
+
+        Returns:
+            (movements, entry_crossings)
+            movements       — completed turning_movements rows (entry→exit)
+            entry_crossings — vehicle_crossings rows (zone_source='entry'),
+                              one per tracker_id per entry zone visit
         """
         now = time.monotonic()
 
@@ -136,18 +143,21 @@ class TurningMovementTracker:
             await self._refresh()
 
         if not self._entry_zones or not self._exit_zones:
-            return []
+            return [], []
 
         if len(detections) == 0 or detections.xyxy is None:
-            return []
+            return [], []
 
-        # Expire stale in-entry records
-        self._in_entry = {
-            tid: v for tid, v in self._in_entry.items()
-            if now - v[1] < TRANSIT_TTL_SEC
+        # Expire stale in-entry records and their written flags
+        expired = {
+            tid for tid, v in self._in_entry.items() if now - v[1] >= TRANSIT_TTL_SEC
         }
+        for tid in expired:
+            del self._in_entry[tid]
+            self._entry_written.discard(tid)
 
-        completed: list[dict[str, Any]] = []
+        completed:       list[dict[str, Any]] = []
+        entry_crossings: list[dict[str, Any]] = []
 
         for i, tid in enumerate(tracker_ids):
             if i >= len(detections.xyxy):
@@ -167,16 +177,17 @@ class TurningMovementTracker:
                     if (cx - ez_cx) ** 2 + (cy - ez_cy) ** 2 <= ez_r ** 2:
                         dwell_ms = max(0, int((now - entry_ts) * 1000))
                         completed.append({
-                            "camera_id":    self.camera_id,
-                            "captured_at":  datetime.now(timezone.utc).isoformat(),
-                            "track_id":     int(tid),
+                            "camera_id":     self.camera_id,
+                            "captured_at":   datetime.now(timezone.utc).isoformat(),
+                            "track_id":      int(tid),
                             "vehicle_class": entry_cls,
-                            "entry_zone":   entry_name,
-                            "exit_zone":    ez_name,
-                            "dwell_ms":     dwell_ms,
-                            "confidence":   entry_conf,
+                            "entry_zone":    entry_name,
+                            "exit_zone":     ez_name,
+                            "dwell_ms":      dwell_ms,
+                            "confidence":    entry_conf,
                         })
                         del self._in_entry[tid]
+                        self._entry_written.discard(tid)
                         break
                 continue   # already in transit — skip entry check
 
@@ -184,9 +195,22 @@ class TurningMovementTracker:
             for (ez_name, ez_cx, ez_cy, ez_r) in self._entry_zones:
                 if (cx - ez_cx) ** 2 + (cy - ez_cy) ** 2 <= ez_r ** 2:
                     self._in_entry[tid] = (ez_name, now, cls, conf)
+                    # Write one vehicle_crossings row per entry zone visit
+                    if tid not in self._entry_written:
+                        self._entry_written.add(tid)
+                        entry_crossings.append({
+                            "camera_id":     self.camera_id,
+                            "captured_at":   datetime.now(timezone.utc).isoformat(),
+                            "track_id":      int(tid),
+                            "vehicle_class": cls,
+                            "confidence":    conf,
+                            "direction":     "in",
+                            "zone_source":   "entry",
+                            "zone_name":     ez_name,
+                        })
                     break
 
-        return completed
+        return completed, entry_crossings
 
 
 # ── DB writer ─────────────────────────────────────────────────────────────────

@@ -1194,9 +1194,11 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             _tt_ids   = [int(t) for t in tracked.tracker_id]
             _tt_cls   = list(tracked.class_id) if tracked.class_id is not None else []
             _tt_confs = list(tracked.confidence) if tracked.confidence is not None else []
-            _movements = await turning_tracker.process(tracked, _tt_ids, _tt_cls, _tt_confs)
+            _movements, _entry_crossings = await turning_tracker.process(tracked, _tt_ids, _tt_cls, _tt_confs)
             if _movements:
                 asyncio.create_task(write_turning_movements(_movements))
+            if _entry_crossings:
+                asyncio.create_task(write_vehicle_crossings(_entry_crossings))
 
         det_boxes = snapshot.get("detections") or []
         conf_vals = [float(d.get("conf")) for d in det_boxes if d.get("conf") is not None]
