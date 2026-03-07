@@ -48,11 +48,11 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
         logger.info("[TrafficDaily] No cameras found, skipping %s", date_str)
         return {"date": date_str, "cameras": 0, "rows": 0}
 
-    # Fetch entry-zone crossings for the day (all cameras in one query)
+    # Fetch entry-zone and game-zone crossings for the day (all cameras in one query)
     xings_resp = await (
         sb.table("vehicle_crossings")
         .select("camera_id,vehicle_class,direction,confidence,speed_kmh,captured_at")
-        .eq("zone_source", "entry")
+        .in_("zone_source", ["entry", "game"])
         .gte("captured_at", s_iso)
         .lt("captured_at",  e_iso)
         .limit(500000)

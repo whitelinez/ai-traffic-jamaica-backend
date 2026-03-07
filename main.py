@@ -36,7 +36,7 @@ from supabase_client import get_supabase, close_supabase
 from ai.stream import HLSStream
 from ai.detector import VehicleDetector
 from ai.tracker import VehicleTracker
-from ai.counter import LineCounter, write_snapshot
+from ai.counter import LineCounter, write_snapshot, write_vehicle_crossings
 from ai.box_smoother import BoxSmoother
 from ai.live_state import set_live_snapshot
 from ai.dataset_capture import LiveDatasetCapture
@@ -1243,10 +1243,15 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         # Keep live_state current so bet_service can read the exact count at bet placement time.
         set_live_snapshot(snapshot)
 
+        # Write per-vehicle crossing events to vehicle_crossings immediately (fire-and-forget).
+        _crossing_events = snapshot.get("crossing_events") or []
+        if _crossing_events:
+            asyncio.create_task(write_vehicle_crossings(_crossing_events))
+
         # Write snapshots at a fixed interval to reduce DB pressure without slowing live WS updates.
         loop_now = asyncio.get_running_loop().time()
         if (loop_now - last_db_write) >= cfg.DB_SNAPSHOT_INTERVAL_SEC:
-            db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "per_class_total", "burst_mode_active")}
+            db_snapshot = {k: v for k, v in snapshot.items() if k not in ("detections", "new_crossings", "crossing_events", "per_class_total", "burst_mode_active")}
             asyncio.create_task(write_snapshot(db_snapshot))
             if cfg.ML_TELEMETRY_ENABLED == 1:
                 snapshot_with_scene = {**snapshot, "scene_lighting": scene_status.get("scene_lighting"), "scene_weather": scene_status.get("scene_weather")}

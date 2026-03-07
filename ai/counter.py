@@ -433,6 +433,7 @@ class LineCounter:
         # build filtered subset for zone trigger
         eligible_indices = [i for i, ok in enumerate(eligible) if ok]
         new_crossings    = 0
+        crossing_events: list[dict] = []
         min_tf           = int(self._settings.get("min_track_frames", 2))
 
         s           = self._settings
@@ -500,6 +501,18 @@ class LineCounter:
                             # Immediately count — track is mature enough.
                             self._add_count(cls_name, direction_in)
                             new_crossings += 1
+                            conf = round(float(detections.confidence[i]), 4) if detections.confidence is not None and i < len(detections.confidence) else None
+                            crossing_events.append({
+                                "camera_id": self.camera_id,
+                                "captured_at": datetime.now(timezone.utc).isoformat(),
+                                "track_id": int(tid) if tid is not None else None,
+                                "vehicle_class": cls_name,
+                                "confidence": conf,
+                                "direction": "in" if direction_in else "out",
+                                "scene_lighting": self._scene_status.get("scene_lighting"),
+                                "scene_weather": self._scene_status.get("scene_weather"),
+                                "zone_source": "game",
+                            })
                             if tid is not None:
                                 self._confirmed_ids.add(tid)
                                 self._pending_crossings.pop(tid, None)
@@ -530,6 +543,22 @@ class LineCounter:
                             new_crossings += 1
                             self._confirmed_ids.add(tid)
                             del self._pending_crossings[tid]
+                            _pconf = None
+                            for ii, t in enumerate(tracker_ids):
+                                if t == tid and detections.confidence is not None and ii < len(detections.confidence):
+                                    _pconf = round(float(detections.confidence[ii]), 4)
+                                    break
+                            crossing_events.append({
+                                "camera_id": self.camera_id,
+                                "captured_at": datetime.now(timezone.utc).isoformat(),
+                                "track_id": int(tid),
+                                "vehicle_class": cls_name,
+                                "confidence": _pconf,
+                                "direction": "in" if direction_in else "out",
+                                "scene_lighting": self._scene_status.get("scene_lighting"),
+                                "scene_weather": self._scene_status.get("scene_weather"),
+                                "zone_source": "game",
+                            })
                             logger.info(
                                 "Pending crossing flushed: tid=%d cls=%s dir=%s total=%d",
                                 tid, cls_name, "in" if direction_in else "out",
@@ -587,6 +616,23 @@ class LineCounter:
                     new_crossings += 1
                     if center:
                         self._recent_count_pos.append((center[0], center[1], time.monotonic()))
+                    _pconf = None
+                    if has_ids:
+                        for ii, t in enumerate(tracker_ids):
+                            if t == tid and detections.confidence is not None and ii < len(detections.confidence):
+                                _pconf = round(float(detections.confidence[ii]), 4)
+                                break
+                    crossing_events.append({
+                        "camera_id": self.camera_id,
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "track_id": int(tid),
+                        "vehicle_class": cls_name,
+                        "confidence": _pconf,
+                        "direction": "in",
+                        "scene_lighting": self._scene_status.get("scene_lighting"),
+                        "scene_weather": self._scene_status.get("scene_weather"),
+                        "zone_source": "game",
+                    })
 
                 self._inside_ids = inside_now
 
@@ -628,6 +674,7 @@ class LineCounter:
             },
             "detections":             boxes,
             "new_crossings":          new_crossings,
+            "crossing_events":        crossing_events,
             "per_class_total":        {cls: v["in"] + v["out"] for cls, v in self._counts.items()},
             "pre_count_total":        0,
             "confirmed_crossings_total": self._confirmed_total,
@@ -706,6 +753,17 @@ async def write_snapshot(snapshot: dict) -> None:
         await sb.table("count_snapshots").insert(row).execute()
     except Exception as exc:
         logger.warning("write_snapshot failed: %s", exc)
+
+
+async def write_vehicle_crossings(events: list[dict]) -> None:
+    """Write per-vehicle crossing rows to Supabase. Called by main.py on each frame."""
+    if not events:
+        return
+    try:
+        sb = await get_supabase()
+        await sb.table("vehicle_crossings").insert(events).execute()
+    except Exception as exc:
+        logger.warning("write_vehicle_crossings failed (%d events): %s", len(events), exc)
 
 
 # ── Analytics zone processor stub (keeps analytics_service import happy) ──────
