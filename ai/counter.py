@@ -57,6 +57,7 @@ class LineCounter:
 
         self._zone:        sv.LineZone | sv.PolygonZone | None = None
         self._zone_type:   str = "line"   # "line" | "polygon"
+        self._zone_name:   str = "Main Zone"   # readable name for vehicle_crossings
         self._zone_coords: tuple[int, int, int, int] = (0, 0, 0, 0)  # (x1,y1,x2,y2) pixels
         self._excl_polys:  list[np.ndarray] = []  # pixel-coord polygons for CENTER exclusion
         self._detect_poly: np.ndarray | None = None  # inclusion zone — None = whole frame
@@ -120,6 +121,7 @@ class LineCounter:
         # merge settings
         merged = dict(DEFAULTS)
         merged.update({k: v for k, v in cfg_raw.items() if v is not None})
+        self._zone_name = str(cfg_raw.get("zone_name") or "Main Zone").strip() or "Main Zone"
         merged["min_track_frames"]   = max(1, min(4, int(merged.get("min_track_frames", 2) or 2)))
         merged["min_confidence"]     = max(0.10, min(0.60, float(merged.get("min_confidence", 0.22) or 0.22)))
         merged["min_box_area_ratio"] = max(0.0, min(0.05, float(merged.get("min_box_area_ratio", 0.001) or 0.001)))
@@ -512,6 +514,7 @@ class LineCounter:
                                 "scene_lighting": self._scene_status.get("scene_lighting"),
                                 "scene_weather": self._scene_status.get("scene_weather"),
                                 "zone_source": "game",
+                                "zone_name": self._zone_name,
                             })
                             if tid is not None:
                                 self._confirmed_ids.add(tid)
@@ -558,6 +561,7 @@ class LineCounter:
                                 "scene_lighting": self._scene_status.get("scene_lighting"),
                                 "scene_weather": self._scene_status.get("scene_weather"),
                                 "zone_source": "game",
+                                "zone_name": self._zone_name,
                             })
                             logger.info(
                                 "Pending crossing flushed: tid=%d cls=%s dir=%s total=%d",
@@ -632,6 +636,7 @@ class LineCounter:
                         "scene_lighting": self._scene_status.get("scene_lighting"),
                         "scene_weather": self._scene_status.get("scene_weather"),
                         "zone_source": "game",
+                        "zone_name": self._zone_name,
                     })
 
                 self._inside_ids = inside_now
