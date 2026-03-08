@@ -48,39 +48,44 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
         logger.info("[TrafficDaily] No cameras found, skipping %s", date_str)
         return {"date": date_str, "cameras": 0, "rows": 0}
 
+    _PAGE = 1000  # PostgREST max_rows cap — paginate to fetch all rows
+
+    async def _paginate(base_query) -> list:
+        """Exhaust a supabase-py query builder by fetching _PAGE rows at a time."""
+        all_rows: list = []
+        offset = 0
+        while True:
+            page = (await base_query.range(offset, offset + _PAGE - 1).execute()).data or []
+            all_rows.extend(page)
+            if len(page) < _PAGE:
+                break
+            offset += _PAGE
+        return all_rows
+
     # Fetch entry-zone and game-zone crossings for the day (all cameras in one query)
-    xings_resp = await (
+    rows = await _paginate(
         sb.table("vehicle_crossings")
         .select("camera_id,vehicle_class,direction,confidence,speed_kmh,captured_at")
         .in_("zone_source", ["entry", "game"])
         .gte("captured_at", s_iso)
         .lt("captured_at",  e_iso)
-        .limit(500000)
-        .execute()
     )
-    rows = xings_resp.data or []
 
     # Fetch turning movements for the day — these are the outbound (exit) counts
-    tm_resp = await (
+    tm_rows = await _paginate(
         sb.table("turning_movements")
         .select("camera_id,entry_zone,exit_zone,vehicle_class,captured_at")
         .gte("captured_at", s_iso)
         .lt("captured_at",  e_iso)
-        .limit(500000)
-        .execute()
     )
-    tm_rows = tm_resp.data or []
 
     # Fetch queue depth snapshots for the day (avg/peak per camera)
-    snaps_resp = await (
+    snaps = await _paginate(
         sb.table("traffic_snapshots")
         .select("camera_id,queue_depth,captured_at")
         .gte("captured_at", s_iso)
         .lt("captured_at",  e_iso)
-        .limit(500000)
-        .execute()
     )
-    snaps = snaps_resp.data or []
 
     # ── Aggregate per camera ──────────────────────────────────────────────────
     # buckets[camera_id] = {total, car, truck, bus, motorcycle, in, out, hourly, speeds, queues}
