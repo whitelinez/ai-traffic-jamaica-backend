@@ -60,6 +60,17 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
     )
     rows = xings_resp.data or []
 
+    # Fetch turning movements for the day — these are the outbound (exit) counts
+    tm_resp = await (
+        sb.table("turning_movements")
+        .select("camera_id,entry_zone,exit_zone,vehicle_class,captured_at")
+        .gte("captured_at", s_iso)
+        .lt("captured_at",  e_iso)
+        .limit(500000)
+        .execute()
+    )
+    tm_rows = tm_resp.data or []
+
     # Fetch queue depth snapshots for the day (avg/peak per camera)
     snaps_resp = await (
         sb.table("count_snapshots")
@@ -72,22 +83,32 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
     snaps = snaps_resp.data or []
 
     # ── Aggregate per camera ──────────────────────────────────────────────────
-    # buckets[camera_id] = {total, car, truck, bus, motorcycle, in, out, hour_totals, speeds, queues}
+    # buckets[camera_id] = {total, car, truck, bus, motorcycle, in, out, hourly, speeds, queues}
+    # hourly[h] = {total, in, out, car, truck, bus, motorcycle}
     buckets: dict[str, dict] = {}
+
+    def _ensure_bucket(cid: str) -> dict:
+        if cid not in buckets:
+            buckets[cid] = {
+                "total": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0,
+                "in": 0, "out": 0,
+                "hourly": {},    # hour(int) → {total,in,out,car,truck,bus,motorcycle}
+                "matrix": {},    # "EntryZone→ExitZone" → {total,car,truck,bus,motorcycle}
+                "speeds": [],
+                "queues": [],
+            }
+        return buckets[cid]
+
+    def _ensure_hour(b: dict, h: int) -> dict:
+        if h not in b["hourly"]:
+            b["hourly"][h] = {"total": 0, "in": 0, "out": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
+        return b["hourly"][h]
 
     for r in rows:
         cid = r.get("camera_id")
         if not cid:
             continue
-        if cid not in buckets:
-            buckets[cid] = {
-                "total": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0,
-                "in": 0, "out": 0,
-                "hour_totals": {},   # hour(int) → count
-                "speeds": [],
-                "queues": [],
-            }
-        b = buckets[cid]
+        b = _ensure_bucket(cid)
         cls = (r.get("vehicle_class") or "").lower()
         if cls not in ("car", "truck", "bus", "motorcycle"):
             continue  # skip non-vehicle detections (traffic lights, persons, etc.)
@@ -108,35 +129,75 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
 
         try:
             h = datetime.fromisoformat(str(r["captured_at"]).replace("Z", "+00:00")).hour
-            b["hour_totals"][h] = b["hour_totals"].get(h, 0) + 1
+            hb = _ensure_hour(b, h)
+            hb["total"] += 1
+            hb[cls]     += 1
+            direction = r.get("direction", "")
+            if direction == "in":
+                hb["in"] += 1
+            elif direction == "out":
+                hb["out"] += 1
         except Exception:
             pass
+
+    # ── Process turning_movements → count_out + hour_buckets.out + turning_matrix ──
+    # per-camera outbound totals from turning_movements
+    tm_counts: dict[str, int] = {}
+    for r in tm_rows:
+        cid = r.get("camera_id")
+        if not cid:
+            continue
+        b   = _ensure_bucket(cid)
+        cls = (r.get("vehicle_class") or "").lower()
+        if cls not in ("car", "truck", "bus", "motorcycle"):
+            cls = "car"
+
+        # Outbound total
+        tm_counts[cid] = tm_counts.get(cid, 0) + 1
+
+        # Hourly outbound
+        try:
+            h  = datetime.fromisoformat(str(r["captured_at"]).replace("Z", "+00:00")).hour
+            hb = _ensure_hour(b, h)
+            hb["out"] += 1
+        except Exception:
+            pass
+
+        # Turning matrix
+        entry = (r.get("entry_zone") or "Unknown").strip()
+        exit_ = (r.get("exit_zone")  or "Unknown").strip()
+        key   = f"{entry}→{exit_}"
+        if key not in b["matrix"]:
+            b["matrix"][key] = {"total": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
+        b["matrix"][key]["total"] += 1
+        b["matrix"][key][cls]     += 1
 
     # Attach queue depths to camera buckets
     for s in snaps:
         cid = s.get("camera_id")
         qd  = s.get("queue_depth")
         if cid and qd is not None:
-            if cid not in buckets:
-                buckets[cid] = {
-                    "total": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0,
-                    "in": 0, "out": 0, "hour_totals": {}, "speeds": [], "queues": [],
-                }
+            b = _ensure_bucket(cid)
             try:
-                buckets[cid]["queues"].append(float(qd))
+                b["queues"].append(float(qd))
             except (ValueError, TypeError):
                 pass
 
     # ── Build upsert rows ─────────────────────────────────────────────────────
     upsert_rows = []
     for cid, b in buckets.items():
+        # Peak hour from inbound hourly totals
         peak_hour = None
-        if b["hour_totals"]:
-            peak_hour = max(b["hour_totals"], key=lambda h: b["hour_totals"][h])
+        if b["hourly"]:
+            peak_hour = max(b["hourly"], key=lambda h: b["hourly"][h]["total"])
 
         avg_queue  = round(sum(b["queues"]) / len(b["queues"]), 2) if b["queues"] else None
         peak_queue = int(max(b["queues"])) if b["queues"] else 0
         avg_speed  = round(sum(b["speeds"]) / len(b["speeds"]), 1) if b["speeds"] else None
+
+        # hour_buckets: stringify keys for JSON (hours as strings "0"-"23")
+        hour_buckets = {str(h): v for h, v in b["hourly"].items()} if b["hourly"] else None
+        turning_matrix = b["matrix"] if b["matrix"] else None
 
         upsert_rows.append({
             "camera_id":        cid,
@@ -147,11 +208,13 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
             "bus_count":        b["bus"],
             "motorcycle_count": b["motorcycle"],
             "count_in":         b["in"],
-            "count_out":        b["out"],
+            "count_out":        tm_counts.get(cid, 0),   # from turning_movements
             "avg_queue_depth":  avg_queue,
             "peak_queue_depth": peak_queue,
             "peak_hour":        peak_hour,
             "avg_speed_kmh":    avg_speed,
+            "hour_buckets":     hour_buckets,
+            "turning_matrix":   turning_matrix,
         })
 
     if upsert_rows:
@@ -162,8 +225,8 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
         )
 
     logger.info(
-        "[TrafficDaily] %s: aggregated %d crossings across %d camera(s)",
-        date_str, len(rows), len(buckets),
+        "[TrafficDaily] %s: aggregated %d crossings + %d turning movements across %d camera(s)",
+        date_str, len(rows), len(tm_rows), len(buckets),
     )
     return {"date": date_str, "cameras": len(buckets), "rows": len(rows)}
 
