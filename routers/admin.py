@@ -1102,3 +1102,26 @@ async def admin_camera_switch(
         "alias": alias,
         "switched_at": switched_at,
     }
+
+
+@router.post("/backfill-daily")
+async def admin_backfill_daily(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    date: str = Query(..., description="UTC date to aggregate, YYYY-MM-DD"),
+):
+    """
+    Manually trigger traffic_daily aggregation for a specific UTC date.
+    Use this to backfill historical data after the service starts.
+    Example: POST /admin/backfill-daily?date=2026-03-07
+    """
+    from services.traffic_daily_service import aggregate_day
+    try:
+        target = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    try:
+        result = await aggregate_day(target)
+        return {"ok": True, **result}
+    except Exception as exc:
+        logger.error("[Admin] backfill-daily failed for %s: %s", date, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc

@@ -88,13 +88,12 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
                 "queues": [],
             }
         b = buckets[cid]
-        b["total"] += 1
+        cls = (r.get("vehicle_class") or "").lower()
+        if cls not in ("car", "truck", "bus", "motorcycle"):
+            continue  # skip non-vehicle detections (traffic lights, persons, etc.)
 
-        cls = (r.get("vehicle_class") or "car").lower()
-        if cls in ("car", "truck", "bus", "motorcycle"):
-            b[cls] += 1
-        else:
-            b["car"] += 1  # unknown → car
+        b["total"] += 1
+        b[cls] += 1
 
         if r.get("direction") == "in":
             b["in"] += 1
