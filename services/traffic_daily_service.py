@@ -73,7 +73,7 @@ async def aggregate_day(date: datetime) -> dict[str, Any]:
 
     # Fetch queue depth snapshots for the day (avg/peak per camera)
     snaps_resp = await (
-        sb.table("count_snapshots")
+        sb.table("traffic_snapshots")
         .select("camera_id,queue_depth,captured_at")
         .gte("captured_at", s_iso)
         .lt("captured_at",  e_iso)
