@@ -297,12 +297,16 @@ _ALLOWED_SEGMENT_SUFFIXES = (".ipcamlive.com", ".googlevideo.com")
 
 
 @router.get("/ts")
-async def stream_segment(p: str = Query(..., max_length=512)):
+async def stream_segment(p: str = Query(..., max_length=4096)):
     """
     Proxy a single HLS transport-stream (*.ts) or sub-playlist (*.m3u8) segment.
 
     *p* is a base64url-encoded upstream segment URL produced by _rewrite_manifest.
     The actual CDN URL is never sent to the browser.
+
+    If the proxied content is an m3u8 sub-playlist (YouTube quality-level manifests),
+    its segment URLs are also rewritten through the proxy so the browser never
+    sees raw googlevideo.com URLs (which have no CORS headers).
     """
     # Decode the opaque segment reference
     try:
@@ -315,10 +319,12 @@ async def stream_segment(p: str = Query(..., max_length=512)):
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Invalid segment scheme")
 
-    # Guard against open-proxy abuse: only allow known ipcamlive CDN hosts
+    # Guard against open-proxy abuse: only allow known camera CDN hosts
     if not any(parsed.netloc.endswith(s) for s in _ALLOWED_SEGMENT_SUFFIXES):
-        logger.warning("Segment proxy blocked non-ipcamlive host: %s", parsed.netloc)
+        logger.warning("Segment proxy blocked non-allowed host: %s", parsed.netloc)
         raise HTTPException(status_code=400, detail="Segment origin not allowed")
+
+    is_m3u8 = segment_url.endswith(".m3u8") or "m3u8" in segment_url.lower().split("?")[0][-10:]
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -329,14 +335,25 @@ async def stream_segment(p: str = Query(..., max_length=512)):
             )
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail="Segment unavailable")
-            media_type = (
-                "video/MP2T"
-                if segment_url.endswith(".ts")
-                else "application/vnd.apple.mpegurl"
-            )
+
+            # If this is an m3u8 sub-playlist, rewrite its segment URLs through
+            # the proxy so the browser never receives raw googlevideo.com URLs.
+            if is_m3u8 or "mpegurl" in (resp.headers.get("content-type") or ""):
+                cfg = get_config()
+                base_url = segment_url.rsplit("/", 1)[0] + "/"
+                segment_proxy_base = (
+                    f"{cfg.FRONTEND_URL}/api/stream" if cfg.FRONTEND_URL else ""
+                )
+                rewritten = _rewrite_manifest(resp.text, base_url, segment_proxy_base=segment_proxy_base)
+                return Response(
+                    content=rewritten,
+                    media_type="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-cache, no-store"},
+                )
+
             return Response(
                 content=resp.content,
-                media_type=media_type,
+                media_type="video/MP2T",
                 headers={"Cache-Control": "public, max-age=10"},
             )
     except HTTPException:
