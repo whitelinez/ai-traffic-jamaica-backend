@@ -61,6 +61,8 @@ class LineCounter:
         self._zone_coords: tuple[int, int, int, int] = (0, 0, 0, 0)  # (x1,y1,x2,y2) pixels
         self._excl_polys:  list[np.ndarray] = []  # pixel-coord polygons for CENTER exclusion
         self._detect_poly: np.ndarray | None = None  # inclusion zone — None = whole frame
+        self._detect_zone_sv: sv.PolygonZone | None = None  # secondary fallback counter
+        self._detect_inside_ids: set[int] = set()  # tracks inside detect zone last frame
         self._last_refresh = 0.0
 
         # counts
@@ -265,6 +267,18 @@ class LineCounter:
             ]
             if len(dz_pixels) >= 3:
                 self._detect_poly = np.array(dz_pixels, dtype=np.int32)
+
+        # Secondary zone: PolygonZone over detect_poly for pre-count fallback.
+        # Counts any new tracker entering the detect zone that wasn't already
+        # counted by the trip-wire.  _confirmed_ids guarantees no double-count.
+        if self._detect_poly is not None:
+            self._detect_zone_sv = sv.PolygonZone(
+                polygon=self._detect_poly,
+                triggering_anchors=[sv.Position.CENTER],
+            )
+        else:
+            self._detect_zone_sv = None
+        self._detect_inside_ids = set()  # reset on every zone refresh
 
         self._last_refresh = time.monotonic()
         logger.info(
@@ -736,6 +750,80 @@ class LineCounter:
                             "Polygon pending flushed: tid=%d cls=%s total=%d",
                             tid, cls_name, self._confirmed_total,
                         )
+
+        # ── secondary detect-zone fallback counter ────────────────────────────
+        # Any eligible tracker that newly enters the detect_zone polygon and
+        # hasn't already been counted by the trip-wire gets counted here.
+        # Acts as a pre-count: cars on approach are caught before reaching the
+        # line, so bad-stream frame drops at the line don't cause misses.
+        # _confirmed_ids prevents double-counting — if the trip-wire already
+        # counted this vehicle, the detect-zone path is silently skipped.
+        if self._detect_zone_sv is not None and len(detections) > 0 and has_ids:
+            try:
+                dz_inside = self._detect_zone_sv.trigger(detections=detections)
+            except Exception:
+                dz_inside = np.zeros(len(detections), dtype=bool)
+
+            dz_inside_now: set[int] = set()
+            dz_tid_center: dict[int, tuple[float, float]] = {}
+
+            for i in eligible_indices:
+                if i >= len(dz_inside) or not dz_inside[i]:
+                    continue
+                dz_tid = tracker_ids[i] if i < len(tracker_ids) else None
+                if dz_tid is None or dz_tid in self._confirmed_ids:
+                    continue
+                dz_inside_now.add(dz_tid)
+                if detections.xyxy is not None and i < len(detections.xyxy):
+                    x1z, y1z, x2z, y2z = detections.xyxy[i]
+                    dz_tid_center[dz_tid] = (float((x1z + x2z) / 2), float((y1z + y2z) / 2))
+
+            dz_newly_entered = dz_inside_now - self._detect_inside_ids
+            for dz_tid in dz_newly_entered:
+                if dz_tid in self._confirmed_ids:
+                    continue
+                if self._track_frames.get(dz_tid, 0) < min_tf:
+                    # Queue in pending — will be counted when track matures
+                    if dz_tid not in self._pending_crossings:
+                        self._pending_crossings[dz_tid] = True
+                    continue
+                dz_center = dz_tid_center.get(dz_tid)
+                if dz_center and self._is_pos_duplicate(dz_center[0], dz_center[1]):
+                    self._confirmed_ids.add(dz_tid)
+                    continue
+                dz_cls = "car"
+                for i, t in enumerate(tracker_ids):
+                    if t == dz_tid and detections.class_id is not None and i < len(detections.class_id):
+                        c = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
+                        dz_cls = c if c != "unknown" else ("car" if unk_as_car else "unknown")
+                        break
+                if dz_cls == "unknown":
+                    continue
+                self._add_count(dz_cls, True)
+                self._confirmed_ids.add(dz_tid)
+                new_crossings += 1
+                if dz_center:
+                    self._recent_count_pos.append((dz_center[0], dz_center[1], time.monotonic()))
+                dz_conf = None
+                for ii, t in enumerate(tracker_ids):
+                    if t == dz_tid and detections.confidence is not None and ii < len(detections.confidence):
+                        dz_conf = round(float(detections.confidence[ii]), 4)
+                        break
+                crossing_events.append({
+                    "camera_id":      self.camera_id,
+                    "captured_at":    datetime.now(timezone.utc).isoformat(),
+                    "track_id":       int(dz_tid),
+                    "vehicle_class":  dz_cls,
+                    "confidence":     dz_conf,
+                    "direction":      "in",
+                    "scene_lighting": self._scene_status.get("scene_lighting"),
+                    "scene_weather":  self._scene_status.get("scene_weather"),
+                    "zone_source":    "game",
+                    "zone_name":      self._zone_name,
+                })
+                logger.debug("Detect-zone pre-count: tid=%d cls=%s total=%d", dz_tid, dz_cls, self._confirmed_total)
+
+            self._detect_inside_ids = dz_inside_now
 
         # build snapshot
         breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
