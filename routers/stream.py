@@ -254,8 +254,8 @@ async def stream_manifest(
 
 # ── Segment proxy ────────────────────────────────────────────────────────────
 
-# Only proxy requests to known ipcamlive CDN domains — prevents open-proxy abuse.
-_ALLOWED_SEGMENT_SUFFIXES = (".ipcamlive.com",)
+# Only proxy requests to known camera CDN domains — prevents open-proxy abuse.
+_ALLOWED_SEGMENT_SUFFIXES = (".ipcamlive.com", ".googlevideo.com")
 
 
 @router.get("/ts")
