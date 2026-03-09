@@ -56,8 +56,8 @@ def trigger_force_refresh() -> None:
     """Signal url_refresh_loop to skip its current sleep and run immediately."""
     try:
         _get_or_create_event().set()
-    except RuntimeError:
-        pass  # no running event loop yet — ignore
+    except Exception:
+        pass  # no running event loop yet, or other transient error — non-fatal
 
 
 def _make_token() -> str:

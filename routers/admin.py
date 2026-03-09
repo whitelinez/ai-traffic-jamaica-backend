@@ -1090,7 +1090,11 @@ async def admin_camera_switch(
     )
 
     # Wake up url_refresh_loop to pick up the new active camera immediately
-    trigger_force_refresh()
+    # Non-fatal: DB update already committed above, so swallow any signal error
+    try:
+        trigger_force_refresh()
+    except Exception as _rf_exc:
+        logger.warning("trigger_force_refresh error (non-fatal): %s", _rf_exc)
 
     switched_at = datetime.now(timezone.utc).isoformat()
     cam_data = cam_resp.data[0]
