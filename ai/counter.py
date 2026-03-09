@@ -644,10 +644,13 @@ class LineCounter:
         # build snapshot
         breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
 
-        # detection boxes for WS broadcast
+        # detection boxes for WS broadcast — only show boxes inside the detect_zone
         boxes: list[dict] = []
         if len(detections) > 0 and detections.xyxy is not None:
             for i in range(min(len(detections.xyxy), 60)):
+                # Skip detections outside the detect_zone polygon (if one is configured)
+                if i < len(eligible) and not eligible[i]:
+                    continue
                 cls_id = int(detections.class_id[i]) if detections.class_id is not None and i < len(detections.class_id) else -1
                 if cls_id not in CLASS_NAMES:
                     continue
