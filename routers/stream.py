@@ -16,7 +16,9 @@ from fastapi.responses import Response
 
 from ai.url_refresher import (
     _supabase_update_stream_url,
+    _supabase_update_stream_url_by_id,
     fetch_fresh_stream_url,
+    fetch_youtube_stream_url,
     get_candidate_aliases,
     get_current_alias,
     get_current_url,
@@ -92,9 +94,39 @@ async def _get_stream_url(cfg, preferred_alias: str | None = None) -> str:
         stream_url = ""
         resolved_alias = ""
 
+    # ── YouTube camera lookup by camera ID (alias="yt:<uuid>") ──────────────
+    # Non-AI YouTube cameras send alias="yt:<camera_id>" from the frontend.
+    # Their HLS URL is stored in cameras.stream_url by camera id (not ipcam_alias).
+    if not stream_url and preferred_alias and preferred_alias.startswith("yt:"):
+        cam_id = preferred_alias[3:]
+        try:
+            supabase = await get_supabase()
+            cam_resp = await (
+                supabase.table("cameras")
+                .select("stream_url,youtube_url")
+                .eq("id", cam_id)
+                .limit(1)
+                .execute()
+            )
+            cam_data = (cam_resp.data or [{}])[0]
+            cached_yt_url = str(cam_data.get("stream_url") or "").strip()
+            if cached_yt_url:
+                stream_url = cached_yt_url
+                resolved_alias = preferred_alias
+            elif cam_data.get("youtube_url"):
+                # No cached URL — fetch via yt-dlp on-demand
+                logger.info("No cached stream URL for yt camera %s — fetching via yt-dlp", cam_id)
+                fresh = await fetch_youtube_stream_url(cam_data["youtube_url"])
+                if fresh:
+                    stream_url = fresh
+                    resolved_alias = preferred_alias
+                    await _supabase_update_stream_url_by_id(cam_id, fresh)
+        except Exception as exc:
+            logger.error("YouTube camera lookup failed for id=%s: %s", cam_id, exc)
+
     # If DB has no URL (null or table error), fetch one on-demand.
     # This handles: newly switched camera, stream rotation, first boot.
-    if not stream_url:
+    if not stream_url and not (preferred_alias or "").startswith("yt:"):
         logger.info("No cached stream URL — fetching on-demand for aliases=%s", aliases[:3])
         for alias in aliases[:3]:
             try:
