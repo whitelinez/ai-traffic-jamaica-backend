@@ -28,6 +28,7 @@ from middleware.rate_limiter import limiter
 from ai.url_refresher import trigger_force_refresh
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+logger = logging.getLogger(__name__)
 
 
 async def _require_admin_user(authorization: Annotated[str | None, Header()] = None) -> dict:
