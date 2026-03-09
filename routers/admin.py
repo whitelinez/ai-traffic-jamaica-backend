@@ -1067,7 +1067,7 @@ async def admin_camera_switch(
     # Verify camera exists
     cam_resp = await (
         sb.table("cameras")
-        .select("id, ipcam_alias")
+        .select("id, ipcam_alias, youtube_url, name")
         .eq("id", camera_id)
         .limit(1)
         .execute()
@@ -1093,13 +1093,21 @@ async def admin_camera_switch(
     trigger_force_refresh()
 
     switched_at = datetime.now(timezone.utc).isoformat()
-    alias = cam_resp.data[0].get("ipcam_alias") or camera_id
-    logger.info("Admin camera switch: id=%s alias=%s at=%s", camera_id, alias, switched_at)
+    cam_data = cam_resp.data[0]
+    alias = cam_data.get("ipcam_alias") or ""
+    youtube_url = cam_data.get("youtube_url") or ""
+    cam_name = cam_data.get("name") or alias or camera_id
+    logger.info(
+        "Admin camera switch: id=%s alias=%s youtube=%s at=%s",
+        camera_id, alias or "(none)", youtube_url or "(none)", switched_at,
+    )
 
     return {
         "ok": True,
         "camera_id": camera_id,
         "alias": alias,
+        "youtube_url": youtube_url,
+        "name": cam_name,
         "switched_at": switched_at,
     }
 
