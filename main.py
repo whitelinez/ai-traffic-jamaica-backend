@@ -444,6 +444,9 @@ async def _ensure_ai_task(cfg, timeout_sec: int = 6, reason: str = "watchdog") -
     _reset_ai_runtime_state(reason=f"start:{reason}")
     _ai_task = asyncio.create_task(ai_loop(cfg, hls_stream), name="ai_loop")
     logger.info("AI loop started (%s) with URL: %s", reason, stream_url)
+    # Tell all WS clients to reset their timestamp filter so stale-frame
+    # detection doesn't silently drop the first few messages after restart.
+    asyncio.create_task(manager.broadcast_public({"type": "scene:reset"}))
     return True
 
 
