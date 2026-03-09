@@ -1141,6 +1141,27 @@ async def admin_force_scene_reset(
     return {"ok": True, "message": "Scene reset triggered — detection will re-initialise within a few seconds."}
 
 
+@router.post("/demo/record")
+async def admin_demo_record(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+    duration: int = Query(default=600, ge=30, le=1800, description="Recording duration in seconds (default 600 = 10 min)"),
+):
+    """Start a background recording of the live stream and upload to Supabase storage demo-videos bucket."""
+    from services import demo_recorder
+    cfg = get_config()
+    result = await demo_recorder.start_recording(duration_sec=duration, cfg=cfg)
+    return result
+
+
+@router.get("/demo/record/status")
+async def admin_demo_record_status(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """Check the status of the current or last demo recording."""
+    from services import demo_recorder
+    return demo_recorder.get_status()
+
+
 @router.post("/backfill-daily")
 async def admin_backfill_daily(
     admin: Annotated[dict, Depends(_require_admin_user)],
