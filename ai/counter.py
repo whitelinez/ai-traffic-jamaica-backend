@@ -828,18 +828,24 @@ class LineCounter:
         # build snapshot
         breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
 
-        # detection boxes for WS broadcast — only show boxes inside the detect_zone
+        # detection boxes for WS broadcast — show ALL detections.
+        # in_detect_zone=True  → inside the detect polygon (or no polygon configured)
+        # in_detect_zone=False → outside the detect polygon (background / context only)
+        # Frontend renders these differently: full-colour vs dimmed/dashed box.
         boxes: list[dict] = []
         if len(detections) > 0 and detections.xyxy is not None:
             for i in range(min(len(detections.xyxy), 60)):
-                # Skip detections outside the detect_zone polygon (if one is configured)
-                if i < len(eligible) and not eligible[i]:
-                    continue
                 cls_id = int(detections.class_id[i]) if detections.class_id is not None and i < len(detections.class_id) else -1
                 if cls_id not in CLASS_NAMES:
                     continue
+                # Require at least minimum global confidence for display (halved vs counting threshold)
+                if detections.confidence is not None and i < len(detections.confidence):
+                    if float(detections.confidence[i]) < max(0.10, self._settings.get("min_confidence", 0.22) * 0.5):
+                        continue
                 conf = round(float(detections.confidence[i]), 4) if detections.confidence is not None and i < len(detections.confidence) else None
                 x1, y1, x2, y2 = detections.xyxy[i]
+                # Compute in_detect_zone: True if eligible (passes detect-zone filter) or no detect zone set
+                in_dz = (self._detect_poly is None) or (i < len(eligible) and eligible[i])
                 boxes.append({
                     "x1": round(float(x1) / self.frame_width, 4),
                     "y1": round(float(y1) / self.frame_height, 4),
@@ -847,7 +853,7 @@ class LineCounter:
                     "y2": round(float(y2) / self.frame_height, 4),
                     "cls": CLASS_NAMES[cls_id],
                     "conf": conf,
-                    "in_detect_zone": True,
+                    "in_detect_zone": in_dz,
                 })
 
         return {
