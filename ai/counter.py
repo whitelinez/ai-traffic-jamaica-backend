@@ -156,7 +156,7 @@ class LineCounter:
             dy = float(ly2 - ly1)
             length = max(1.0, (dx * dx + dy * dy) ** 0.5)
             nx, ny = -dy / length, dx / length   # unit perpendicular
-            half_w = max(18, min(45, int(min(w, h) * 0.030)))
+            half_w = max(24, min(70, int(min(w, h) * 0.045)))
             return np.array([
                 [int(lx1 + nx * half_w), int(ly1 + ny * half_w)],
                 [int(lx2 + nx * half_w), int(ly2 + ny * half_w)],
@@ -583,8 +583,39 @@ class LineCounter:
                     if i >= len(inside_mask) or not inside_mask[i]:
                         continue
                     tid = tracker_ids[i] if has_ids and i < len(tracker_ids) else None
+
+                    # ── untracked detection fallback ──────────────────────────
+                    # ByteTrack may fail to assign an ID on choppy streams.
+                    # Count untracked detections via position-dedup only — no
+                    # _confirmed_ids check (no ID to check), no min_track_frames.
                     if tid is None:
+                        if detections.xyxy is not None and i < len(detections.xyxy):
+                            x1u, y1u, x2u, y2u = detections.xyxy[i]
+                            cu = (float((x1u + x2u) / 2), float((y1u + y2u) / 2))
+                            if not self._is_pos_duplicate(cu[0], cu[1]):
+                                cls_id_u = int(detections.class_id[i]) if detections.class_id is not None and i < len(detections.class_id) else -1
+                                cls_u = CLASS_NAMES.get(cls_id_u, "unknown")
+                                if cls_u == "unknown":
+                                    cls_u = "car" if unk_as_car else None
+                                if cls_u:
+                                    self._add_count(cls_u, True)
+                                    new_crossings += 1
+                                    self._recent_count_pos.append((cu[0], cu[1], time.monotonic()))
+                                    conf_u = round(float(detections.confidence[i]), 4) if detections.confidence is not None and i < len(detections.confidence) else None
+                                    crossing_events.append({
+                                        "camera_id": self.camera_id,
+                                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                                        "track_id": None,
+                                        "vehicle_class": cls_u,
+                                        "confidence": conf_u,
+                                        "direction": "in",
+                                        "scene_lighting": self._scene_status.get("scene_lighting"),
+                                        "scene_weather": self._scene_status.get("scene_weather"),
+                                        "zone_source": "game",
+                                        "zone_name": self._zone_name,
+                                    })
                         continue
+
                     if tid in self._confirmed_ids:
                         continue
 
