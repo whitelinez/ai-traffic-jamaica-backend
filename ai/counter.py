@@ -56,9 +56,10 @@ class LineCounter:
         self.frame_height = frame_height
 
         self._zone:        sv.LineZone | sv.PolygonZone | None = None
-        self._zone_type:   str = "line"   # "line" | "polygon"
+        self._zone_type:   str = "line"   # "line" | "polygon" | "line_pixel"
         self._zone_name:   str = "Main Zone"   # readable name for vehicle_crossings
         self._zone_coords: tuple[int, int, int, int] = (0, 0, 0, 0)  # (x1,y1,x2,y2) pixels
+        self._line_seg:    tuple[int, int, int, int] | None = None   # raw pixel endpoints for bbox check
         self._excl_polys:  list[np.ndarray] = []  # pixel-coord polygons for CENTER exclusion
         self._detect_poly: np.ndarray | None = None  # inclusion zone — None = whole frame
         self._detect_zone_sv: sv.PolygonZone | None = None  # secondary fallback counter
@@ -182,14 +183,17 @@ class LineCounter:
                 mx1, my1, mx2, my2, self.camera_id,
             )
         elif line and "x1" in line and "x2" in line:
-            # 2-point line drawn by admin — wrap in a trip-wire band.
+            # 2-point line drawn by admin — pixel-level bbox intersection trigger.
+            # Any detection whose bounding box touches the line segment is counted.
+            # No trip-wire band needed — more permissive than center-in-band.
             lx1 = int(float(line["x1"]) * w); ly1 = int(float(line["y1"]) * h)
             lx2 = int(float(line["x2"]) * w); ly2 = int(float(line["y2"]) * h)
             self._zone_coords = (lx1, ly1, lx2, ly2)
-            self._zone        = sv.PolygonZone(polygon=_line_to_tripwire(lx1, ly1, lx2, ly2), triggering_anchors=[sv.Position.CENTER])
-            self._zone_type   = "polygon"
+            self._line_seg    = (lx1, ly1, lx2, ly2)
+            self._zone        = None   # no PolygonZone — raw line segment used directly
+            self._zone_type   = "line_pixel"
             logger.info(
-                "Counter zone: 2-pt trip-wire band (%d,%d)→(%d,%d) camera=%s",
+                "Counter zone: 2-pt pixel-line (%d,%d)→(%d,%d) camera=%s",
                 lx1, ly1, lx2, ly2, self.camera_id,
             )
         else:
@@ -338,6 +342,53 @@ class LineCounter:
 
     # ── eligibility filter ────────────────────────────────────────────────────
 
+    # ── pixel-level line intersection helpers ─────────────────────────────────
+
+    @staticmethod
+    def _segs_intersect(
+        ax1: float, ay1: float, ax2: float, ay2: float,
+        bx1: float, by1: float, bx2: float, by2: float,
+    ) -> bool:
+        """Return True if line segment A intersects line segment B."""
+        def cross(ox, oy, ax, ay, bx, by):
+            return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+        def on_seg(px, py, qx, qy, rx, ry):
+            return min(px, rx) <= qx <= max(px, rx) and min(py, ry) <= qy <= max(py, ry)
+        d1 = cross(bx1, by1, bx2, by2, ax1, ay1)
+        d2 = cross(bx1, by1, bx2, by2, ax2, ay2)
+        d3 = cross(ax1, ay1, ax2, ay2, bx1, by1)
+        d4 = cross(ax1, ay1, ax2, ay2, bx2, by2)
+        if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
+           ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
+            return True
+        if d1 == 0 and on_seg(bx1, by1, ax1, ay1, bx2, by2): return True
+        if d2 == 0 and on_seg(bx1, by1, ax2, ay2, bx2, by2): return True
+        if d3 == 0 and on_seg(ax1, ay1, bx1, by1, ax2, ay2): return True
+        if d4 == 0 and on_seg(ax1, ay1, bx2, by2, ax2, ay2): return True
+        return False
+
+    def _bbox_hits_line(self, bx1: float, by1: float, bx2: float, by2: float) -> bool:
+        """Return True if the axis-aligned bounding box touches the count line segment."""
+        if self._line_seg is None:
+            return False
+        lx1, ly1, lx2, ly2 = self._line_seg
+        # Check all 4 sides of the bbox against the line
+        sides = [
+            (bx1, by1, bx2, by1),  # top
+            (bx2, by1, bx2, by2),  # right
+            (bx2, by2, bx1, by2),  # bottom
+            (bx1, by2, bx1, by1),  # left
+        ]
+        for sx1, sy1, sx2, sy2 in sides:
+            if self._segs_intersect(lx1, ly1, lx2, ly2, sx1, sy1, sx2, sy2):
+                return True
+        # Line endpoint inside the bbox (covers fully-contained short lines)
+        if bx1 <= lx1 <= bx2 and by1 <= ly1 <= by2:
+            return True
+        if bx1 <= lx2 <= bx2 and by1 <= ly2 <= by2:
+            return True
+        return False
+
     def _eligible_mask(self, detections: sv.Detections) -> list[bool]:
         n           = len(detections)
         mask        = [True] * n
@@ -420,13 +471,14 @@ class LineCounter:
 
     async def process(self, frame: np.ndarray, detections: sv.Detections) -> dict[str, Any]:
         now_mono = time.monotonic()
-        if self._zone is None or (now_mono - self._last_refresh) > LINE_REFRESH_INTERVAL:
+        no_zone = self._zone is None and self._line_seg is None
+        if no_zone or (now_mono - self._last_refresh) > LINE_REFRESH_INTERVAL:
             try:
                 await self._refresh()
             except Exception as exc:
                 logger.warning("Counter._refresh failed: %s", exc)
 
-        if self._zone is None:
+        if self._zone is None and self._line_seg is None:
             return self._empty_snapshot()
 
         has_ids = (
@@ -582,6 +634,113 @@ class LineCounter:
                                 tid, cls_name, "in" if direction_in else "out",
                                 self._confirmed_total,
                             )
+
+        elif self._zone_type == "line_pixel":
+            # Pixel-level bbox intersection: count any detection whose bounding
+            # box touches the drawn line segment.  No trip-wire band — any pixel
+            # of the box overlapping the line is sufficient to trigger.
+            if len(detections) > 0 and detections.xyxy is not None:
+                for i in eligible_indices:
+                    if i >= len(detections.xyxy):
+                        continue
+                    bx1, by1, bx2, by2 = detections.xyxy[i]
+                    if not self._bbox_hits_line(float(bx1), float(by1), float(bx2), float(by2)):
+                        continue
+
+                    tid = tracker_ids[i] if has_ids and i < len(tracker_ids) else None
+
+                    # Untracked: use position dedup only
+                    if tid is None:
+                        cx_u = (float(bx1) + float(bx2)) / 2
+                        cy_u = (float(by1) + float(by2)) / 2
+                        if not self._is_pos_duplicate(cx_u, cy_u):
+                            cls_id_u = int(detections.class_id[i]) if detections.class_id is not None and i < len(detections.class_id) else -1
+                            cls_u = CLASS_NAMES.get(cls_id_u, "unknown")
+                            if cls_u == "unknown" and unk_as_car:
+                                cls_u = "car"
+                            if cls_u and cls_u != "unknown":
+                                self._add_count(cls_u, True)
+                                new_crossings += 1
+                                self._recent_count_pos.append((cx_u, cy_u, time.monotonic()))
+                                conf_u = round(float(detections.confidence[i]), 4) if detections.confidence is not None and i < len(detections.confidence) else None
+                                crossing_events.append({
+                                    "camera_id": self.camera_id, "captured_at": datetime.now(timezone.utc).isoformat(),
+                                    "track_id": None, "vehicle_class": cls_u, "confidence": conf_u,
+                                    "direction": "in",
+                                    "scene_lighting": self._scene_status.get("scene_lighting"),
+                                    "scene_weather": self._scene_status.get("scene_weather"),
+                                    "zone_source": "game", "zone_name": self._zone_name,
+                                })
+                        continue
+
+                    if tid in self._confirmed_ids:
+                        continue
+
+                    frames_seen = self._track_frames.get(tid, 0) if tid is not None else min_tf
+                    if frames_seen < min_tf:
+                        if tid not in self._pending_crossings:
+                            self._pending_crossings[tid] = True
+                        continue
+
+                    cx = (float(bx1) + float(bx2)) / 2
+                    cy = (float(by1) + float(by2)) / 2
+                    if self._is_pos_duplicate(cx, cy):
+                        self._confirmed_ids.add(tid)
+                        continue
+
+                    cls_id = int(detections.class_id[i]) if detections.class_id is not None and i < len(detections.class_id) else -1
+                    cls_name = CLASS_NAMES.get(cls_id, "unknown")
+                    if cls_name == "unknown" and unk_as_car:
+                        cls_name = "car"
+                    if not cls_name or cls_name == "unknown":
+                        continue
+
+                    self._add_count(cls_name, True)
+                    self._confirmed_ids.add(tid)
+                    new_crossings += 1
+                    self._recent_count_pos.append((cx, cy, time.monotonic()))
+                    conf = round(float(detections.confidence[i]), 4) if detections.confidence is not None and i < len(detections.confidence) else None
+                    crossing_events.append({
+                        "camera_id": self.camera_id, "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "track_id": int(tid), "vehicle_class": cls_name, "confidence": conf,
+                        "direction": "in",
+                        "scene_lighting": self._scene_status.get("scene_lighting"),
+                        "scene_weather": self._scene_status.get("scene_weather"),
+                        "zone_source": "game", "zone_name": self._zone_name,
+                    })
+
+                # Flush pending crossings for mature tracks
+                if self._pending_crossings and has_ids:
+                    for tid, _ in list(self._pending_crossings.items()):
+                        if tid in self._confirmed_ids:
+                            del self._pending_crossings[tid]
+                            continue
+                        if self._track_frames.get(tid, 0) < min_tf:
+                            continue
+                        cls_name = "car"
+                        for i, t in enumerate(tracker_ids):
+                            if t == tid and detections.class_id is not None and i < len(detections.class_id):
+                                c = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
+                                cls_name = c if c != "unknown" else ("car" if unk_as_car else "unknown")
+                                break
+                        self._add_count(cls_name, True)
+                        self._confirmed_ids.add(tid)
+                        new_crossings += 1
+                        del self._pending_crossings[tid]
+                        _pconf = None
+                        for ii, t in enumerate(tracker_ids):
+                            if t == tid and detections.confidence is not None and ii < len(detections.confidence):
+                                _pconf = round(float(detections.confidence[ii]), 4)
+                                break
+                        crossing_events.append({
+                            "camera_id": self.camera_id, "captured_at": datetime.now(timezone.utc).isoformat(),
+                            "track_id": int(tid), "vehicle_class": cls_name, "confidence": _pconf,
+                            "direction": "in",
+                            "scene_lighting": self._scene_status.get("scene_lighting"),
+                            "scene_weather": self._scene_status.get("scene_weather"),
+                            "zone_source": "game", "zone_name": self._zone_name,
+                        })
+                        logger.info("line_pixel pending flushed: tid=%d cls=%s total=%d", tid, cls_name, self._confirmed_total)
 
         else:  # polygon
             if len(detections) > 0:
