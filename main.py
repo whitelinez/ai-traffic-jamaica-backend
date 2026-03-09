@@ -1517,15 +1517,33 @@ async def health():
             )
             camera_id = fallback_resp.data[0]["id"] if fallback_resp.data else None
         if camera_id:
-            snap_resp = await (
-                sb.table("count_snapshots")
-                .select("camera_id,captured_at,count_in,count_out,total,vehicle_breakdown")
-                .eq("camera_id", camera_id)
-                .order("captured_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            snap_rows = snap_resp.data or []
+            try:
+                snap_resp = await (
+                    sb.table("count_snapshots")
+                    .select("camera_id,captured_at,count_in,count_out,total,vehicle_breakdown")
+                    .eq("camera_id", camera_id)
+                    .order("captured_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                snap_rows = snap_resp.data or []
+            except Exception as snap_exc:
+                logger.warning("health: count_snapshots full select failed (%s), retrying minimal", snap_exc)
+                snap_rows = []
+            if not snap_rows:
+                # Fallback: select only columns guaranteed to exist (same as bootstrap query)
+                try:
+                    snap_resp2 = await (
+                        sb.table("count_snapshots")
+                        .select("camera_id,captured_at,total,vehicle_breakdown")
+                        .eq("camera_id", camera_id)
+                        .order("captured_at", desc=True)
+                        .limit(1)
+                        .execute()
+                    )
+                    snap_rows = snap_resp2.data or []
+                except Exception as snap_exc2:
+                    logger.warning("health: count_snapshots minimal select failed (%s)", snap_exc2)
             if snap_rows:
                 latest_snapshot = snap_rows[0]
 
