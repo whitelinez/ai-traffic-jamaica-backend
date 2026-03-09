@@ -587,17 +587,27 @@ class LineCounter:
                         continue
                     if tid in self._confirmed_ids:
                         continue
-                    if self._track_frames.get(tid, 0) < min_tf:
-                        continue
 
-                    inside_now.add(tid)
                     if detections.xyxy is not None and i < len(detections.xyxy):
                         x1b, y1b, x2b, y2b = detections.xyxy[i]
                         tid_to_center[tid] = (float((x1b + x2b) / 2), float((y1b + y2b) / 2))
 
+                    if self._track_frames.get(tid, 0) < min_tf:
+                        # Track is inside zone but not mature yet — queue it.
+                        # Will be flushed as soon as the track accumulates enough frames,
+                        # even if the vehicle has already exited the trip-wire by then.
+                        if tid not in self._pending_crossings:
+                            self._pending_crossings[tid] = True
+                        inside_now.add(tid)
+                        continue
+
+                    inside_now.add(tid)
+
                 # count tracks that just entered (were outside last frame, inside now)
                 newly_entered = inside_now - self._inside_ids
                 for tid in newly_entered:
+                    if self._track_frames.get(tid, 0) < min_tf:
+                        continue  # still immature, pending queue handles it
                     # Position-based dedup: suppress tracker ID flips and dual-class
                     # detections that refer to the same physical vehicle.
                     center = tid_to_center.get(tid)
@@ -640,6 +650,61 @@ class LineCounter:
                     })
 
                 self._inside_ids = inside_now
+
+                # ── flush pending polygon entries for now-mature tracks ────
+                # These are vehicles that entered the zone but didn't have enough
+                # track frames at entry time. Count them now regardless of whether
+                # they're still inside the zone (they crossed, just late to confirm).
+                if self._pending_crossings and has_ids:
+                    for tid, _ in list(self._pending_crossings.items()):
+                        if tid in self._confirmed_ids:
+                            del self._pending_crossings[tid]
+                            continue
+                        if self._track_frames.get(tid, 0) < min_tf:
+                            continue
+                        center = tid_to_center.get(tid)
+                        if center and self._is_pos_duplicate(center[0], center[1]):
+                            self._confirmed_ids.add(tid)
+                            del self._pending_crossings[tid]
+                            continue
+                        cls_name = "car"
+                        if has_ids:
+                            for i, t in enumerate(tracker_ids):
+                                if t == tid and detections.class_id is not None and i < len(detections.class_id):
+                                    c = CLASS_NAMES.get(int(detections.class_id[i]), "unknown")
+                                    cls_name = c if c != "unknown" else ("car" if unk_as_car else "unknown")
+                                    break
+                        if cls_name == "unknown":
+                            del self._pending_crossings[tid]
+                            continue
+                        self._add_count(cls_name, True)
+                        self._confirmed_ids.add(tid)
+                        new_crossings += 1
+                        if center:
+                            self._recent_count_pos.append((center[0], center[1], time.monotonic()))
+                        _pconf = None
+                        if has_ids:
+                            for ii, t in enumerate(tracker_ids):
+                                if t == tid and detections.confidence is not None and ii < len(detections.confidence):
+                                    _pconf = round(float(detections.confidence[ii]), 4)
+                                    break
+                        crossing_events.append({
+                            "camera_id": self.camera_id,
+                            "captured_at": datetime.now(timezone.utc).isoformat(),
+                            "track_id": int(tid),
+                            "vehicle_class": cls_name,
+                            "confidence": _pconf,
+                            "direction": "in",
+                            "scene_lighting": self._scene_status.get("scene_lighting"),
+                            "scene_weather": self._scene_status.get("scene_weather"),
+                            "zone_source": "game",
+                            "zone_name": self._zone_name,
+                        })
+                        del self._pending_crossings[tid]
+                        logger.info(
+                            "Polygon pending flushed: tid=%d cls=%s total=%d",
+                            tid, cls_name, self._confirmed_total,
+                        )
 
         # build snapshot
         breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
