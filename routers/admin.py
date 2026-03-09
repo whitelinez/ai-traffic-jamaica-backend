@@ -1117,6 +1117,30 @@ async def admin_camera_switch(
     }
 
 
+@router.post("/force-scene-reset")
+async def admin_force_scene_reset(
+    admin: Annotated[dict, Depends(_require_admin_user)],
+):
+    """
+    Force the AI detection loop to reset its scene state immediately.
+    1. Broadcasts a 'scene:reset' WebSocket event so all clients clear stale boxes.
+    2. Triggers url_refresh_loop to run now, which causes the AI loop to detect
+       the (possibly changed) alias and re-initialise counter + tracker.
+    """
+    try:
+        await manager.broadcast_public({"type": "scene:reset"})
+    except Exception as exc:
+        logger.warning("scene:reset broadcast error (non-fatal): %s", exc)
+
+    try:
+        trigger_force_refresh()
+    except Exception as exc:
+        logger.warning("trigger_force_refresh error (non-fatal): %s", exc)
+
+    logger.info("Admin forced scene reset by user=%s", admin.get("sub", "?"))
+    return {"ok": True, "message": "Scene reset triggered — detection will re-initialise within a few seconds."}
+
+
 @router.post("/backfill-daily")
 async def admin_backfill_daily(
     admin: Annotated[dict, Depends(_require_admin_user)],
