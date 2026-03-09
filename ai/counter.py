@@ -26,6 +26,53 @@ TRACK_TTL_SEC          = 10.0
 DEDUP_RADIUS_RATIO     = 0.06  # 6% of frame diagonal — suppresses same-vehicle re-counts
 DEDUP_TTL_SEC          = 2.0   # seconds to remember a counted position
 
+# ── Vehicle color detection ───────────────────────────────────────────────────
+
+def _sample_vehicle_color(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> str:
+    """
+    Estimate the dominant body color of a vehicle from its bounding box.
+    Crops the inner 60% of the box (avoids road/sky bleed at edges), converts
+    BGR→HSV, takes the median H/S/V, and maps to a color name.
+    Returns 'unknown' if the box is too small or the frame is unavailable.
+    """
+    if frame is None:
+        return "unknown"
+    fh, fw = frame.shape[:2]
+    # Shrink to inner 60%: 20% padding on each side
+    pw = max(2, int((x2 - x1) * 0.20))
+    ph = max(2, int((y2 - y1) * 0.20))
+    cx1, cy1 = max(0, x1 + pw), max(0, y1 + ph)
+    cx2, cy2 = min(fw, x2 - pw), min(fh, y2 - ph)
+    if cx2 - cx1 < 4 or cy2 - cy1 < 4:
+        return "unknown"
+    crop = frame[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return "unknown"
+    # Optionally downsample for speed on large boxes
+    if crop.shape[0] > 32 or crop.shape[1] > 32:
+        crop = cv2.resize(crop, (32, 32), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h_med = float(np.median(hsv[:, :, 0]))   # OpenCV H: 0–180
+    s_med = float(np.median(hsv[:, :, 1]))   # S: 0–255
+    v_med = float(np.median(hsv[:, :, 2]))   # V: 0–255
+    # Achromatic (low saturation)
+    if s_med < 45:
+        if v_med < 55:  return "black"
+        if v_med > 185: return "white"
+        return "silver"
+    # Chromatic — map OpenCV H (0–180) to color names
+    h = h_med * 2  # → 0–360
+    if h < 15 or h >= 340: return "red"
+    if h < 35:  return "orange"
+    if h < 65:  return "yellow"
+    if h < 85:  return "lime"
+    if h < 165: return "green"
+    if h < 195: return "cyan"
+    if h < 255: return "blue"
+    if h < 285: return "purple"
+    if h < 340: return "pink"
+    return "red"
+
 # ── defaults (all overridable via cameras.count_settings) ─────────────────────
 DEFAULTS: dict[str, Any] = {
     "min_confidence":       0.22,
@@ -984,6 +1031,21 @@ class LineCounter:
 
             self._detect_inside_ids = dz_inside_now
 
+        # Attach color to all crossing events using the current frame
+        if frame is not None and detections.xyxy is not None:
+            tid_to_bbox: dict[int, tuple] = {}
+            if has_ids:
+                for i, tid in enumerate(tracker_ids):
+                    if i < len(detections.xyxy):
+                        tid_to_bbox[tid] = tuple(detections.xyxy[i])
+            for ev in crossing_events:
+                if ev.get("color"):
+                    continue
+                tid_ev = ev.get("track_id")
+                bbox = tid_to_bbox.get(tid_ev) if tid_ev is not None else None
+                if bbox:
+                    ev["color"] = _sample_vehicle_color(frame, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+
         # build snapshot
         breakdown = {cls: v["in"] + v["out"] for cls, v in self._counts.items()}
 
@@ -1003,8 +1065,8 @@ class LineCounter:
                         continue
                 conf = round(float(detections.confidence[i]), 4) if detections.confidence is not None and i < len(detections.confidence) else None
                 x1, y1, x2, y2 = detections.xyxy[i]
-                # Compute in_detect_zone: True if eligible (passes detect-zone filter) or no detect zone set
                 in_dz = (self._detect_poly is None) or (i < len(eligible) and eligible[i])
+                color = _sample_vehicle_color(frame, int(x1), int(y1), int(x2), int(y2))
                 boxes.append({
                     "x1": round(float(x1) / self.frame_width, 4),
                     "y1": round(float(y1) / self.frame_height, 4),
@@ -1012,6 +1074,7 @@ class LineCounter:
                     "y2": round(float(y2) / self.frame_height, 4),
                     "cls": CLASS_NAMES[cls_id],
                     "conf": conf,
+                    "color": color,
                     "in_detect_zone": in_dz,
                 })
 
