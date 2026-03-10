@@ -28,7 +28,7 @@ from datetime import datetime, timezone, timedelta
 
 from config import get_config
 from middleware.rate_limiter import limiter
-from routers import bets, rounds, admin, stream
+from routers import bets, rounds, admin, stream, demo as demo_router_module
 from websocket.ws_public import router as ws_public_router
 from websocket.ws_account import router as ws_account_router
 from websocket.ws_manager import manager
@@ -1313,6 +1313,9 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
                 list(payload.get("detections") or []), fps=_ws_fps
             )
             await manager.broadcast_public(payload)
+            # Demo recorder hook — captures events while recording is active
+            from services.demo_recorder import capture_event
+            capture_event(payload)
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -1431,6 +1434,7 @@ app.include_router(bets.router)
 app.include_router(rounds.router)
 app.include_router(admin.router)
 app.include_router(stream.router)
+app.include_router(demo_router_module.router)
 app.include_router(ws_public_router)
 app.include_router(ws_account_router)
 
