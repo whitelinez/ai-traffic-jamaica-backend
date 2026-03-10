@@ -79,6 +79,17 @@ async def demo_start_detect(request: Request):
         manager=manager,
         camera_id=camera_id,
     )
+
+    # Notify all WebSocket clients that live AI is now offline (demo mode)
+    try:
+        await manager.broadcast_public({
+            "type": "demo_mode",
+            "active": True,
+            "message": "AI inference running on demo recording",
+        })
+    except Exception as exc:
+        logger.warning("[demo_router] demo_mode broadcast failed: %s", exc)
+
     return result
 
 
@@ -89,8 +100,20 @@ async def demo_stop_detect(request: Request):
 
     demo_player.stop()
 
-    # Resume live AI
     app = request.app
+    manager = app.state.ws_manager
+
+    # Notify clients that live AI is resuming before we restart it
+    try:
+        await manager.broadcast_public({
+            "type": "demo_mode",
+            "active": False,
+            "message": "AI inference returning to live stream",
+        })
+    except Exception as exc:
+        logger.warning("[demo_router] demo_mode broadcast failed: %s", exc)
+
+    # Resume live AI
     await _resume_live_ai(app)
 
     return {"ok": True}
