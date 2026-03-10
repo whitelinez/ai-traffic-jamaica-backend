@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 # ── Background task handles ────────────────────────────────────────────────────
 _refresh_task: asyncio.Task | None = None
 _ai_task: asyncio.Task | None = None
+_demo_mode: bool = False   # True while demo_player is running — watchdog skips AI restart
 _round_task: asyncio.Task | None = None
 _resolver_task: asyncio.Task | None = None
 _ml_retrain_task: asyncio.Task | None = None
@@ -474,6 +475,7 @@ async def health_watchdog_loop(cfg) -> None:
                     since_start > _AI_HEARTBEAT_STALE_SEC
                     and (since_frame is None or since_frame > _AI_HEARTBEAT_STALE_SEC)
                     and _can_restart("ai", loop_now)
+                    and not _demo_mode
                 ):
                     ai_restart_reason = f"stale_heartbeat:{round(since_start, 1)}s"
                     _ai_runtime_state["last_error"] = ai_restart_reason
@@ -485,7 +487,7 @@ async def health_watchdog_loop(cfg) -> None:
                             pass
                     ai_running = False
 
-            if not ai_running and _can_restart("ai", loop_now):
+            if not ai_running and _can_restart("ai", loop_now) and not _demo_mode:
                 reason = ai_restart_reason or _task_failure(_ai_task) or "not_running"
                 started = await _ensure_ai_task(cfg, timeout_sec=6, reason="watchdog")
                 if started:
@@ -947,6 +949,11 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     camera_alias = get_current_alias() or cfg.CAMERA_ALIAS
     camera_id = await _resolve_camera_id_for_alias(camera_alias)
     logger.info("AI loop using camera alias=%s camera_id=%s", camera_alias, camera_id)
+    # Make camera_id available to demo router
+    try:
+        app.state.demo_camera_id = camera_id
+    except Exception:
+        pass
 
     logger.info("AI loop inner: opening HLS stream")
     frame_buf = None
@@ -1402,6 +1409,8 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
+app.state.ws_manager = manager          # used by demo router to broadcast
+app.state.demo_camera_id = None         # set during lifespan once camera_id is resolved
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 cfg_once = None

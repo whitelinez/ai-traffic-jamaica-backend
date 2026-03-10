@@ -80,6 +80,9 @@ class Config:
     # Bet logic
     BET_LOCK_SECONDS: int
 
+    # Demo detection
+    DEMO_SECRET: str
+
     # Server
     WS_PORT: int
 
@@ -171,6 +174,9 @@ class Config:
         # Set to the Vercel deployment URL, e.g. https://your-app.vercel.app
         # Leave empty to fall back to passthrough (segments served directly from CDN).
         self.FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
+        # Demo detection secret — shared between Vercel functions and backend
+        # Set any random string in Railway + Vercel env vars
+        self.DEMO_SECRET = os.getenv("DEMO_SECRET", "")
 
 
 @lru_cache(maxsize=1)
