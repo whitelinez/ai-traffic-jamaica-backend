@@ -6,8 +6,8 @@ Runs every hour automatically.
 Retention policy:
     ml_detection_events   — 2 hours   (writes ~15 rows/sec; keeps ~108K rows max)
     count_snapshots       — 6 hours   (writes ~1 row/sec;  keeps ~21.6K rows max)
-    vehicle_crossings     — 24 hours  (per-vehicle events; ~4K rows/day)
-    turning_movements     — 24 hours  (was 7 days; 30K rows/day x 7d = 210K rows = ~50 MB)
+    vehicle_crossings     — 7 days    (per-vehicle events; ~4K rows/day x 7d = ~28K rows; enables week exports)
+    turning_movements     — 7 days    (exit completions; 30K rows/day x 7d = 210K rows = ~50 MB; needed for outbound analytics)
     traffic_snapshots     — 3 days    (used by analytics API)
 """
 import asyncio
@@ -22,8 +22,8 @@ _STARTUP_DELAY_SEC  = 60          # wait 60s after boot before first run
 _POLICY: list[tuple[str, str, timedelta]] = [
     ("ml_detection_events", "captured_at", timedelta(hours=2)),
     ("count_snapshots",     "captured_at", timedelta(hours=6)),
-    ("vehicle_crossings",   "captured_at", timedelta(hours=24)),
-    ("turning_movements",   "captured_at", timedelta(hours=24)),
+    ("vehicle_crossings",   "captured_at", timedelta(days=7)),
+    ("turning_movements",   "captured_at", timedelta(days=7)),
     ("traffic_snapshots",   "captured_at", timedelta(days=3)),
 ]
 
