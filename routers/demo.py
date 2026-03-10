@@ -127,7 +127,7 @@ async def _pause_live_ai(app) -> None:
         task.cancel()
         try:
             await task
-        except Exception:
+        except BaseException:
             pass
     _main._demo_mode = True
     logger.info("[demo_router] Live AI paused for demo detection")
