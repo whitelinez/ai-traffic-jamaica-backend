@@ -46,10 +46,12 @@ def generate_ws_token(secret: str, extra: str = "") -> str:
     return f"{ts}.{nonce}.{sig}"
 
 
-def validate_ws_token(token: Optional[str], secret: str, extra: str = "") -> bool:
+def validate_ws_token(token: Optional[str], secret: str, extra: str = "", check_nonce: bool = True) -> bool:
     """
     Validate a HMAC WS token (v2 format: ts.nonce.sig).
     Returns True if signature is valid, token is within TTL, and nonce not replayed.
+    Set check_nonce=False for HTTP endpoints (stream manifest/segments) where
+    HLS.js may retry the same token — nonce replay protection is only needed for WS.
     """
     if not token:
         return False
@@ -76,11 +78,12 @@ def validate_ws_token(token: Optional[str], secret: str, extra: str = "") -> boo
         logger.warning("WS token signature mismatch")
         return False
 
-    # ── Replay protection ────────────────────────────────────────
-    _purge_expired_nonces()
-    if nonce in _seen_nonces:
-        logger.warning("WS token replay detected (nonce=%s)", nonce[:8])
-        return False
-    _seen_nonces[nonce] = time.monotonic() + _NONCE_TTL
+    # ── Replay protection (WS only) ──────────────────────────────
+    if check_nonce:
+        _purge_expired_nonces()
+        if nonce in _seen_nonces:
+            logger.warning("WS token replay detected (nonce=%s)", nonce[:8])
+            return False
+        _seen_nonces[nonce] = time.monotonic() + _NONCE_TTL
 
     return True

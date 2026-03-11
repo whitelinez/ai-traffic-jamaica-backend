@@ -211,7 +211,7 @@ async def stream_manifest(
     alias: str | None = Query(default=None),
 ):
     cfg = get_config()
-    if not validate_ws_token(token, cfg.WS_AUTH_SECRET):
+    if not validate_ws_token(token, cfg.WS_AUTH_SECRET, check_nonce=False):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     preferred_alias = str(alias or "").strip() or None
@@ -288,7 +288,7 @@ async def stream_manifest(
             raise HTTPException(status_code=502, detail="Stream unavailable")
 
         segment_proxy_base = (
-            f"{cfg.FRONTEND_URL}/api/stream" if cfg.FRONTEND_URL else ""
+            f"{cfg.FRONTEND_URL}/stream/ts" if cfg.FRONTEND_URL else ""
         )
         rewritten = _rewrite_manifest(resp.text, base_url, segment_proxy_base=segment_proxy_base)
         _manifest_cache["body"] = rewritten
@@ -360,13 +360,13 @@ async def stream_segment(p: str = Query(..., max_length=4096)):
                 return Response(
                     content=rewritten,
                     media_type="application/vnd.apple.mpegurl",
-                    headers={"Cache-Control": "no-cache, no-store"},
+                    headers={"Cache-Control": "no-cache, no-store", **_CORS_HEADERS},
                 )
 
             return Response(
                 content=resp.content,
                 media_type="video/MP2T",
-                headers={"Cache-Control": "public, max-age=10"},
+                headers={"Cache-Control": "public, max-age=10", **_CORS_HEADERS},
             )
     except HTTPException:
         raise
