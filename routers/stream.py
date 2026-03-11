@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/stream", tags=["stream"])
 
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Range",
+    "Access-Control-Max-Age":       "86400",
+}
+
 _PROXY_HEADERS = {
     "Referer": "https://www.ipcamlive.com/",
     "User-Agent": (
@@ -193,6 +200,11 @@ def _rewrite_manifest(manifest_body: str, base_url: str, segment_proxy_base: str
     return "\n".join(lines)
 
 
+@router.options("/live.m3u8")
+async def stream_manifest_preflight():
+    return Response(None, status_code=204, headers=_CORS_HEADERS)
+
+
 @router.get("/live.m3u8")
 async def stream_manifest(
     token: str = Query(...),
@@ -213,7 +225,7 @@ async def stream_manifest(
         return Response(
             content=cached_body,
             media_type="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "no-cache, no-store"},
+            headers={"Cache-Control": "no-cache, no-store", **_CORS_HEADERS},
         )
 
     async with _cache_lock:
@@ -226,7 +238,7 @@ async def stream_manifest(
             return Response(
                 content=cached_body,
                 media_type="application/vnd.apple.mpegurl",
-                headers={"Cache-Control": "no-cache, no-store"},
+                headers={"Cache-Control": "no-cache, no-store", **_CORS_HEADERS},
             )
 
         try:
@@ -286,7 +298,7 @@ async def stream_manifest(
     return Response(
         content=rewritten,
         media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "no-cache, no-store"},
+        headers={"Cache-Control": "no-cache, no-store", **_CORS_HEADERS},
     )
 
 
