@@ -16,9 +16,11 @@ from typing import Any
 import urllib.request
 import json
 
+import os
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 import cv2
@@ -1416,6 +1418,10 @@ app.state.limiter = limiter
 app.state.ws_manager = manager          # used by demo router to broadcast
 app.state.demo_camera_id = None         # set during lifespan once camera_id is resolved
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Serve local HLS segments when FFmpeg is transcoding RTMP
+if os.path.isdir("/tmp/hls"):
+    app.mount("/hls", StaticFiles(directory="/tmp/hls"), name="hls")
 
 cfg_once = None
 allowed_origins: list[str] = []

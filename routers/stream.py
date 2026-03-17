@@ -214,6 +214,24 @@ async def stream_manifest(
     if not validate_ws_token(token, cfg.WS_AUTH_SECRET, check_nonce=False):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+    # Serve local HLS when FFmpeg is transcoding an RTMP source
+    if cfg.DIRECT_STREAM_URL.startswith("rtmp://"):
+        import os
+        local_m3u8 = "/tmp/hls/stream.m3u8"
+        if os.path.exists(local_m3u8):
+            content = await asyncio.to_thread(lambda: open(local_m3u8).read())
+            base = cfg.HLS_SEGMENT_BASE_URL
+            rewritten = "\n".join(
+                f"{base}/{line.strip()}" if line.strip() and not line.startswith("#") else line
+                for line in content.splitlines()
+            )
+            return Response(
+                content=rewritten,
+                media_type="application/vnd.apple.mpegurl",
+                headers={"Cache-Control": "no-cache, no-store", "Access-Control-Allow-Origin": "*"},
+            )
+        raise HTTPException(status_code=503, detail="HLS segments not ready yet")
+
     preferred_alias = str(alias or "").strip() or None
 
     now = time.monotonic()
