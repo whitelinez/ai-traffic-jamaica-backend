@@ -15,6 +15,8 @@ class Config:
     CAMERA_ALIAS: str
     CAMERA_ALIASES: list[str]
     URL_REFRESH_INTERVAL: int  # seconds between proactive URL refreshes (default 240)
+    # Optional: skip ipcamlive entirely and use this URL directly (HLS or RTMP)
+    DIRECT_STREAM_URL: str
 
     # WebSocket auth (HMAC)
     WS_AUTH_SECRET: str
@@ -111,6 +113,7 @@ class Config:
         self.SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
 
         self.URL_REFRESH_INTERVAL = int(os.getenv("URL_REFRESH_INTERVAL", "240"))
+        self.DIRECT_STREAM_URL = os.getenv("DIRECT_STREAM_URL", "").strip()
         self.YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")           # nano: 3-4x faster on CPU vs small
         self.YOLO_TRACKER_YAML = os.getenv("YOLO_TRACKER_YAML", "")
         self.YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))

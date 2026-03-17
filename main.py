@@ -42,7 +42,7 @@ from ai.box_smoother import BoxSmoother
 from ai.live_state import set_live_snapshot
 from ai.dataset_capture import LiveDatasetCapture
 from ai.dataset_upload import SupabaseDatasetUploader
-from ai.url_refresher import url_refresh_loop, bulk_url_refresh_loop, get_current_url, get_current_alias
+from ai.url_refresher import url_refresh_loop, bulk_url_refresh_loop, get_current_url, get_current_alias, set_direct_url
 from ai.quality import compute_quality, write_quality_snapshot, quality_probe_loop
 from ai.occlusion_guard import OcclusionGuard
 from services.round_service import resolve_round_from_latest_snapshot
@@ -456,7 +456,7 @@ async def health_watchdog_loop(cfg) -> None:
     while True:
         loop_now = asyncio.get_running_loop().time()
         try:
-            if not _task_running(_refresh_task) and _can_restart("refresh", loop_now):
+            if not cfg.DIRECT_STREAM_URL and not _task_running(_refresh_task) and _can_restart("refresh", loop_now):
                 reason = _task_failure(_refresh_task) or "not_running"
                 _refresh_task = asyncio.create_task(
                     url_refresh_loop(cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL),
@@ -1337,14 +1337,18 @@ async def lifespan(app: FastAPI):
 
     await get_supabase()
 
-    # 1. Start URL refresher
-    _refresh_task = asyncio.create_task(
-        url_refresh_loop(cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL),
-        name="url_refresh_loop",
-    )
-    logger.info("URL refresh task started (alias=%s, interval=%ds)", cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL)
-    asyncio.create_task(bulk_url_refresh_loop(), name="bulk_url_refresh_loop")
-    logger.info("Bulk URL refresh task started (interval=6h)")
+    # 1. Start URL refresher (skipped when DIRECT_STREAM_URL is set)
+    if cfg.DIRECT_STREAM_URL:
+        set_direct_url(cfg.DIRECT_STREAM_URL)
+        logger.info("DIRECT_STREAM_URL set — skipping ipcamlive URL refresher")
+    else:
+        _refresh_task = asyncio.create_task(
+            url_refresh_loop(cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL),
+            name="url_refresh_loop",
+        )
+        logger.info("URL refresh task started (alias=%s, interval=%ds)", cfg.CAMERA_ALIAS, cfg.URL_REFRESH_INTERVAL)
+        asyncio.create_task(bulk_url_refresh_loop(), name="bulk_url_refresh_loop")
+        logger.info("Bulk URL refresh task started (interval=6h)")
 
     # 2. Wait up to 30s for first URL before starting AI loop
     stream_url = await _wait_for_stream_url(_WATCHDOG_STARTUP_WAIT_SEC)

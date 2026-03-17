@@ -45,6 +45,14 @@ def get_current_alias() -> str | None:
     return _current_alias
 
 
+def set_direct_url(url: str) -> None:
+    """Bypass ipcamlive: inject a stream URL (HLS or RTMP) directly."""
+    global _current_url, _current_alias
+    _current_url = url
+    _current_alias = "direct"
+    logger.info("Direct stream URL set: %s", url)
+
+
 def _get_or_create_event() -> asyncio.Event:
     global _force_refresh_event
     if _force_refresh_event is None:
