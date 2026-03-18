@@ -45,10 +45,17 @@ if echo "$DIRECT_STREAM_URL" | grep -q "^rtmp://"; then
     # Note: "|| true" prevents set -e from killing the loop on FFmpeg failure
     (while true; do
         echo "FFmpeg: starting HLS transcode from $LOCAL_RTMP"
-        ffmpeg -i "$LOCAL_RTMP" \
+        ffmpeg \
+            -fflags +nobuffer+discardcorrupt \
+            -flags low_delay \
+            -rtmp_buffer 0 \
+            -i "$LOCAL_RTMP" \
             -c:v copy -an \
-            -f hls -hls_time 2 -hls_list_size 6 \
-            -hls_flags delete_segments+append_list \
+            -f hls \
+            -hls_time 1 \
+            -hls_list_size 4 \
+            -hls_flags delete_segments+append_list+omit_endlist \
+            -hls_allow_cache 0 \
             /tmp/hls/stream.m3u8 || true
         echo "FFmpeg exited — retrying in 5s"
         sleep 5
