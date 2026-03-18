@@ -42,13 +42,14 @@ if echo "$DIRECT_STREAM_URL" | grep -q "^rtmp://"; then
     echo "RTMP relay active: $LOCAL_RTMP → $RTMP_HOST:$RTMP_PORT via Tailscale"
 
     # Run FFmpeg in a background retry loop
+    # Note: "|| true" prevents set -e from killing the loop on FFmpeg failure
     (while true; do
         echo "FFmpeg: starting HLS transcode from $LOCAL_RTMP"
         ffmpeg -i "$LOCAL_RTMP" \
             -c:v copy -an \
             -f hls -hls_time 2 -hls_list_size 6 \
             -hls_flags delete_segments+append_list \
-            /tmp/hls/stream.m3u8
+            /tmp/hls/stream.m3u8 || true
         echo "FFmpeg exited — retrying in 5s"
         sleep 5
     done) &
