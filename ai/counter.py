@@ -357,6 +357,8 @@ class LineCounter:
             # do NOT remove from _confirmed_ids — prevents double-count on re-entry
 
     def _add_count(self, cls_name: str, direction_in: bool) -> None:
+        if getattr(self, "_suppress_crossings", False):
+            return
         if direction_in:
             self._confirmed_in    += 1
             self._confirmed_total += 1
@@ -516,7 +518,11 @@ class LineCounter:
 
     # ── main process ──────────────────────────────────────────────────────────
 
-    async def process(self, frame: np.ndarray, detections: sv.Detections) -> dict[str, Any]:
+    async def process(self, frame: np.ndarray, detections: sv.Detections, suppress_crossings: bool = False) -> dict[str, Any]:
+        self._suppress_crossings = suppress_crossings
+        if suppress_crossings:
+            # Camera is panning — discard any pending crossings queued before the move
+            self._pending_crossings.clear()
         now_mono = time.monotonic()
         no_zone = self._zone is None and self._line_seg is None
         if no_zone or (now_mono - self._last_refresh) > LINE_REFRESH_INTERVAL:

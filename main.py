@@ -47,6 +47,7 @@ from ai.dataset_upload import SupabaseDatasetUploader
 from ai.url_refresher import url_refresh_loop, bulk_url_refresh_loop, get_current_url, get_current_alias, set_direct_url
 from ai.quality import compute_quality, write_quality_snapshot, quality_probe_loop
 from ai.occlusion_guard import OcclusionGuard
+from ai.ptz_guard import PTZGuard
 from services.round_service import resolve_round_from_latest_snapshot
 from services.leaderboard_service import leaderboard_refresh_loop
 from services.anomaly_service import CountAnomalyDetector
@@ -135,6 +136,7 @@ _latest_frame_jpeg: bytes | None = None
 # ── Per-session AI helpers (reset on camera switch) ────────────────────────────
 _occlusion_guard: OcclusionGuard = OcclusionGuard()
 _count_anomaly_detector: CountAnomalyDetector = CountAnomalyDetector()
+_ptz_guard: PTZGuard = PTZGuard()
 
 # ── Shared state between ai_loop and round_monitor_loop ───────────────────────
 _active_round: dict | None = None
@@ -925,6 +927,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
     logger.info("AI loop inner: initialising tracker")
     tracker = VehicleTracker()
     box_smoother = BoxSmoother()
+    _ptz_guard.reset()
 
     async def _resolve_camera_id_for_alias(alias: str) -> str:
         resp = await (
@@ -1052,6 +1055,7 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
             process_every_n = 1   # reset frame-skip so old camera's perf state doesn't carry over
             box_smoother.reset()  # clear stale EMA state for previous camera
             tracker = VehicleTracker()  # full re-instantiate: clears all ByteTrack vehicle IDs
+            _ptz_guard.reset()
             try:
                 runtime_profile_name = ""
                 last_runtime_eval = 0.0
@@ -1199,8 +1203,19 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         detections = await asyncio.to_thread(detector.detect, frame)
         # Keep full-frame detections for tracking/overlay visibility.
         # Count logic still applies detect/count zones inside LineCounter.process().
+
+        # PTZ guard: detect global camera motion, suppress crossings + reset tracker
+        camera_moving, just_stopped = await asyncio.to_thread(_ptz_guard.update, frame)
+        if just_stopped:
+            # Camera just settled — discard all stale tracks from previous pan position
+            tracker = VehicleTracker()
+            tracker.set_night_mode(effective_night_mode)
+            box_smoother.reset()
+        if camera_moving and manager.public_count > 0:
+            asyncio.create_task(manager.broadcast_public({"type": "camera_pan"}))
+
         tracked = tracker.update(detections)
-        snapshot = await counter.process(frame, tracked)
+        snapshot = await counter.process(frame, tracked, suppress_crossings=camera_moving)
 
         # Turning movement tracker — run on every processed frame
         if turning_tracker is not None and len(tracked) > 0 and tracked.tracker_id is not None:
