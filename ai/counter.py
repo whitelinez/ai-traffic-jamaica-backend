@@ -244,26 +244,12 @@ class LineCounter:
                 lx1, ly1, lx2, ly2, self.camera_id,
             )
         else:
-            # No count_line configured: use a PolygonZone entry-counter.
-            # This is more robust than line-crossing when the detector sporadically
-            # misses vehicles (common at intersection cameras where vehicles are
-            # briefly occluded or move fast relative to the stream FPS).
-            # A vehicle is counted once the FIRST TIME its tracker ID appears
-            # inside the zone.  Using detect_zone polygon if available, otherwise
-            # a default road-band covering y=0.30-0.70 (full frame width).
-            if self._detect_poly is not None:
-                zone_poly = self._detect_poly
-            else:
-                zone_poly = np.array([
-                    [0,       int(0.30 * h)],
-                    [w,       int(0.30 * h)],
-                    [w,       int(0.70 * h)],
-                    [0,       int(0.70 * h)],
-                ], dtype=np.int32)
-            self._zone      = sv.PolygonZone(polygon=zone_poly, triggering_anchors=[sv.Position.CENTER])
-            self._zone_type = "polygon"
+            # No count_line configured — counting is disabled until admin draws one.
+            self._zone      = None
+            self._line_seg  = None
+            self._zone_type = "line"
             logger.info(
-                "Counter zone: no count_line → PolygonZone entry-counter camera=%s",
+                "Counter zone: no count_line configured — counting disabled camera=%s",
                 self.camera_id,
             )
 
