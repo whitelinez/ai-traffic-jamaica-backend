@@ -1361,7 +1361,17 @@ async def lifespan(app: FastAPI):
 
     # 1. Start URL refresher (skipped when DIRECT_STREAM_URL is set)
     if cfg.DIRECT_STREAM_URL:
-        set_direct_url(cfg.DIRECT_STREAM_URL)
+        if cfg.DIRECT_STREAM_URL.startswith("rtmp://"):
+            # FFmpeg is transcoding RTMP → local HLS in entrypoint.sh.
+            # Read the local HLS over localhost HTTP instead of raw RTMP —
+            # HLS has 4-6 seconds of segment buffering which absorbs Tailscale
+            # jitter. Raw RTMP through the SOCKS5 relay has zero buffering so
+            # any network hiccup causes an immediate cv2 frame-read failure.
+            local_hls = "http://localhost:8000/hls/stream.m3u8"
+            set_direct_url(local_hls)
+            logger.info("RTMP source detected — AI will read local HLS (%s) for stability", local_hls)
+        else:
+            set_direct_url(cfg.DIRECT_STREAM_URL)
         logger.info("DIRECT_STREAM_URL set — skipping ipcamlive URL refresher")
     else:
         _refresh_task = asyncio.create_task(

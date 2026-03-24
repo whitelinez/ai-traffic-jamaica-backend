@@ -48,21 +48,22 @@ if echo "$DIRECT_STREAM_URL" | grep -q "^rtmp://"; then
         ffmpeg \
             -fflags +nobuffer+discardcorrupt \
             -flags low_delay \
-            -rtmp_buffer 0 \
+            -rtmp_buffer 500 \
             -i "$LOCAL_RTMP" \
             -c:v copy -an \
             -f hls \
-            -hls_time 1 \
-            -hls_list_size 4 \
+            -hls_time 2 \
+            -hls_list_size 6 \
             -hls_flags delete_segments+append_list+omit_endlist \
             -hls_allow_cache 0 \
+            -loglevel warning \
             /tmp/hls/stream.m3u8 || true
-        echo "FFmpeg exited — retrying in 5s"
-        sleep 5
+        echo "FFmpeg exited — retrying in 3s"
+        sleep 3
     done) &
 
-    # Wait up to 30s for first m3u8
-    for i in $(seq 1 30); do
+    # Wait up to 60s for first m3u8 (2s segments need more time to appear)
+    for i in $(seq 1 60); do
         [ -f /tmp/hls/stream.m3u8 ] && echo "HLS ready" && break
         sleep 1
     done
