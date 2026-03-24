@@ -1205,17 +1205,22 @@ async def _ai_loop_inner(cfg, hls_stream: HLSStream) -> None:
         # Count logic still applies detect/count zones inside LineCounter.process().
 
         # PTZ guard: detect global camera motion, suppress crossings + reset tracker
-        camera_moving, just_stopped = await asyncio.to_thread(_ptz_guard.update, frame)
+        ptz_suppressed, just_stopped = await asyncio.to_thread(_ptz_guard.update, frame)
         if just_stopped:
             # Camera just settled — discard all stale tracks from previous pan position
             tracker = VehicleTracker()
             tracker.set_night_mode(effective_night_mode)
             box_smoother.reset()
-        if camera_moving and manager.public_count > 0:
-            asyncio.create_task(manager.broadcast_public({"type": "camera_pan"}))
+        if ptz_suppressed and manager.public_count > 0:
+            asyncio.create_task(manager.broadcast_public({
+                "type": "camera_pan",
+                "displacement": round(_ptz_guard.last_displacement, 2),
+                "inlier_ratio": round(_ptz_guard.last_inlier_ratio, 2),
+                "settling": _ptz_guard._settle_countdown > 0,
+            }))
 
         tracked = tracker.update(detections)
-        snapshot = await counter.process(frame, tracked, suppress_crossings=camera_moving)
+        snapshot = await counter.process(frame, tracked, suppress_crossings=ptz_suppressed)
 
         # Turning movement tracker — run on every processed frame
         if turning_tracker is not None and len(tracked) > 0 and tracked.tracker_id is not None:
